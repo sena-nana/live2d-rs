@@ -1,16 +1,33 @@
-use live2d_core::{BlendMode, DrawableId, MaskRef, MaterialKey, ModelSnapshot};
+use live2d_core::{BlendMode, DrawableId, DrawableRanges, MaskRef, MaterialKey, ModelSnapshot};
+use std::collections::HashMap;
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderPlan {
+    pub model: ModelRenderCtx,
     pub masks: Vec<MaskPass>,
     pub draws: Vec<DrawCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelRenderCtx {
+    pub vertex_count: u32,
+    pub index_count: u32,
+    pub drawables: Vec<DrawableRenderCtx>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DrawableRenderCtx {
+    pub drawable_id: DrawableId,
+    pub texture_index: usize,
+    pub ranges: DrawableRanges,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaskPass {
     pub id: MaskRef,
     pub drawable_ids: Vec<DrawableId>,
+    pub inverted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,32 +46,96 @@ pub struct DrawCommand {
 #[derive(Debug, Clone, Default)]
 pub struct RenderPlanner;
 
+pub trait Live2DRenderBackend {
+    fn begin_model(&mut self, _ctx: &ModelRenderCtx) {}
+    fn begin_clip_masks(&mut self, _masks: &[MaskPass]) {}
+    fn begin_clip_mask(&mut self, _mask: &MaskPass) {}
+    fn draw_mask_drawable(&mut self, _mask: &MaskPass, _call: &DrawCommand) {}
+    fn end_clip_mask(&mut self, _mask: &MaskPass) {}
+    fn end_clip_masks(&mut self) {}
+    fn begin_main_pass(&mut self) {}
+    fn draw_drawable(&mut self, call: &DrawCommand);
+    fn end_model(&mut self) {}
+}
+
+impl RenderPlan {
+    pub fn dispatch<B>(&self, backend: &mut B)
+    where
+        B: Live2DRenderBackend,
+    {
+        backend.begin_model(&self.model);
+        if !self.masks.is_empty() {
+            backend.begin_clip_masks(&self.masks);
+            for mask in &self.masks {
+                backend.begin_clip_mask(mask);
+                for drawable_id in &mask.drawable_ids {
+                    if let Some(call) = self.draw_for_id(drawable_id) {
+                        backend.draw_mask_drawable(mask, call);
+                    }
+                }
+                backend.end_clip_mask(mask);
+            }
+            backend.end_clip_masks();
+        }
+        backend.begin_main_pass();
+        for draw in &self.draws {
+            backend.draw_drawable(draw);
+        }
+        backend.end_model();
+    }
+
+    fn draw_for_id(&self, drawable_id: &DrawableId) -> Option<&DrawCommand> {
+        self.draws
+            .iter()
+            .find(|draw| draw.drawable_id == *drawable_id)
+    }
+}
+
 impl RenderPlanner {
     pub fn new() -> Self {
         Self
     }
 
     pub fn build(&self, snapshot: &ModelSnapshot) -> RenderPlan {
+        let model = build_model_ctx(snapshot);
+        let drawable_ranges = model
+            .drawables
+            .iter()
+            .map(|drawable| {
+                (
+                    drawable.drawable_id.clone(),
+                    (drawable.texture_index, drawable.ranges.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut mask_refs = HashMap::new();
         let mut drawables = snapshot.drawables.iter().collect::<Vec<_>>();
         drawables.sort_by_key(|drawable| drawable.render_order);
 
         let mut masks = Vec::new();
         let draws = drawables
             .into_iter()
-            .map(|drawable| {
+            .filter_map(|drawable| {
+                let (texture_index, ranges) = drawable_ranges.get(&drawable.id)?.clone();
                 let mask = drawable.clipping.as_ref().map(|clipping| {
+                    let mask_key = (clipping.drawable_ids.clone(), clipping.inverted);
+                    if let Some(mask_ref) = mask_refs.get(&mask_key) {
+                        return *mask_ref;
+                    }
                     let mask_ref = MaskRef(masks.len());
                     masks.push(MaskPass {
                         id: mask_ref,
                         drawable_ids: clipping.drawable_ids.clone(),
+                        inverted: clipping.inverted,
                     });
+                    mask_refs.insert(mask_key, mask_ref);
                     mask_ref
                 });
-                DrawCommand {
+                Some(DrawCommand {
                     drawable_id: drawable.id.clone(),
-                    texture_index: drawable.texture_index,
-                    vertex_range: 0..drawable.vertices.len() as u32,
-                    index_range: 0..drawable.indices.len() as u32,
+                    texture_index,
+                    vertex_range: ranges.vertex_range,
+                    index_range: ranges.index_range,
                     opacity: drawable.opacity,
                     blend_mode: drawable.blend_mode,
                     mask,
@@ -64,11 +145,46 @@ impl RenderPlanner {
                         .map(|clipping| clipping.inverted)
                         .unwrap_or(false),
                     material: MaterialKey::Default,
-                }
+                })
             })
             .collect();
 
-        RenderPlan { masks, draws }
+        RenderPlan {
+            model,
+            masks,
+            draws,
+        }
+    }
+}
+
+fn build_model_ctx(snapshot: &ModelSnapshot) -> ModelRenderCtx {
+    let mut vertex_offset = 0;
+    let mut index_offset = 0;
+    let drawables = snapshot
+        .drawables
+        .iter()
+        .filter(|drawable| !drawable.vertices.is_empty() && !drawable.indices.is_empty())
+        .map(|drawable| {
+            let vertex_count = drawable.vertices.len() as u32;
+            let index_count = drawable.indices.len() as u32;
+            let ranges = DrawableRanges {
+                vertex_range: vertex_offset..vertex_offset + vertex_count,
+                index_range: index_offset..index_offset + index_count,
+            };
+            vertex_offset += vertex_count;
+            index_offset += index_count;
+            DrawableRenderCtx {
+                drawable_id: drawable.id.clone(),
+                texture_index: drawable.texture_index,
+                ranges,
+            }
+        })
+        .collect();
+
+    ModelRenderCtx {
+        vertex_count: vertex_offset,
+        index_count: index_offset,
+        drawables,
     }
 }
 
@@ -122,7 +238,188 @@ mod tests {
 
         assert_eq!(plan.masks.len(), 1);
         assert_eq!(plan.draws[0].mask, Some(MaskRef(0)));
+        assert!(plan.masks[0].inverted);
         assert!(plan.draws[0].inverted_mask);
+    }
+
+    #[test]
+    fn shares_mask_passes_for_matching_clip_groups() {
+        let snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![
+                drawable("mask", 0, None),
+                drawable(
+                    "masked-a",
+                    1,
+                    Some(ClippingInfo {
+                        drawable_ids: vec![DrawableId::from("mask")],
+                        inverted: false,
+                    }),
+                ),
+                drawable(
+                    "masked-b",
+                    2,
+                    Some(ClippingInfo {
+                        drawable_ids: vec![DrawableId::from("mask")],
+                        inverted: false,
+                    }),
+                ),
+            ],
+        };
+
+        let plan = RenderPlanner::new().build(&snapshot);
+
+        assert_eq!(plan.masks.len(), 1);
+        assert_eq!(plan.draws[1].mask, Some(MaskRef(0)));
+        assert_eq!(plan.draws[2].mask, Some(MaskRef(0)));
+    }
+
+    #[test]
+    fn packs_drawable_ranges_once_and_draws_in_render_order() {
+        let snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![
+                drawable_with_shape("b", 20, 2, 3),
+                drawable_with_shape("a", 10, 3, 6),
+            ],
+        };
+
+        let plan = RenderPlanner::new().build(&snapshot);
+
+        assert_eq!(plan.model.vertex_count, 5);
+        assert_eq!(plan.model.index_count, 9);
+        assert_eq!(plan.model.drawables[0].drawable_id.as_ref(), "b");
+        assert_eq!(plan.model.drawables[0].ranges.vertex_range, 0..2);
+        assert_eq!(plan.model.drawables[0].ranges.index_range, 0..3);
+        assert_eq!(plan.model.drawables[1].drawable_id.as_ref(), "a");
+        assert_eq!(plan.model.drawables[1].ranges.vertex_range, 2..5);
+        assert_eq!(plan.model.drawables[1].ranges.index_range, 3..9);
+
+        let draw_ids = plan
+            .draws
+            .iter()
+            .map(|draw| draw.drawable_id.as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(draw_ids, ["a", "b"]);
+        assert_eq!(plan.draws[0].vertex_range, 2..5);
+        assert_eq!(plan.draws[0].index_range, 3..9);
+        assert_eq!(plan.draws[1].vertex_range, 0..2);
+        assert_eq!(plan.draws[1].index_range, 0..3);
+    }
+
+    #[test]
+    fn dispatches_clip_masks_before_main_draws() {
+        let snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![
+                drawable("mask", 0, None),
+                drawable(
+                    "masked",
+                    1,
+                    Some(ClippingInfo {
+                        drawable_ids: vec![DrawableId::from("mask")],
+                        inverted: false,
+                    }),
+                ),
+            ],
+        };
+        let plan = RenderPlanner::new().build(&snapshot);
+        let mut backend = RecordingBackend::default();
+
+        plan.dispatch(&mut backend);
+
+        assert_eq!(
+            backend.events,
+            vec![
+                Event::BeginModel {
+                    vertices: 2,
+                    indices: 2,
+                },
+                Event::BeginClipMasks(1),
+                Event::BeginClipMask {
+                    id: MaskRef(0),
+                    inverted: false,
+                },
+                Event::MaskDrawable {
+                    mask: MaskRef(0),
+                    drawable: DrawableId::from("mask"),
+                },
+                Event::EndClipMask(MaskRef(0)),
+                Event::BeginMainPass,
+                Event::Draw(DrawableId::from("mask")),
+                Event::Draw(DrawableId::from("masked")),
+                Event::EndModel,
+            ]
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingBackend {
+        events: Vec<Event>,
+    }
+
+    impl Live2DRenderBackend for RecordingBackend {
+        fn begin_model(&mut self, ctx: &ModelRenderCtx) {
+            self.events.push(Event::BeginModel {
+                vertices: ctx.vertex_count,
+                indices: ctx.index_count,
+            });
+        }
+
+        fn begin_clip_masks(&mut self, masks: &[MaskPass]) {
+            self.events.push(Event::BeginClipMasks(masks.len()));
+        }
+
+        fn begin_clip_mask(&mut self, mask: &MaskPass) {
+            self.events.push(Event::BeginClipMask {
+                id: mask.id,
+                inverted: mask.inverted,
+            });
+        }
+
+        fn draw_mask_drawable(&mut self, mask: &MaskPass, call: &DrawCommand) {
+            self.events.push(Event::MaskDrawable {
+                mask: mask.id,
+                drawable: call.drawable_id.clone(),
+            });
+        }
+
+        fn end_clip_mask(&mut self, mask: &MaskPass) {
+            self.events.push(Event::EndClipMask(mask.id));
+        }
+
+        fn begin_main_pass(&mut self) {
+            self.events.push(Event::BeginMainPass);
+        }
+
+        fn draw_drawable(&mut self, call: &DrawCommand) {
+            self.events.push(Event::Draw(call.drawable_id.clone()));
+        }
+
+        fn end_model(&mut self) {
+            self.events.push(Event::EndModel);
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        BeginModel { vertices: u32, indices: u32 },
+        BeginClipMasks(usize),
+        BeginClipMask { id: MaskRef, inverted: bool },
+        MaskDrawable { mask: MaskRef, drawable: DrawableId },
+        EndClipMask(MaskRef),
+        BeginMainPass,
+        Draw(DrawableId),
+        EndModel,
     }
 
     fn drawable(id: &str, render_order: i32, clipping: Option<ClippingInfo>) -> Drawable {
@@ -138,6 +435,29 @@ mod tests {
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             clipping,
+        }
+    }
+
+    fn drawable_with_shape(
+        id: &str,
+        render_order: i32,
+        vertex_count: usize,
+        index_count: usize,
+    ) -> Drawable {
+        Drawable {
+            id: DrawableId::from(id),
+            render_order,
+            texture_index: 0,
+            vertices: (0..vertex_count)
+                .map(|index| Vertex {
+                    position: [index as f32, 0.0],
+                    uv: [0.0, 0.0],
+                })
+                .collect(),
+            indices: (0..index_count).map(|index| index as u16).collect(),
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            clipping: None,
         }
     }
 }
