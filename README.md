@@ -13,17 +13,15 @@ live2d-runtime  Asset resolving, model3 parsing, model loading, update, snapshot
 live2d-render   Snapshot-to-RenderPlan conversion without wgpu or window-system types
 live2d-wgpu     Optional wgpu backend, Live2D renderer, preview renderer, and WGSL assets
 live2d          Facade crate with opt-in features
-nanavts-display NanaVTS preview HTTP protocol and winit/wgpu display process
 ```
 
 The dependency direction is one way:
 
 ```text
 live2d-sys -> live2d-core -> live2d-runtime -> live2d-render -> live2d-wgpu
-                                                        \-> nanavts-display
 ```
 
-No Tauri crate is provided in this phase. Tauri applications should launch or embed their own process/window integration and call the normal Rust APIs.
+No Tauri or application-specific display crate is provided. Applications should own their process/window/protocol integration and call the normal Rust APIs.
 
 ## Features
 
@@ -44,7 +42,7 @@ Enable Cubism-backed loading in crates that need real `.moc3` evaluation:
 
 ```powershell
 $env:LIVE2D_CUBISM_SDK_DIR = "C:\path\to\CubismSdkForNative"
-cargo check -p nanavts-display --features live2d-cubism,wgpu,winit
+cargo check -p live2d --features live2d-cubism,wgpu
 ```
 
 ## Runtime API
@@ -65,29 +63,7 @@ let snapshot = instance.snapshot();
 let plan = RenderPlanner::new().build(snapshot);
 ```
 
-Applications that want the built-in wgpu path enable `features = ["wgpu"]` and use `live2d::wgpu::WgpuLive2DRenderer`. The same backend owns the built-in `WgpuPreviewRenderer`; NanaVTS preview code should call that backend instead of keeping local wgpu shader or pipeline state.
-
-## NanaVTS Preview
-
-The preview process preserves the NanaVTS display HTTP surface and consumes the `live2d-wgpu` backend for both model rendering and the no-model preview:
-
-- `GET /schema`
-- `POST /session`
-- `POST /model/inspect`
-- `POST /artmesh-picker/sessions`
-- `GET /artmesh-picker/sessions/{id}`
-
-Run it directly:
-
-```powershell
-cargo run -p nanavts-display --features wgpu,winit
-```
-
-Replay a session fixture:
-
-```powershell
-.\crates\nanavts-display\replay.ps1
-```
+Applications that want the built-in wgpu path enable `features = ["wgpu"]` and use `live2d::wgpu::WgpuLive2DRenderer`. The same backend owns the built-in `WgpuPreviewRenderer`; application preview code should call that backend instead of keeping local wgpu shader or pipeline state.
 
 ## Validation
 
@@ -95,5 +71,5 @@ Replay a session fixture:
 cargo check --workspace --no-default-features
 cargo test --workspace --no-default-features
 cargo check -p live2d --features wgpu
-cargo check -p nanavts-display --features wgpu,winit
+cargo check -p live2d --features live2d-cubism,wgpu
 ```

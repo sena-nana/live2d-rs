@@ -6,7 +6,6 @@ members = [
     "crates/live2d-render",
     "crates/live2d-wgpu",
     "crates/live2d",
-    "crates/nanavts-display",
 ]
 resolver = "2"
 

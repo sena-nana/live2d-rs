@@ -11,7 +11,7 @@ If this repository has a `.codegraph/` directory, use CodeGraph before grep/find
 - Keep `live2d-sys`, `live2d-core`, `live2d-runtime`, and `live2d-render` free of `wgpu`, `winit`, and Tauri types.
 - Do not create a `live2d-tauri` crate or a `tauri` feature in this phase.
 - Do not vendor the official Cubism SDK or generated SDK downloads. Use `LIVE2D_CUBISM_SDK_DIR` for local linking.
-- Preserve the NanaVTS display HTTP protocol when changing `crates/nanavts-display`.
+- Keep application-specific display protocols outside this workspace; NanaVTS preview code belongs in the NanaVTS/VTSTemplate repository.
 - Prefer functional tests over log/string matching. Add tests only when behavior changes.
 
 ## Crate Boundaries
@@ -22,13 +22,11 @@ If this repository has a `.codegraph/` directory, use CodeGraph before grep/find
 - `live2d-render`: platform-neutral render plans and mask/material grouping.
 - `live2d-wgpu`: wgpu resources, pipeline cache, buffers, textures, shaders, Live2D renderer, and built-in preview renderer.
 - `live2d`: facade re-exports with opt-in `wgpu`.
-- `nanavts-display`: NanaVTS preview process, HTTP session protocol, winit event loop, and session-to-backend parameter adaptation.
 
-`nanavts-display` must call `live2d-wgpu` for wgpu rendering. Do not add NanaVTS-local WGSL files, render pipelines, uniform buffers, bind groups, or renderer state there.
+Application display crates must call `live2d-wgpu` for wgpu rendering. Do not add NanaVTS-local WGSL files, render pipelines, uniform buffers, bind groups, or renderer state to this workspace.
 
 ## Validation
 
 - Baseline: `cargo check --workspace --no-default-features`
 - Behavior: `cargo test --workspace --no-default-features`
 - Built-in renderer: `cargo check -p live2d --features wgpu`
-- Previewer: `cargo check -p nanavts-display --features wgpu,winit`
