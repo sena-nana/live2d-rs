@@ -254,13 +254,13 @@ pub struct WgpuLive2DRenderer {
     uniform_bind_group: wgpu::BindGroup,
     uniform_stride: u64,
     uniform_capacity: usize,
-    scene_key: Option<String>,
-    scene_topology: Option<SceneTopology>,
-    texture_cache: Option<TextureCache>,
+    active_scene_key: Option<String>,
+    scene_topologies: HashMap<String, SceneTopology>,
+    texture_caches: HashMap<String, TextureCache>,
     mask_atlas: Option<MaskAtlas>,
     mask_atlas_dirty: bool,
     offscreen_target: Option<OffscreenTarget>,
-    gpu_scene: Option<GpuScene>,
+    gpu_scenes: HashMap<String, GpuScene>,
     render_world: RenderWorld,
     #[cfg(feature = "probe")]
     pending_gpu_timestamps: Vec<GpuTimestampFrame>,
@@ -350,7 +350,6 @@ impl GpuTimestampFrame {
 }
 
 struct TextureCache {
-    model_key: String,
     topology: TextureTopology,
     bind_groups: Vec<wgpu::BindGroup>,
 }
@@ -758,13 +757,13 @@ impl WgpuLive2DRenderer {
             uniform_bind_group,
             uniform_stride,
             uniform_capacity: 1,
-            scene_key: None,
-            scene_topology: None,
-            texture_cache: None,
+            active_scene_key: None,
+            scene_topologies: HashMap::new(),
+            texture_caches: HashMap::new(),
             mask_atlas: None,
             mask_atlas_dirty: true,
             offscreen_target: None,
-            gpu_scene: None,
+            gpu_scenes: HashMap::new(),
             render_world: RenderWorld::new(),
             #[cfg(feature = "probe")]
             pending_gpu_timestamps: Vec::new(),
@@ -1129,6 +1128,17 @@ impl WgpuLive2DRenderer {
         Ok(())
     }
 
+    fn active_gpu_scene(&self) -> Option<&GpuScene> {
+        self.active_scene_key
+            .as_ref()
+            .and_then(|key| self.gpu_scenes.get(key))
+    }
+
+    fn active_gpu_scene_mut(&mut self) -> Option<&mut GpuScene> {
+        let key = self.active_scene_key.clone()?;
+        self.gpu_scenes.get_mut(&key)
+    }
+
     fn encode_render_from_uniform_slot<'pass>(
         &self,
         queue: &wgpu::Queue,
@@ -1139,7 +1149,7 @@ impl WgpuLive2DRenderer {
         first_uniform_slot: usize,
         mask_atlas: Option<&MaskAtlas>,
     ) {
-        let Some(gpu_scene) = &self.gpu_scene else {
+        let Some(gpu_scene) = self.active_gpu_scene() else {
             return;
         };
         let active_mask_atlas = if render_plan.masks.is_empty() {
@@ -1189,7 +1199,7 @@ impl WgpuLive2DRenderer {
     ) where
         P: ProbeSink,
     {
-        let Some(gpu_scene) = &self.gpu_scene else {
+        let Some(gpu_scene) = self.active_gpu_scene() else {
             return;
         };
         let active_mask_atlas = if render_plan.masks.is_empty() {
@@ -1256,7 +1266,10 @@ impl WgpuLive2DRenderer {
         view: &WgpuLive2DView,
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) -> MaskAtlasUpdate {
-        let Some(gpu_scene) = &self.gpu_scene else {
+        let Some(active_scene_key) = self.active_scene_key.clone() else {
+            return MaskAtlasUpdate::default();
+        };
+        let Some(gpu_scene) = self.gpu_scenes.get(&active_scene_key) else {
             return MaskAtlasUpdate::default();
         };
         let slots = render_plan.masks.len();
@@ -1582,29 +1595,30 @@ impl WgpuLive2DRenderer {
         let render_plan = self.render_world.build(snapshot);
         let topology = scene_topology(snapshot);
         let texture_topology = texture_topology(snapshot);
+        let active_scene_changed =
+            self.active_scene_key.as_deref() != Some(snapshot.model_key.as_str());
         let texture_dirty = self
-            .texture_cache
-            .as_ref()
-            .map(|cache| {
-                cache.model_key != snapshot.model_key || cache.topology != texture_topology
-            })
+            .texture_caches
+            .get(&snapshot.model_key)
+            .map(|cache| cache.topology != texture_topology)
             .unwrap_or(true);
         let textures = self.prepare_textures(device, queue, snapshot);
-        if texture_dirty {
+        if active_scene_changed || texture_dirty {
             self.mask_atlas_dirty = true;
         }
-        if self.scene_key.as_deref() == Some(snapshot.model_key.as_str())
-            && self.scene_topology.as_ref() == Some(&topology)
-            && self.gpu_scene.is_some()
+        if self.scene_topologies.get(&snapshot.model_key) == Some(&topology)
+            && self.gpu_scenes.contains_key(&snapshot.model_key)
         {
+            self.active_scene_key = Some(snapshot.model_key.clone());
             self.upload_scene_positions(queue, snapshot, &render_plan);
-            if let Some(gpu_scene) = &mut self.gpu_scene {
+            if let Some(gpu_scene) = self.active_gpu_scene_mut() {
                 gpu_scene.textures = textures;
             }
             return render_plan;
         }
-        self.scene_key = Some(snapshot.model_key.clone());
-        self.scene_topology = Some(topology);
+        self.active_scene_key = Some(snapshot.model_key.clone());
+        self.scene_topologies
+            .insert(snapshot.model_key.clone(), topology);
         self.mask_atlas_dirty = true;
         let positions = gpu_scene_positions(snapshot, &render_plan);
         let uvs = gpu_scene_uvs(snapshot, &render_plan);
@@ -1631,15 +1645,18 @@ impl WgpuLive2DRenderer {
             mapped_at_creation: false,
         });
         queue.write_buffer(&index_buffer, 0, &index_bytes);
-        self.gpu_scene = Some(GpuScene {
-            position_buffer,
-            uv_buffer,
-            index_buffer,
-            positions,
-            vertex_count: render_plan.model.vertex_count,
-            index_count: render_plan.model.index_count,
-            textures,
-        });
+        self.gpu_scenes.insert(
+            snapshot.model_key.clone(),
+            GpuScene {
+                position_buffer,
+                uv_buffer,
+                index_buffer,
+                positions,
+                vertex_count: render_plan.model.vertex_count,
+                index_count: render_plan.model.index_count,
+                textures,
+            },
+        );
         render_plan
     }
 
@@ -1657,21 +1674,21 @@ impl WgpuLive2DRenderer {
         let render_plan = self.render_world.build_with_probe(snapshot, probe);
         let topology = scene_topology(snapshot);
         let texture_topology = texture_topology(snapshot);
+        let active_scene_changed =
+            self.active_scene_key.as_deref() != Some(snapshot.model_key.as_str());
         let texture_dirty = self
-            .texture_cache
-            .as_ref()
-            .map(|cache| {
-                cache.model_key != snapshot.model_key || cache.topology != texture_topology
-            })
+            .texture_caches
+            .get(&snapshot.model_key)
+            .map(|cache| cache.topology != texture_topology)
             .unwrap_or(true);
         let textures = self.prepare_textures_with_probe(device, queue, snapshot, probe);
-        if texture_dirty {
+        if active_scene_changed || texture_dirty {
             self.mask_atlas_dirty = true;
         }
-        if self.scene_key.as_deref() == Some(snapshot.model_key.as_str())
-            && self.scene_topology.as_ref() == Some(&topology)
-            && self.gpu_scene.is_some()
+        if self.scene_topologies.get(&snapshot.model_key) == Some(&topology)
+            && self.gpu_scenes.contains_key(&snapshot.model_key)
         {
+            self.active_scene_key = Some(snapshot.model_key.clone());
             counter(
                 probe,
                 Stage::WgpuSceneTopologyHit,
@@ -1680,7 +1697,7 @@ impl WgpuLive2DRenderer {
                 vec![ProbeAttr::new("cache", "scene_topology")],
             );
             self.upload_scene_positions_with_probe(queue, snapshot, &render_plan, probe);
-            if let Some(gpu_scene) = &mut self.gpu_scene {
+            if let Some(gpu_scene) = self.active_gpu_scene_mut() {
                 gpu_scene.textures = textures;
             }
             return render_plan;
@@ -1692,8 +1709,9 @@ impl WgpuLive2DRenderer {
             1,
             vec![ProbeAttr::new("cache", "scene_topology")],
         );
-        self.scene_key = Some(snapshot.model_key.clone());
-        self.scene_topology = Some(topology);
+        self.active_scene_key = Some(snapshot.model_key.clone());
+        self.scene_topologies
+            .insert(snapshot.model_key.clone(), topology);
         self.mask_atlas_dirty = true;
         let positions = gpu_scene_positions(snapshot, &render_plan);
         let uvs = gpu_scene_uvs(snapshot, &render_plan);
@@ -1751,15 +1769,18 @@ impl WgpuLive2DRenderer {
                     3,
                     Vec::new(),
                 );
-                self.gpu_scene = Some(GpuScene {
-                    position_buffer,
-                    uv_buffer,
-                    index_buffer,
-                    positions,
-                    vertex_count: render_plan.model.vertex_count,
-                    index_count: render_plan.model.index_count,
-                    textures,
-                });
+                self.gpu_scenes.insert(
+                    snapshot.model_key.clone(),
+                    GpuScene {
+                        position_buffer,
+                        uv_buffer,
+                        index_buffer,
+                        positions,
+                        vertex_count: render_plan.model.vertex_count,
+                        index_count: render_plan.model.index_count,
+                        textures,
+                    },
+                );
             },
         );
         render_plan
@@ -1772,8 +1793,8 @@ impl WgpuLive2DRenderer {
         snapshot: &ModelSnapshot,
     ) -> Vec<wgpu::BindGroup> {
         let topology = texture_topology(snapshot);
-        if let Some(cache) = &self.texture_cache {
-            if cache.model_key == snapshot.model_key && cache.topology == topology {
+        if let Some(cache) = self.texture_caches.get(&snapshot.model_key) {
+            if cache.topology == topology {
                 return cache.bind_groups.clone();
             }
         }
@@ -1783,11 +1804,13 @@ impl WgpuLive2DRenderer {
             .iter()
             .map(|texture| self.create_texture_bind_group(device, queue, texture))
             .collect::<Vec<_>>();
-        self.texture_cache = Some(TextureCache {
-            model_key: snapshot.model_key.clone(),
-            topology,
-            bind_groups: bind_groups.clone(),
-        });
+        self.texture_caches.insert(
+            snapshot.model_key.clone(),
+            TextureCache {
+                topology,
+                bind_groups: bind_groups.clone(),
+            },
+        );
         bind_groups
     }
 
@@ -1803,8 +1826,8 @@ impl WgpuLive2DRenderer {
         P: ProbeSink,
     {
         let topology = texture_topology(snapshot);
-        if let Some(cache) = &self.texture_cache {
-            if cache.model_key == snapshot.model_key && cache.topology == topology {
+        if let Some(cache) = self.texture_caches.get(&snapshot.model_key) {
+            if cache.topology == topology {
                 counter(
                     probe,
                     Stage::WgpuTextureCacheHit,
@@ -1856,11 +1879,13 @@ impl WgpuLive2DRenderer {
             bind_groups.len() as u64,
             vec![ProbeAttr::new("resource", "texture_bind_group")],
         );
-        self.texture_cache = Some(TextureCache {
-            model_key: snapshot.model_key.clone(),
-            topology,
-            bind_groups: bind_groups.clone(),
-        });
+        self.texture_caches.insert(
+            snapshot.model_key.clone(),
+            TextureCache {
+                topology,
+                bind_groups: bind_groups.clone(),
+            },
+        );
         bind_groups
     }
 
@@ -1933,7 +1958,7 @@ impl WgpuLive2DRenderer {
         render_plan: &RenderPlan,
     ) {
         let mask_dirty = {
-            let Some(gpu_scene) = &mut self.gpu_scene else {
+            let Some(gpu_scene) = self.active_gpu_scene_mut() else {
                 return;
             };
             if gpu_scene.vertex_count != render_plan.model.vertex_count {
@@ -1957,7 +1982,7 @@ impl WgpuLive2DRenderer {
     ) where
         P: ProbeSink,
     {
-        let Some(gpu_scene) = &self.gpu_scene else {
+        let Some(gpu_scene) = self.active_gpu_scene() else {
             return;
         };
         if gpu_scene.vertex_count != render_plan.model.vertex_count {
@@ -1967,7 +1992,7 @@ impl WgpuLive2DRenderer {
         let mut bytes = 0;
         let mut mask_dirty = false;
         measure(probe, Stage::WgpuPositionUpload, Vec::new(), || {
-            let Some(gpu_scene) = &mut self.gpu_scene else {
+            let Some(gpu_scene) = self.active_gpu_scene_mut() else {
                 return;
             };
             let upload_plan = gpu_position_upload_plan(&gpu_scene.positions, snapshot, render_plan);

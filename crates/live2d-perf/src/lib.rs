@@ -71,7 +71,10 @@ pub mod wgpu_scenarios {
                 scenario_config.mask_groups = scenario_config.mask_groups.max(16);
                 scenario_config.mask_members = scenario_config.mask_members.max(6);
             }
-            let snapshot = synthetic_snapshot(&scenario_config, frame);
+            let mut snapshot = synthetic_snapshot(&scenario_config, frame);
+            if scenario == "wgpu-model-switch" {
+                snapshot.model_key = format!("synthetic-wgpu-switch-{}", frame % 2);
+            }
             let extent = if scenario == "wgpu-resize" {
                 256 + frame as u32 * 32
             } else {
