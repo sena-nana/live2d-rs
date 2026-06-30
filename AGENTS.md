@@ -20,9 +20,11 @@ If this repository has a `.codegraph/` directory, use CodeGraph before grep/find
 - `live2d-core`: safe shared data types and identifiers.
 - `live2d-runtime`: asset resolving, model3 parsing, Cubism-backed loading, snapshots, ArtMesh inspect.
 - `live2d-render`: platform-neutral render plans and mask/material grouping.
-- `live2d-wgpu`: wgpu resources, pipeline cache, buffers, textures, shaders.
+- `live2d-wgpu`: wgpu resources, pipeline cache, buffers, textures, shaders, Live2D renderer, and built-in preview renderer.
 - `live2d`: facade re-exports with opt-in `wgpu`.
-- `nanavts-display`: NanaVTS preview process, HTTP session protocol, winit event loop.
+- `nanavts-display`: NanaVTS preview process, HTTP session protocol, winit event loop, and session-to-backend parameter adaptation.
+
+`nanavts-display` must call `live2d-wgpu` for wgpu rendering. Do not add NanaVTS-local WGSL files, render pipelines, uniform buffers, bind groups, or renderer state there.
 
 ## Validation
 

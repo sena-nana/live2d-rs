@@ -19,9 +19,9 @@ description: Maintain the live2d-rs Rust workspace for Live2D Cubism FFI, safe r
 - `live2d-core`: identifiers, canvas, texture, drawable, ArtMesh, and snapshot types.
 - `live2d-runtime`: `AssetResolver`, model3 resource parsing, Cubism-backed loading, update, snapshot, ArtMesh inspect.
 - `live2d-render`: draw ordering, mask plan, material keys, render commands; no GPU or window types.
-- `live2d-wgpu`: wgpu buffers, textures, bind groups, pipelines, shaders, and renderer state.
+- `live2d-wgpu`: wgpu buffers, textures, bind groups, pipelines, shaders, Live2D renderer state, and built-in preview renderer state.
 - `live2d`: facade re-exports; default features stay platform-independent.
-- `nanavts-display`: NanaVTS session protocol, schema, picker, replay, and winit/wgpu preview executable.
+- `nanavts-display`: NanaVTS session protocol, schema, picker, replay, winit executable, and session-to-backend parameter adaptation.
 
 ## Guardrails
 
@@ -30,6 +30,7 @@ description: Maintain the live2d-rs Rust workspace for Live2D Cubism FFI, safe r
 - Do not add tests that only match log text or exact error strings unless the string is a public protocol field.
 - Keep public API examples in `README.md` aligned with the facade crate.
 - Keep `nanavts-display` as a consumer of the facade, not as a source of core runtime types.
+- Keep wgpu shader, pipeline, uniform-buffer, bind-group, and renderer state in `live2d-wgpu`; `nanavts-display` should call backend renderers instead of owning a local preview renderer.
 
 ## Validation
 

@@ -1,7 +1,7 @@
 use crate::{
     http::{spawn_http_server, DisplayState},
-    live2d::{Live2dGpuRenderer, Live2dScene, Live2dView},
-    preview::PreviewUniform,
+    live2d::{Live2dGpuRenderer, Live2dScene, Live2dView, PreviewGpuRenderer},
+    preview::{preview_uniform_from_session, PreviewUniform},
     replay::{load_replay_session, post_replay_session},
     session,
 };
@@ -268,7 +268,7 @@ impl ApplicationHandler for App {
                             .as_ref()
                             .and_then(|picker| picker.hovered.as_ref())
                             .is_some();
-                        let uniform = PreviewUniform::from_session(
+                        let uniform = preview_uniform_from_session(
                             guard.session.as_ref(),
                             time,
                             renderer.size.width,
@@ -473,9 +473,7 @@ struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: PhysicalSize<u32>,
-    pipeline: wgpu::RenderPipeline,
-    uniform_buffer: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
+    preview_renderer: PreviewGpuRenderer,
     live2d_renderer: Live2dGpuRenderer,
 }
 
@@ -524,67 +522,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("NanaVTS Display Preview Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("preview.wgsl").into()),
-        });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("NanaVTS Preview Uniform"),
-            size: std::mem::size_of::<PreviewUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("NanaVTS Preview Bind Group Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("NanaVTS Preview Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("NanaVTS Preview Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("NanaVTS Preview Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let preview_renderer = PreviewGpuRenderer::new(&device, format);
         let live2d_renderer = Live2dGpuRenderer::new(&device, format);
 
         Self {
@@ -593,9 +531,7 @@ impl Renderer {
             queue,
             config,
             size,
-            pipeline,
-            uniform_buffer,
-            bind_group,
+            preview_renderer,
             live2d_renderer,
         }
     }
@@ -630,9 +566,6 @@ impl Renderer {
             }
             wgpu::CurrentSurfaceTexture::Validation => return Err("surface validation failed"),
         };
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
-
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -673,30 +606,17 @@ impl Renderer {
                         transform,
                         width: self.size.width,
                         height: self.size.height,
-                        effect: live2d_effect_from_preview(uniform),
+                        effect: uniform.live2d_effect(),
                         target_drawable_ids: target_art_mesh_ids,
                     },
                 );
             } else if has_session {
-                pass.set_pipeline(&self.pipeline);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.draw(0..3, 0..1);
+                self.preview_renderer
+                    .render(&self.queue, &mut pass, uniform);
             }
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
     }
-}
-
-fn live2d_effect_from_preview(uniform: PreviewUniform) -> [f32; 4] {
-    let strength = uniform.params0[0].clamp(0.0, 1.0);
-    let brightness = uniform.params0[1].clamp(0.0, 2.0);
-    let opacity = uniform.params3[1].clamp(0.0, 1.0);
-    [
-        (1.0 * (1.0 - strength) + uniform.tint_a[0] * strength * brightness).clamp(0.0, 2.0),
-        (1.0 * (1.0 - strength) + uniform.tint_a[1] * strength * brightness).clamp(0.0, 2.0),
-        (1.0 * (1.0 - strength) + uniform.tint_a[2] * strength * brightness).clamp(0.0, 2.0),
-        opacity,
-    ]
 }

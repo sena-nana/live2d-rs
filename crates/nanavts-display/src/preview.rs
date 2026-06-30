@@ -2,149 +2,90 @@ use crate::{
     catalog,
     session::{self, DisplaySession},
 };
-use bytemuck::{Pod, Zeroable};
+use live2d::wgpu::WgpuPreviewUniform;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
-pub struct PreviewUniform {
-    pub viewport: [f32; 4],
-    pub view_transform: [f32; 4],
-    pub tint_a: [f32; 4],
-    pub tint_b: [f32; 4],
-    pub grad_lo: [f32; 4],
-    pub grad_hi: [f32; 4],
-    pub ptcl_color: [f32; 4],
-    pub damage_fray_color: [f32; 4],
-    pub params0: [f32; 4],
-    pub params1: [f32; 4],
-    pub params2: [f32; 4],
-    pub params3: [f32; 4],
-    pub params4: [f32; 4],
-    pub params5: [f32; 4],
-    pub params6: [f32; 4],
-    pub params7: [f32; 4],
-    pub params8: [f32; 4],
-    pub params9: [f32; 4],
-    pub picker: [f32; 4],
-}
+pub type PreviewUniform = WgpuPreviewUniform;
 
-impl PreviewUniform {
-    pub fn from_session(
-        session: Option<&DisplaySession>,
-        time_seconds: f32,
-        width: u32,
-        height: u32,
-    ) -> Self {
-        let data = active_part_data(session);
-        let values = &data.values;
-        let mut uniform = Self::neutral(time_seconds, width, height);
+pub fn preview_uniform_from_session(
+    session: Option<&DisplaySession>,
+    time_seconds: f32,
+    width: u32,
+    height: u32,
+) -> PreviewUniform {
+    let data = active_part_data(session);
+    let values = &data.values;
+    let mut uniform = PreviewUniform::neutral(time_seconds, width, height);
 
-        uniform.tint_a = read_color(values, "tint", [1.0, 1.0, 1.0, 1.0]);
-        uniform.tint_b = read_color(values, "tint2", [1.0, 1.0, 1.0, 1.0]);
-        uniform.grad_lo = read_color(values, "grad_lo", [0.0, 0.0, 0.0, 1.0]);
-        uniform.grad_hi = read_color(values, "grad_hi", [1.0, 1.0, 1.0, 1.0]);
-        uniform.ptcl_color = read_color(values, "ptcl_color", [1.0, 1.0, 1.0, 1.0]);
-        uniform.damage_fray_color =
-            read_color(values, "damage_fray_color", [0.92, 0.88, 0.80, 1.0]);
+    uniform.tint_a = read_color(values, "tint", [1.0, 1.0, 1.0, 1.0]);
+    uniform.tint_b = read_color(values, "tint2", [1.0, 1.0, 1.0, 1.0]);
+    uniform.grad_lo = read_color(values, "grad_lo", [0.0, 0.0, 0.0, 1.0]);
+    uniform.grad_hi = read_color(values, "grad_hi", [1.0, 1.0, 1.0, 1.0]);
+    uniform.ptcl_color = read_color(values, "ptcl_color", [1.0, 1.0, 1.0, 1.0]);
+    uniform.damage_fray_color = read_color(values, "damage_fray_color", [0.92, 0.88, 0.80, 1.0]);
 
-        uniform.params0 = [
-            read_f32(values, "strength", 0.0).clamp(0.0, 1.0),
-            read_f32(values, "brightness", 1.0).clamp(0.0, 2.0),
-            enabled(&data, "flow"),
-            read_f32(values, "flow_speed", 1.0).clamp(0.0, 5.0),
-        ];
-        uniform.params1 = [
-            read_f32(values, "flow_scale", 1.0).clamp(0.0, 5.0),
-            read_f32(values, "grad_amount", 0.0).clamp(0.0, 1.0),
-            read_f32(values, "hue", 0.0).clamp(-180.0, 180.0),
-            read_f32(values, "hue_cycle", 0.0).clamp(-180.0, 180.0),
-        ];
-        uniform.params2 = [
-            read_f32(values, "posterize", 0.0).clamp(0.0, 16.0),
-            read_f32(values, "pulse_amount", 0.0).clamp(0.0, 1.0),
-            read_f32(values, "pulse_speed", 2.0).clamp(0.0, 8.0),
-            read_f32(values, "saturation", 1.0).clamp(0.0, 2.0),
-        ];
-        uniform.params3 = [
-            read_f32(values, "contrast", 1.0).clamp(0.0, 2.0),
-            read_f32(values, "opacity", 1.0).clamp(0.0, 1.0),
-            read_f32(values, "scale", 1.0).clamp(0.1, 3.0),
-            read_f32(values, "sphere_progress", 0.0).clamp(0.0, 1.0),
-        ];
-        uniform.params4 = [
-            read_f32(values, "sphere_angle_z", 0.0).clamp(-180.0, 180.0),
-            read_f32(values, "sphere_speed_z", 0.0).clamp(-360.0, 360.0),
-            read_f32(values, "sphere_shade", 0.35).clamp(0.0, 1.0),
-            read_f32(values, "dissolve_progress", 0.0).clamp(0.0, 1.0),
-        ];
-        uniform.params5 = [
-            read_f32(values, "dissolve_block_size", 0.12).clamp(0.02, 0.5),
-            read_f32(values, "dissolve_glow", 1.25).max(0.0),
-            enabled(&data, "particle"),
-            read_f32(values, "ptcl_shape", 2.0).clamp(0.0, 3.0),
-        ];
-        uniform.params6 = [
-            read_f32(values, "ptcl_density", 1.0).clamp(0.0, 5.0),
-            read_f32(values, "ptcl_size", 0.2).clamp(0.0, 1.0),
-            read_f32(values, "ptcl_speed", 1.0).clamp(0.0, 5.0),
-            read_f32(values, "damage_amount", 0.0).clamp(0.0, 1.0),
-        ];
-        uniform.params7 = [
-            read_f32(values, "damage_count", 18.0).clamp(1.0, 24.0),
-            read_f32(values, "damage_spread", 0.15).clamp(0.0, 0.5),
-            read_f32(values, "damage_size", 0.65).clamp(0.0, 1.0),
-            read_f32(values, "damage_corex", 0.0).clamp(-0.25, 0.25),
-        ];
-        uniform.params8 = [
-            read_f32(values, "damage_corey", 0.0).clamp(-0.25, 0.25),
-            read_f32(values, "damage_falloff", 0.5).clamp(0.0, 1.0),
-            read_f32(values, "damage_elong", 0.6).clamp(0.1, 1.5),
-            read_f32(values, "damage_angle", 0.0).rem_euclid(360.0),
-        ];
-        uniform.params9 = [
-            read_f32(values, "damage_ragged", 0.4).clamp(0.0, 1.0),
-            read_f32(values, "damage_fray", 0.4).clamp(0.0, 1.0),
-            read_f32(values, "damage_seed", 0.0),
-            enabled(&data, "damage"),
-        ];
-        uniform
-    }
-
-    fn neutral(time_seconds: f32, width: u32, height: u32) -> Self {
-        Self {
-            viewport: [time_seconds, width.max(1) as f32, height.max(1) as f32, 0.0],
-            view_transform: [0.0, 0.0, 1.0, 0.0],
-            tint_a: [1.0, 1.0, 1.0, 1.0],
-            tint_b: [1.0, 1.0, 1.0, 1.0],
-            grad_lo: [0.0, 0.0, 0.0, 1.0],
-            grad_hi: [1.0, 1.0, 1.0, 1.0],
-            ptcl_color: [1.0, 1.0, 1.0, 1.0],
-            damage_fray_color: [0.92, 0.88, 0.80, 1.0],
-            params0: [0.0, 1.0, 0.0, 1.0],
-            params1: [1.0, 0.0, 0.0, 0.0],
-            params2: [0.0, 0.0, 2.0, 1.0],
-            params3: [1.0, 1.0, 1.0, 0.0],
-            params4: [0.0, 0.0, 0.35, 0.0],
-            params5: [0.12, 1.25, 0.0, 2.0],
-            params6: [1.0, 0.2, 1.0, 0.0],
-            params7: [18.0, 0.15, 0.65, 0.0],
-            params8: [0.0, 0.5, 0.6, 0.0],
-            params9: [0.4, 0.4, 0.0, 0.0],
-            picker: [0.0, 0.0, 0.0, 0.0],
-        }
-    }
-
-    pub fn with_picker_hover(mut self, active: bool) -> Self {
-        self.picker[0] = if active { 1.0 } else { 0.0 };
-        self
-    }
-
-    pub fn with_view_transform(mut self, transform: [f32; 4]) -> Self {
-        self.view_transform = transform;
-        self
-    }
+    uniform.params0 = [
+        read_f32(values, "strength", 0.0).clamp(0.0, 1.0),
+        read_f32(values, "brightness", 1.0).clamp(0.0, 2.0),
+        enabled(&data, "flow"),
+        read_f32(values, "flow_speed", 1.0).clamp(0.0, 5.0),
+    ];
+    uniform.params1 = [
+        read_f32(values, "flow_scale", 1.0).clamp(0.0, 5.0),
+        read_f32(values, "grad_amount", 0.0).clamp(0.0, 1.0),
+        read_f32(values, "hue", 0.0).clamp(-180.0, 180.0),
+        read_f32(values, "hue_cycle", 0.0).clamp(-180.0, 180.0),
+    ];
+    uniform.params2 = [
+        read_f32(values, "posterize", 0.0).clamp(0.0, 16.0),
+        read_f32(values, "pulse_amount", 0.0).clamp(0.0, 1.0),
+        read_f32(values, "pulse_speed", 2.0).clamp(0.0, 8.0),
+        read_f32(values, "saturation", 1.0).clamp(0.0, 2.0),
+    ];
+    uniform.params3 = [
+        read_f32(values, "contrast", 1.0).clamp(0.0, 2.0),
+        read_f32(values, "opacity", 1.0).clamp(0.0, 1.0),
+        read_f32(values, "scale", 1.0).clamp(0.1, 3.0),
+        read_f32(values, "sphere_progress", 0.0).clamp(0.0, 1.0),
+    ];
+    uniform.params4 = [
+        read_f32(values, "sphere_angle_z", 0.0).clamp(-180.0, 180.0),
+        read_f32(values, "sphere_speed_z", 0.0).clamp(-360.0, 360.0),
+        read_f32(values, "sphere_shade", 0.35).clamp(0.0, 1.0),
+        read_f32(values, "dissolve_progress", 0.0).clamp(0.0, 1.0),
+    ];
+    uniform.params5 = [
+        read_f32(values, "dissolve_block_size", 0.12).clamp(0.02, 0.5),
+        read_f32(values, "dissolve_glow", 1.25).max(0.0),
+        enabled(&data, "particle"),
+        read_f32(values, "ptcl_shape", 2.0).clamp(0.0, 3.0),
+    ];
+    uniform.params6 = [
+        read_f32(values, "ptcl_density", 1.0).clamp(0.0, 5.0),
+        read_f32(values, "ptcl_size", 0.2).clamp(0.0, 1.0),
+        read_f32(values, "ptcl_speed", 1.0).clamp(0.0, 5.0),
+        read_f32(values, "damage_amount", 0.0).clamp(0.0, 1.0),
+    ];
+    uniform.params7 = [
+        read_f32(values, "damage_count", 18.0).clamp(1.0, 24.0),
+        read_f32(values, "damage_spread", 0.15).clamp(0.0, 0.5),
+        read_f32(values, "damage_size", 0.65).clamp(0.0, 1.0),
+        read_f32(values, "damage_corex", 0.0).clamp(-0.25, 0.25),
+    ];
+    uniform.params8 = [
+        read_f32(values, "damage_corey", 0.0).clamp(-0.25, 0.25),
+        read_f32(values, "damage_falloff", 0.5).clamp(0.0, 1.0),
+        read_f32(values, "damage_elong", 0.6).clamp(0.1, 1.5),
+        read_f32(values, "damage_angle", 0.0).rem_euclid(360.0),
+    ];
+    uniform.params9 = [
+        read_f32(values, "damage_ragged", 0.4).clamp(0.0, 1.0),
+        read_f32(values, "damage_fray", 0.4).clamp(0.0, 1.0),
+        read_f32(values, "damage_seed", 0.0),
+        enabled(&data, "damage"),
+    ];
+    uniform
 }
 
 struct PreviewData {
@@ -344,7 +285,7 @@ mod tests {
             ..Default::default()
         };
 
-        let uniform = PreviewUniform::from_session(Some(&session), 1.5, 800, 600);
+        let uniform = preview_uniform_from_session(Some(&session), 1.5, 800, 600);
 
         assert_eq!(uniform.tint_a[0], 1.0);
         assert_eq!(uniform.params0[2], 1.0);
@@ -378,7 +319,7 @@ mod tests {
             ..Default::default()
         };
 
-        let uniform = PreviewUniform::from_session(Some(&session), 0.0, 1, 1);
+        let uniform = preview_uniform_from_session(Some(&session), 0.0, 1, 1);
 
         assert_eq!(uniform.params0[0], 0.5);
         assert_eq!(uniform.params5[2], 0.0);
@@ -415,7 +356,7 @@ mod tests {
             ..Default::default()
         };
 
-        let uniform = PreviewUniform::from_session(Some(&session), 0.0, 1, 1);
+        let uniform = preview_uniform_from_session(Some(&session), 0.0, 1, 1);
 
         assert_eq!(uniform.params0[0], 0.0);
         assert_eq!(uniform.params1[2], 45.0);

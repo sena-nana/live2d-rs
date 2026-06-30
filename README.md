@@ -11,7 +11,7 @@ live2d-sys      Cubism Core FFI and SDK link probing
 live2d-core     Platform-independent model, drawable, canvas, texture, and identifier types
 live2d-runtime  Asset resolving, model3 parsing, model loading, update, snapshot, ArtMesh inspect
 live2d-render   Snapshot-to-RenderPlan conversion without wgpu or window-system types
-live2d-wgpu     Optional wgpu backend and built-in WGSL renderer
+live2d-wgpu     Optional wgpu backend, Live2D renderer, preview renderer, and WGSL assets
 live2d          Facade crate with opt-in features
 nanavts-display NanaVTS preview HTTP protocol and winit/wgpu display process
 ```
@@ -65,11 +65,11 @@ let snapshot = instance.snapshot();
 let plan = RenderPlanner::new().build(snapshot);
 ```
 
-Applications that want the built-in wgpu path enable `features = ["wgpu"]` and use `live2d::wgpu::WgpuLive2DRenderer`.
+Applications that want the built-in wgpu path enable `features = ["wgpu"]` and use `live2d::wgpu::WgpuLive2DRenderer`. The same backend owns the built-in `WgpuPreviewRenderer`; NanaVTS preview code should call that backend instead of keeping local wgpu shader or pipeline state.
 
 ## NanaVTS Preview
 
-The preview process preserves the NanaVTS display HTTP surface:
+The preview process preserves the NanaVTS display HTTP surface and consumes the `live2d-wgpu` backend for both model rendering and the no-model preview:
 
 - `GET /schema`
 - `POST /session`

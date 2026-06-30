@@ -15,7 +15,6 @@ path = "src/main.rs"
 required-features = ["wgpu", "winit"]
 
 [dependencies]
-bytemuck.workspace = true
 live2d.workspace = true
 pollster = { workspace = true, optional = true }
 serde.workspace = true

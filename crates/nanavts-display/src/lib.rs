@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod http;
 pub mod live2d;
 pub mod model;
+#[cfg(feature = "wgpu")]
 pub mod preview;
 pub mod replay;
 pub mod session;

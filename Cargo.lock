@@ -939,7 +939,6 @@ dependencies = [
 name = "nanavts-display"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
  "live2d",
  "pollster",
  "serde",

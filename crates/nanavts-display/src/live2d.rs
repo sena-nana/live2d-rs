@@ -7,6 +7,9 @@ pub type Live2dScene = live2d::core::ModelSnapshot;
 pub type Live2dGpuRenderer = live2d::wgpu::WgpuLive2DRenderer;
 
 #[cfg(feature = "wgpu")]
+pub type PreviewGpuRenderer = live2d::wgpu::WgpuPreviewRenderer;
+
+#[cfg(feature = "wgpu")]
 pub type Live2dView = live2d::wgpu::WgpuLive2DView;
 
 pub fn inspect_art_meshes(model_json_path: impl AsRef<Path>) -> Result<Vec<ArtMeshItem>, String> {
