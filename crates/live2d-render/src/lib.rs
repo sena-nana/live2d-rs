@@ -41,6 +41,12 @@ impl DrawableTable {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+struct MaskGroupTable {
+    masks: Vec<MaskPass>,
+    mask_refs_by_row: Vec<Option<MaskRef>>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaskPass {
     pub id: MaskRef,
@@ -175,38 +181,20 @@ impl RenderPlanner {
 
     pub fn build(&self, snapshot: &ModelSnapshot) -> RenderPlan {
         let (model, table) = build_model_ctx_and_table(snapshot);
-        let mut mask_refs = HashMap::new();
         let ordered_rows = sorted_drawable_rows(&table);
+        let mask_table = build_mask_group_table(snapshot, &table, &ordered_rows);
 
-        let mut masks = Vec::new();
         let draws = ordered_rows
             .into_iter()
             .map(|row| {
-                let drawable = &snapshot.drawables[table.source_indices[row]];
-                let mask = drawable.clipping.as_ref().map(|clipping| {
-                    let mask_key = MaskKey {
-                        drawable_ids: &clipping.drawable_ids,
-                        inverted: clipping.inverted,
-                    };
-                    if let Some(mask_ref) = mask_refs.get(&mask_key) {
-                        return *mask_ref;
-                    }
-                    let mask_ref = MaskRef(masks.len());
-                    masks.push(MaskPass {
-                        id: mask_ref,
-                        drawable_ids: clipping.drawable_ids.clone(),
-                        inverted: clipping.inverted,
-                    });
-                    mask_refs.insert(mask_key, mask_ref);
-                    mask_ref
-                });
+                let mask = mask_table.mask_refs_by_row[row];
                 draw_command_for_row(snapshot, &table, row, mask)
             })
             .collect();
 
         RenderPlan {
             model,
-            masks,
+            masks: mask_table.masks,
             draws,
         }
     }
@@ -227,12 +215,16 @@ impl RenderPlanner {
                 let (model, table) = measure(probe, Stage::RenderModelCtxBuild, Vec::new(), || {
                     build_model_ctx_and_table(snapshot)
                 });
-                let mut mask_refs = HashMap::new();
                 let ordered_rows = measure(probe, Stage::RenderOrderSort, Vec::new(), || {
                     sorted_drawable_rows(&table)
                 });
 
-                let mut masks = Vec::new();
+                let mask_table = measure(
+                    probe,
+                    Stage::RenderMaskDedup,
+                    vec![ProbeAttr::new("candidate_drawables", ordered_rows.len())],
+                    || build_mask_group_table(snapshot, &table, &ordered_rows),
+                );
                 let draws = measure(
                     probe,
                     Stage::RenderDrawCommandBuild,
@@ -241,34 +233,7 @@ impl RenderPlanner {
                         ordered_rows
                             .into_iter()
                             .map(|row| {
-                                let drawable = &snapshot.drawables[table.source_indices[row]];
-                                let mask = drawable.clipping.as_ref().map(|clipping| {
-                                    measure(
-                                        probe,
-                                        Stage::RenderMaskDedup,
-                                        vec![ProbeAttr::new(
-                                            "mask_drawables",
-                                            clipping.drawable_ids.len(),
-                                        )],
-                                        || {
-                                            let mask_key = MaskKey {
-                                                drawable_ids: &clipping.drawable_ids,
-                                                inverted: clipping.inverted,
-                                            };
-                                            if let Some(mask_ref) = mask_refs.get(&mask_key) {
-                                                return *mask_ref;
-                                            }
-                                            let mask_ref = MaskRef(masks.len());
-                                            masks.push(MaskPass {
-                                                id: mask_ref,
-                                                drawable_ids: clipping.drawable_ids.clone(),
-                                                inverted: clipping.inverted,
-                                            });
-                                            mask_refs.insert(mask_key, mask_ref);
-                                            mask_ref
-                                        },
-                                    )
-                                });
+                                let mask = mask_table.mask_refs_by_row[row];
                                 draw_command_for_row(snapshot, &table, row, mask)
                             })
                             .collect::<Vec<_>>()
@@ -286,12 +251,12 @@ impl RenderPlanner {
                     probe,
                     Stage::RenderPlanTotal,
                     "resource_rebuilds",
-                    masks.len() as u64,
+                    mask_table.masks.len() as u64,
                     vec![ProbeAttr::new("resource", "mask_pass")],
                 );
                 RenderPlan {
                     model,
-                    masks,
+                    masks: mask_table.masks,
                     draws,
                 }
             },
@@ -356,6 +321,45 @@ fn sorted_drawable_rows(table: &DrawableTable) -> Vec<usize> {
     let mut rows = (0..table.len()).collect::<Vec<_>>();
     rows.sort_by_key(|row| table.render_orders[*row]);
     rows
+}
+
+fn build_mask_group_table(
+    snapshot: &ModelSnapshot,
+    table: &DrawableTable,
+    ordered_rows: &[usize],
+) -> MaskGroupTable {
+    let mut mask_refs = HashMap::new();
+    let mut masks = Vec::new();
+    let mut mask_refs_by_row = vec![None; table.len()];
+
+    for &row in ordered_rows {
+        let drawable = &snapshot.drawables[table.source_indices[row]];
+        let Some(clipping) = drawable.clipping.as_ref() else {
+            continue;
+        };
+        let mask_key = MaskKey {
+            drawable_ids: &clipping.drawable_ids,
+            inverted: clipping.inverted,
+        };
+        let mask_ref = if let Some(mask_ref) = mask_refs.get(&mask_key) {
+            *mask_ref
+        } else {
+            let mask_ref = MaskRef(masks.len());
+            masks.push(MaskPass {
+                id: mask_ref,
+                drawable_ids: clipping.drawable_ids.clone(),
+                inverted: clipping.inverted,
+            });
+            mask_refs.insert(mask_key, mask_ref);
+            mask_ref
+        };
+        mask_refs_by_row[row] = Some(mask_ref);
+    }
+
+    MaskGroupTable {
+        masks,
+        mask_refs_by_row,
+    }
 }
 
 fn draw_command_for_row(
