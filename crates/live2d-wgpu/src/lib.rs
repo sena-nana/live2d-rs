@@ -8,6 +8,7 @@ use live2d_render::{
 use std::collections::{HashMap, HashSet};
 
 const MASK_ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const MASK_DRAW_LOOKUP_INDEX_THRESHOLD: usize = 8 * 1024;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -430,6 +431,39 @@ struct WgpuRenderBackend<'a, 'pass, 'view> {
     canvas: [f32; 4],
     view: &'view WgpuLive2DView,
     target_ids: HashSet<&'view str>,
+}
+
+enum MaskDrawLookup<'a> {
+    Linear(&'a [DrawCommand]),
+    Indexed(HashMap<&'a str, &'a DrawCommand>),
+}
+
+impl<'a> MaskDrawLookup<'a> {
+    fn new(render_plan: &'a RenderPlan) -> Self {
+        let potential_comparisons = render_plan
+            .draws
+            .len()
+            .saturating_mul(mask_draw_call_count(render_plan));
+        if potential_comparisons <= MASK_DRAW_LOOKUP_INDEX_THRESHOLD {
+            return Self::Linear(&render_plan.draws);
+        }
+
+        let lookup = render_plan
+            .draws
+            .iter()
+            .map(|draw| (draw.drawable_id.as_ref(), draw))
+            .collect();
+        Self::Indexed(lookup)
+    }
+
+    fn get(&self, drawable_id: &str) -> Option<&'a DrawCommand> {
+        match self {
+            Self::Linear(draws) => draws
+                .iter()
+                .find(|draw| draw.drawable_id.as_ref() == drawable_id),
+            Self::Indexed(lookup) => lookup.get(drawable_id).copied(),
+        }
+    }
 }
 
 struct PipelineCache {
@@ -1275,7 +1309,22 @@ impl WgpuLive2DRenderer {
         pass.set_index_buffer(gpu_scene.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.set_bind_group(2, &self.fallback_mask_bind_group, &[]);
 
-        let mut uniform_slot = 0;
+        let draw_lookup = MaskDrawLookup::new(render_plan);
+        let mask_uniform = Live2dUniform {
+            viewport: [
+                mask_atlas.slot_width as f32,
+                mask_atlas.slot_height as f32,
+                0.0,
+                0.0,
+            ],
+            view_transform: view.transform,
+            canvas: live2d_canvas_uniform(canvas),
+            effect: [1.0, 1.0, 1.0, 1.0],
+            mask: [0.0, 0.0, 0.0, 0.0],
+        };
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&mask_uniform));
+        pass.set_bind_group(0, &self.uniform_bind_group, &[0]);
+
         for (slot, mask) in render_plan.masks.iter().enumerate() {
             let slot_x = (slot % mask_atlas.columns) as f32 * mask_atlas.slot_width as f32;
             let slot_y = (slot / mask_atlas.columns) as f32 * mask_atlas.slot_height as f32;
@@ -1289,7 +1338,7 @@ impl WgpuLive2DRenderer {
                 1.0,
             );
             for drawable_id in &mask.drawable_ids {
-                let Some(draw) = draw_command_for_id(render_plan, drawable_id.as_ref()) else {
+                let Some(draw) = draw_lookup.get(drawable_id.as_ref()) else {
                     continue;
                 };
                 let Some(texture) = gpu_scene.textures.get(draw.texture_index) else {
@@ -1298,26 +1347,6 @@ impl WgpuLive2DRenderer {
                 let Ok(base_vertex) = i32::try_from(draw.vertex_range.start) else {
                     continue;
                 };
-                let uniform = Live2dUniform {
-                    viewport: [
-                        mask_atlas.slot_width as f32,
-                        mask_atlas.slot_height as f32,
-                        0.0,
-                        0.0,
-                    ],
-                    view_transform: view.transform,
-                    canvas: live2d_canvas_uniform(canvas),
-                    effect: [1.0, 1.0, 1.0, 1.0],
-                    mask: [0.0, 0.0, 0.0, 0.0],
-                };
-                let uniform_offset = self.uniform_stride * uniform_slot as u64;
-                uniform_slot += 1;
-                queue.write_buffer(
-                    &self.uniform_buffer,
-                    uniform_offset,
-                    bytemuck::bytes_of(&uniform),
-                );
-                pass.set_bind_group(0, &self.uniform_bind_group, &[uniform_offset as u32]);
                 pass.set_bind_group(1, texture, &[]);
                 pass.insert_debug_marker(draw.drawable_id.as_ref());
                 pass.draw_indexed(draw.index_range.clone(), base_vertex, 0..1);
@@ -1397,7 +1426,7 @@ impl WgpuLive2DRenderer {
             Stage::WgpuMaskPassEncode,
             vec![
                 ProbeAttr::new("masks", render_plan.masks.len()),
-                ProbeAttr::new("mask_draw_calls", mask_uniform_slots(render_plan)),
+                ProbeAttr::new("mask_draw_calls", mask_draw_call_count(render_plan)),
             ],
             || {
                 self.prepare_mask_atlas(
@@ -1415,7 +1444,7 @@ impl WgpuLive2DRenderer {
             probe,
             Stage::WgpuMaskPassEncode,
             "draw_calls",
-            mask_uniform_slots(render_plan) as u64,
+            mask_draw_call_count(render_plan) as u64,
             Vec::new(),
         );
         counter(
@@ -2009,6 +2038,10 @@ fn uniform_slots(render_plan: &RenderPlan) -> usize {
 }
 
 fn mask_uniform_slots(render_plan: &RenderPlan) -> usize {
+    usize::from(!render_plan.masks.is_empty())
+}
+
+fn mask_draw_call_count(render_plan: &RenderPlan) -> usize {
     render_plan
         .masks
         .iter()
@@ -2217,16 +2250,6 @@ fn mask_uniform_for_layout(draw: &DrawCommand, layout: Option<MaskAtlasLayout>) 
             slot_scale_y
         },
     ]
-}
-
-fn draw_command_for_id<'a>(
-    render_plan: &'a RenderPlan,
-    drawable_id: &str,
-) -> Option<&'a DrawCommand> {
-    render_plan
-        .draws
-        .iter()
-        .find(|draw| draw.drawable_id.as_ref() == drawable_id)
 }
 
 fn create_live2d_pipeline(
@@ -2599,6 +2622,35 @@ mod tests {
 
         assert_eq!(mask_uniform_slots(&render_plan), 1);
         assert_eq!(uniform_slots(&render_plan), 3);
+    }
+
+    #[test]
+    fn mask_writer_uniform_slot_is_shared_across_mask_draws() {
+        let mut snapshot = masked_snapshot();
+        snapshot.drawables.push(Drawable {
+            id: DrawableId::from("mask_extra"),
+            render_order: 2,
+            texture_index: 0,
+            vertices: vec![Vertex {
+                position: [2.0, 2.0],
+                uv: [0.0, 0.0],
+            }],
+            indices: vec![0],
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            clipping: None,
+        });
+        snapshot.drawables[1]
+            .clipping
+            .as_mut()
+            .expect("masked drawable has clipping")
+            .drawable_ids
+            .push(DrawableId::from("mask_extra"));
+        let render_plan = RenderPlanner::new().build(&snapshot);
+
+        assert_eq!(mask_draw_call_count(&render_plan), 2);
+        assert_eq!(mask_uniform_slots(&render_plan), 1);
+        assert_eq!(uniform_slots(&render_plan), render_plan.draws.len() + 1);
     }
 
     #[test]
