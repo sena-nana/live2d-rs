@@ -6,3 +6,6 @@ pub use live2d_runtime as runtime;
 pub use live2d_wgpu as wgpu;
 
 pub use live2d_runtime::Live2DInstance;
+
+#[cfg(feature = "probe")]
+pub use live2d_probe as probe;

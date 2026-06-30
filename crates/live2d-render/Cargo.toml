@@ -7,3 +7,8 @@ repository.workspace = true
 
 [dependencies]
 live2d-core.workspace = true
+live2d-probe = { workspace = true, optional = true }
+
+[features]
+default = []
+probe = ["dep:live2d-probe"]

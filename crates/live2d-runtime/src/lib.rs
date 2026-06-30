@@ -1,6 +1,10 @@
 use live2d_core::{ArtMeshInfo, ModelSnapshot};
 #[cfg(feature = "live2d-cubism")]
 use live2d_core::{BlendMode, CanvasInfo, Drawable, DrawableId, TextureAsset, Vertex};
+#[cfg(all(feature = "probe", feature = "live2d-cubism"))]
+use live2d_probe::ProbeAttr;
+#[cfg(feature = "probe")]
+use live2d_probe::{counter, measure, ProbeSink, Stage};
 use serde_json::Value;
 use std::{
     fs,
@@ -131,12 +135,119 @@ pub fn resolve_model_files(model_json_path: impl AsRef<Path>) -> Result<ModelFil
     })
 }
 
+#[cfg(feature = "probe")]
+pub fn resolve_model_files_with_probe<P>(
+    model_json_path: impl AsRef<Path>,
+    probe: &P,
+) -> Result<ModelFiles, String>
+where
+    P: ProbeSink,
+{
+    measure(probe, Stage::RuntimeAssetResolve, Vec::new(), || {
+        let model_json_path = model_json_path.as_ref();
+        if model_json_path.as_os_str().is_empty() {
+            return Err("invalid_live2d_model_path".into());
+        }
+        if !model_json_path.exists() {
+            return Err("live2d_model_not_found".into());
+        }
+
+        let raw = measure(probe, Stage::RuntimeModel3Read, Vec::new(), || {
+            fs::read_to_string(model_json_path).map_err(|_| "live2d_model_unreadable")
+        })?;
+        counter(
+            probe,
+            Stage::RuntimeModel3Read,
+            "bytes",
+            raw.len() as u64,
+            Vec::new(),
+        );
+        let json: Value = measure(probe, Stage::RuntimeModel3Parse, Vec::new(), || {
+            serde_json::from_str(&raw).map_err(|_| "invalid_model3_json")
+        })?;
+        let model_root = model_json_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let file_refs = json.get("FileReferences").unwrap_or(&Value::Null);
+        let moc = file_refs
+            .get("Moc")
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .ok_or_else(|| "live2d_moc_not_declared".to_string())?;
+
+        let mut missing_files = Vec::new();
+        let moc_path = model_root.join(moc);
+        if !moc_path.exists() {
+            missing_files.push(normalize_relative_path(moc));
+        }
+
+        let mut texture_paths = Vec::new();
+        if let Some(textures) = file_refs.get("Textures").and_then(Value::as_array) {
+            for texture in textures.iter().filter_map(Value::as_str) {
+                let path = model_root.join(texture);
+                if !path.exists() {
+                    missing_files.push(normalize_relative_path(texture));
+                }
+                texture_paths.push(path);
+            }
+        }
+
+        missing_files.sort();
+        missing_files.dedup();
+        counter(
+            probe,
+            Stage::RuntimeAssetResolve,
+            "texture_refs",
+            texture_paths.len() as u64,
+            Vec::new(),
+        );
+        counter(
+            probe,
+            Stage::RuntimeAssetResolve,
+            "missing_files",
+            missing_files.len() as u64,
+            Vec::new(),
+        );
+
+        Ok(ModelFiles {
+            model_json_path: model_json_path.to_path_buf(),
+            model_root,
+            moc_path,
+            texture_paths,
+            missing_files,
+        })
+    })
+}
+
 pub fn inspect_art_meshes(model_json_path: impl AsRef<Path>) -> Result<Vec<ArtMeshInfo>, String> {
     runtime::inspect_art_meshes(model_json_path.as_ref())
 }
 
 pub fn load_snapshot(model_json_path: impl AsRef<Path>) -> Result<ModelSnapshot, String> {
     runtime::load_snapshot(model_json_path.as_ref())
+}
+
+#[cfg(feature = "probe")]
+pub fn inspect_art_meshes_with_probe<P>(
+    model_json_path: impl AsRef<Path>,
+    probe: &P,
+) -> Result<Vec<ArtMeshInfo>, String>
+where
+    P: ProbeSink,
+{
+    runtime::inspect_art_meshes_with_probe(model_json_path.as_ref(), probe)
+}
+
+#[cfg(feature = "probe")]
+pub fn load_snapshot_with_probe<P>(
+    model_json_path: impl AsRef<Path>,
+    probe: &P,
+) -> Result<ModelSnapshot, String>
+where
+    P: ProbeSink,
+{
+    runtime::load_snapshot_with_probe(model_json_path.as_ref(), probe)
 }
 
 fn normalize_relative_path(path: &str) -> String {
@@ -161,6 +272,34 @@ mod runtime {
             return Err("live2d_model_assets_missing".into());
         }
         Err(RUNTIME_UNAVAILABLE.into())
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn inspect_art_meshes_with_probe<P>(
+        model_json_path: &Path,
+        probe: &P,
+    ) -> Result<Vec<ArtMeshInfo>, String>
+    where
+        P: ProbeSink,
+    {
+        Ok(load_snapshot_with_probe(model_json_path, probe)?.art_meshes)
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn load_snapshot_with_probe<P>(
+        model_json_path: &Path,
+        probe: &P,
+    ) -> Result<ModelSnapshot, String>
+    where
+        P: ProbeSink,
+    {
+        measure(probe, Stage::RuntimeLoadSnapshot, Vec::new(), || {
+            let files = resolve_model_files_with_probe(model_json_path, probe)?;
+            if !files.missing_files.is_empty() {
+                return Err("live2d_model_assets_missing".into());
+            }
+            Err(RUNTIME_UNAVAILABLE.into())
+        })
     }
 }
 
@@ -210,6 +349,101 @@ mod runtime {
             art_meshes,
             drawables,
             textures,
+        })
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn inspect_art_meshes_with_probe<P>(
+        model_json_path: &Path,
+        probe: &P,
+    ) -> Result<Vec<ArtMeshInfo>, String>
+    where
+        P: ProbeSink,
+    {
+        Ok(load_snapshot_with_probe(model_json_path, probe)?.art_meshes)
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn load_snapshot_with_probe<P>(
+        model_json_path: &Path,
+        probe: &P,
+    ) -> Result<ModelSnapshot, String>
+    where
+        P: ProbeSink,
+    {
+        measure(probe, Stage::RuntimeLoadSnapshot, Vec::new(), || {
+            let files = resolve_model_files_with_probe(model_json_path, probe)?;
+            if !files.missing_files.is_empty() {
+                return Err("live2d_model_assets_missing".into());
+            }
+            let textures = load_textures_with_probe(&files.texture_paths, probe)?;
+            let mut moc_bytes = measure(probe, Stage::RuntimeMocRead, Vec::new(), || {
+                fs::read(&files.moc_path).map_err(|_| "live2d_moc_unreadable")
+            })?;
+            counter(
+                probe,
+                Stage::RuntimeMocRead,
+                "bytes",
+                moc_bytes.len() as u64,
+                Vec::new(),
+            );
+            let moc = measure(probe, Stage::RuntimeMocRevive, Vec::new(), || unsafe {
+                live2d_sys::csmReviveMocInPlace(moc_bytes.as_mut_ptr().cast(), moc_bytes.len() as _)
+            });
+            if moc.is_null() {
+                return Err("live2d_moc_invalid".into());
+            }
+            let model_size = measure(
+                probe,
+                Stage::RuntimeModelAllocation,
+                Vec::new(),
+                || unsafe { live2d_sys::csmGetSizeofModel(moc) as usize },
+            );
+            if model_size == 0 {
+                return Err("live2d_model_allocation_failed".into());
+            }
+            counter(
+                probe,
+                Stage::RuntimeModelAllocation,
+                "bytes",
+                model_size as u64,
+                Vec::new(),
+            );
+            let mut model_bytes = vec![0_u8; model_size];
+            let model = measure(probe, Stage::RuntimeModelInit, Vec::new(), || unsafe {
+                live2d_sys::csmInitializeModelInPlace(
+                    moc,
+                    model_bytes.as_mut_ptr().cast(),
+                    model_bytes.len() as _,
+                )
+            });
+            if model.is_null() {
+                return Err("live2d_model_initialization_failed".into());
+            }
+            measure(probe, Stage::RuntimeModelUpdate, Vec::new(), || unsafe {
+                live2d_sys::csmUpdateModel(model)
+            });
+            let (canvas, drawables, art_meshes) = measure(
+                probe,
+                Stage::RuntimeSnapshotExtract,
+                Vec::new(),
+                || unsafe { snapshot_model(model) },
+            )?;
+            counter(
+                probe,
+                Stage::RuntimeSnapshotExtract,
+                "draw_calls",
+                drawables.len() as u64,
+                Vec::new(),
+            );
+
+            Ok(ModelSnapshot {
+                model_key: files.model_json_path.to_string_lossy().into_owned(),
+                canvas,
+                art_meshes,
+                drawables,
+                textures,
+            })
         })
     }
 
@@ -317,6 +551,45 @@ mod runtime {
                     height,
                     rgba: image.into_raw(),
                 })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "probe")]
+    fn load_textures_with_probe<P>(
+        paths: &[PathBuf],
+        probe: &P,
+    ) -> Result<Vec<TextureAsset>, String>
+    where
+        P: ProbeSink,
+    {
+        paths
+            .iter()
+            .map(|path| {
+                measure(
+                    probe,
+                    Stage::RuntimeTextureDecode,
+                    vec![ProbeAttr::new("path", path.to_string_lossy().into_owned())],
+                    || {
+                        let image = image::open(path)
+                            .map_err(|_| "live2d_texture_unreadable")?
+                            .into_rgba8();
+                        let (width, height) = image.dimensions();
+                        let rgba = image.into_raw();
+                        counter(
+                            probe,
+                            Stage::RuntimeTextureDecode,
+                            "bytes",
+                            rgba.len() as u64,
+                            Vec::new(),
+                        );
+                        Ok(TextureAsset {
+                            width,
+                            height,
+                            rgba,
+                        })
+                    },
+                )
             })
             .collect()
     }

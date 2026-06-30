@@ -1,5 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use live2d_core::{BlendMode, CanvasInfo, Drawable, ModelSnapshot, TextureAsset};
+#[cfg(feature = "probe")]
+use live2d_probe::{counter, gauge, measure, ProbeAttr, ProbeSink, Stage};
 use live2d_render::{
     DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlan, RenderPlanner,
 };
@@ -257,6 +259,91 @@ pub struct WgpuLive2DRenderer {
     mask_atlas: Option<MaskAtlas>,
     offscreen_target: Option<OffscreenTarget>,
     gpu_scene: Option<GpuScene>,
+    #[cfg(feature = "probe")]
+    pending_gpu_timestamps: Vec<GpuTimestampFrame>,
+}
+
+#[cfg(feature = "probe")]
+struct GpuTimestampFrame {
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    readback_buffer: wgpu::Buffer,
+    query_count: u32,
+    mask_indices: Option<(u32, u32)>,
+    main_indices: (u32, u32),
+}
+
+#[cfg(feature = "probe")]
+impl GpuTimestampFrame {
+    fn new(device: &wgpu::Device, has_mask_pass: bool) -> Option<Self> {
+        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return None;
+        }
+        let (query_count, mask_indices, main_indices) = if has_mask_pass {
+            (4, Some((0, 1)), (2, 3))
+        } else {
+            (2, None, (0, 1))
+        };
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("Live2D Probe Timestamp Query Set"),
+            ty: wgpu::QueryType::Timestamp,
+            count: query_count,
+        });
+        let resolve_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Live2D Probe Timestamp Resolve"),
+            size: query_count as u64 * std::mem::size_of::<u64>() as u64,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Live2D Probe Timestamp Readback"),
+            size: query_count as u64 * std::mem::size_of::<u64>() as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some(Self {
+            query_set,
+            resolve_buffer,
+            readback_buffer,
+            query_count,
+            mask_indices,
+            main_indices,
+        })
+    }
+
+    fn timestamp_writes(&self, indices: (u32, u32)) -> wgpu::RenderPassTimestampWrites<'_> {
+        wgpu::RenderPassTimestampWrites {
+            query_set: &self.query_set,
+            beginning_of_pass_write_index: Some(indices.0),
+            end_of_pass_write_index: Some(indices.1),
+        }
+    }
+
+    fn main_timestamp_writes(&self) -> wgpu::RenderPassTimestampWrites<'_> {
+        self.timestamp_writes(self.main_indices)
+    }
+
+    fn mask_timestamp_writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.mask_indices
+            .map(|indices| self.timestamp_writes(indices))
+    }
+
+    fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
+        let byte_count = self.query_count as u64 * std::mem::size_of::<u64>() as u64;
+        encoder.resolve_query_set(
+            &self.query_set,
+            0..self.query_count,
+            &self.resolve_buffer,
+            0,
+        );
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            0,
+            &self.readback_buffer,
+            0,
+            byte_count,
+        );
+    }
 }
 
 struct TextureCache {
@@ -568,7 +655,7 @@ impl WgpuLive2DRenderer {
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
+                resource: uniform_binding(&uniform_buffer, uniform_stride),
             }],
         });
         let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -629,7 +716,38 @@ impl WgpuLive2DRenderer {
             mask_atlas: None,
             offscreen_target: None,
             gpu_scene: None,
+            #[cfg(feature = "probe")]
+            pending_gpu_timestamps: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn new_with_probe<P>(device: &wgpu::Device, format: wgpu::TextureFormat, probe: &P) -> Self
+    where
+        P: ProbeSink,
+    {
+        measure(probe, Stage::WgpuRendererInit, Vec::new(), || {
+            let renderer = Self::new(device, format);
+            gauge(
+                probe,
+                Stage::WgpuGpuTimestampSupport,
+                "gpu_timestamps",
+                if device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+                    1.0
+                } else {
+                    0.0
+                },
+                Vec::new(),
+            );
+            counter(
+                probe,
+                Stage::WgpuPipelineCreation,
+                "resource_rebuilds",
+                renderer.pipelines.pipelines.len() as u64,
+                Vec::new(),
+            );
+            renderer
+        })
     }
 
     pub fn prepare_model(
@@ -650,6 +768,24 @@ impl WgpuLive2DRenderer {
         let render_plan = self.prepare_scene(device, queue, snapshot);
         self.ensure_uniform_capacity(device, uniform_slots(&render_plan));
         render_plan
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn prepare_render_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        snapshot: &ModelSnapshot,
+        probe: &P,
+    ) -> RenderPlan
+    where
+        P: ProbeSink,
+    {
+        measure(probe, Stage::WgpuPrepareRender, Vec::new(), || {
+            let render_plan = self.prepare_scene_with_probe(device, queue, snapshot, probe);
+            self.ensure_uniform_capacity_with_probe(device, uniform_slots(&render_plan), probe);
+            render_plan
+        })
     }
 
     pub fn render<'pass>(
@@ -685,6 +821,32 @@ impl WgpuLive2DRenderer {
         );
     }
 
+    #[cfg(feature = "probe")]
+    pub fn render_to_view_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: WgpuLive2DTarget<'_>,
+        snapshot: &ModelSnapshot,
+        view: WgpuLive2DView,
+        probe: &P,
+    ) where
+        P: ProbeSink,
+    {
+        let render_plan = self.prepare_render_with_probe(device, queue, snapshot, probe);
+        self.encode_render_to_view_with_probe(
+            device,
+            queue,
+            encoder,
+            target,
+            &render_plan,
+            &snapshot.canvas,
+            view,
+            probe,
+        );
+    }
+
     pub fn encode_render_to_view(
         &mut self,
         device: &wgpu::Device,
@@ -697,7 +859,7 @@ impl WgpuLive2DRenderer {
     ) {
         self.ensure_uniform_capacity(device, uniform_slots(render_plan));
         if !render_plan.masks.is_empty() {
-            self.prepare_mask_atlas(device, queue, encoder, render_plan, canvas, &view);
+            self.prepare_mask_atlas(device, queue, encoder, render_plan, canvas, &view, None);
         }
         let first_main_uniform_slot = mask_uniform_slots(render_plan);
         let mask_atlas = self.mask_atlas.as_ref();
@@ -726,6 +888,80 @@ impl WgpuLive2DRenderer {
             first_main_uniform_slot,
             mask_atlas,
         );
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn encode_render_to_view_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: WgpuLive2DTarget<'_>,
+        render_plan: &RenderPlan,
+        canvas: &CanvasInfo,
+        view: WgpuLive2DView,
+        probe: &P,
+    ) where
+        P: ProbeSink,
+    {
+        self.ensure_uniform_capacity_with_probe(device, uniform_slots(render_plan), probe);
+        let timestamp_frame = GpuTimestampFrame::new(device, !render_plan.masks.is_empty());
+        if !render_plan.masks.is_empty() {
+            let mask_timestamp_writes = timestamp_frame
+                .as_ref()
+                .and_then(GpuTimestampFrame::mask_timestamp_writes);
+            self.prepare_mask_atlas_with_probe(
+                device,
+                queue,
+                encoder,
+                render_plan,
+                canvas,
+                &view,
+                probe,
+                mask_timestamp_writes,
+            );
+        }
+        let first_main_uniform_slot = mask_uniform_slots(render_plan);
+        let mask_atlas = self.mask_atlas.as_ref();
+        measure(
+            probe,
+            Stage::WgpuMainPassEncode,
+            vec![ProbeAttr::new("draws", render_plan.draws.len())],
+            || {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Live2D Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target.view,
+                        depth_slice: None,
+                        resolve_target: target.resolve_target,
+                        ops: wgpu::Operations {
+                            load: target.load_op,
+                            store: target.store_op,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: timestamp_frame
+                        .as_ref()
+                        .map(GpuTimestampFrame::main_timestamp_writes),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                self.encode_render_from_uniform_slot_with_probe(
+                    queue,
+                    &mut pass,
+                    render_plan,
+                    canvas,
+                    view,
+                    first_main_uniform_slot,
+                    mask_atlas,
+                    probe,
+                );
+            },
+        );
+        if let Some(timestamp_frame) = timestamp_frame {
+            timestamp_frame.resolve(encoder);
+            self.pending_gpu_timestamps.push(timestamp_frame);
+        }
     }
 
     pub fn encode_render<'pass>(
@@ -768,6 +1004,79 @@ impl WgpuLive2DRenderer {
             .as_ref()
             .expect("offscreen target is retained after rendering")
             .view
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn render_to_offscreen_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        snapshot: &ModelSnapshot,
+        view: WgpuLive2DView,
+        clear_color: wgpu::Color,
+        probe: &P,
+    ) -> &wgpu::TextureView
+    where
+        P: ProbeSink,
+    {
+        self.ensure_offscreen_target_with_probe(device, view.width, view.height, probe);
+        let offscreen_view = self
+            .offscreen_target
+            .as_ref()
+            .expect("offscreen target is created before rendering")
+            .view
+            .clone();
+        self.render_to_view_with_probe(
+            device,
+            queue,
+            encoder,
+            WgpuLive2DTarget::clear(&offscreen_view, clear_color),
+            snapshot,
+            view,
+            probe,
+        );
+        &self
+            .offscreen_target
+            .as_ref()
+            .expect("offscreen target is retained after rendering")
+            .view
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn collect_gpu_timestamps_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        probe: &P,
+    ) -> Result<(), String>
+    where
+        P: ProbeSink,
+    {
+        let timestamp_period = queue.get_timestamp_period() as f64;
+        for pending in self.pending_gpu_timestamps.drain(..) {
+            let values =
+                read_timestamp_values(device, &pending.readback_buffer, pending.query_count)?;
+            if let Some((start, end)) = pending.mask_indices {
+                record_gpu_pass_nanos(
+                    probe,
+                    Stage::WgpuMaskPassEncode,
+                    "mask_atlas",
+                    &values,
+                    (start, end),
+                    timestamp_period,
+                );
+            }
+            record_gpu_pass_nanos(
+                probe,
+                Stage::WgpuMainPassEncode,
+                "main",
+                &values,
+                pending.main_indices,
+                timestamp_period,
+            );
+        }
+        Ok(())
     }
 
     fn encode_render_from_uniform_slot<'pass>(
@@ -814,6 +1123,68 @@ impl WgpuLive2DRenderer {
         render_plan.dispatch(&mut backend);
     }
 
+    #[cfg(feature = "probe")]
+    fn encode_render_from_uniform_slot_with_probe<'pass, P>(
+        &self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'pass>,
+        render_plan: &RenderPlan,
+        canvas: &CanvasInfo,
+        view: WgpuLive2DView,
+        first_uniform_slot: usize,
+        mask_atlas: Option<&MaskAtlas>,
+        probe: &P,
+    ) where
+        P: ProbeSink,
+    {
+        let Some(gpu_scene) = &self.gpu_scene else {
+            return;
+        };
+        let active_mask_atlas = if render_plan.masks.is_empty() {
+            None
+        } else {
+            mask_atlas
+        };
+        let mask_bind_group = active_mask_atlas
+            .map(|atlas| &atlas.bind_group)
+            .unwrap_or(&self.fallback_mask_bind_group);
+        let target_ids = view
+            .target_drawable_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut backend = WgpuRenderBackend {
+            queue,
+            pass,
+            pipelines: &self.pipelines,
+            uniform_buffer: &self.uniform_buffer,
+            uniform_bind_group: &self.uniform_bind_group,
+            uniform_stride: self.uniform_stride,
+            uniform_index: first_uniform_slot,
+            mask_bind_group,
+            mask_atlas: active_mask_atlas,
+            gpu_scene,
+            canvas: live2d_canvas_uniform(canvas),
+            view: &view,
+            target_ids,
+        };
+        counter(
+            probe,
+            Stage::WgpuMainPassEncode,
+            "draw_calls",
+            render_plan.draws.len() as u64,
+            Vec::new(),
+        );
+        counter(
+            probe,
+            Stage::WgpuMainPassEncode,
+            "buffer_writes",
+            render_plan.draws.len() as u64,
+            vec![ProbeAttr::new("buffer", "uniform")],
+        );
+        render_plan.dispatch_with_probe(&mut backend, probe);
+    }
+
     fn prepare_mask_atlas(
         &mut self,
         device: &wgpu::Device,
@@ -822,6 +1193,7 @@ impl WgpuLive2DRenderer {
         render_plan: &RenderPlan,
         canvas: &CanvasInfo,
         view: &WgpuLive2DView,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let Some(gpu_scene) = &self.gpu_scene else {
             return;
@@ -873,7 +1245,7 @@ impl WgpuLive2DRenderer {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -882,6 +1254,7 @@ impl WgpuLive2DRenderer {
         pass.set_vertex_buffer(0, gpu_scene.position_buffer.slice(..));
         pass.set_vertex_buffer(1, gpu_scene.uv_buffer.slice(..));
         pass.set_index_buffer(gpu_scene.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+        pass.set_bind_group(2, &self.fallback_mask_bind_group, &[]);
 
         let mut uniform_slot = 0;
         for (slot, mask) in render_plan.masks.iter().enumerate() {
@@ -935,6 +1308,106 @@ impl WgpuLive2DRenderer {
         pass.pop_debug_group();
     }
 
+    #[cfg(feature = "probe")]
+    fn prepare_mask_atlas_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        render_plan: &RenderPlan,
+        canvas: &CanvasInfo,
+        view: &WgpuLive2DView,
+        probe: &P,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) where
+        P: ProbeSink,
+    {
+        let slots = render_plan.masks.len();
+        if slots == 0 {
+            self.prepare_mask_atlas(
+                device,
+                queue,
+                encoder,
+                render_plan,
+                canvas,
+                view,
+                timestamp_writes,
+            );
+            return;
+        }
+        let layout = measure(
+            probe,
+            Stage::WgpuMaskAtlasLayout,
+            vec![
+                ProbeAttr::new("view_width", view.width),
+                ProbeAttr::new("view_height", view.height),
+                ProbeAttr::new("slots", slots),
+            ],
+            || {
+                mask_atlas_layout(
+                    view.width,
+                    view.height,
+                    slots,
+                    device.limits().max_texture_dimension_2d,
+                )
+            },
+        );
+        let rebuild = self
+            .mask_atlas
+            .as_ref()
+            .map(|atlas| {
+                atlas.width != layout.width
+                    || atlas.height != layout.height
+                    || atlas.slot_width != layout.slot_width
+                    || atlas.slot_height != layout.slot_height
+                    || atlas.columns != layout.columns
+                    || atlas.slots != layout.slots
+            })
+            .unwrap_or(true);
+        if rebuild {
+            counter(
+                probe,
+                Stage::WgpuMaskAtlasRebuild,
+                "resource_rebuilds",
+                1,
+                vec![ProbeAttr::new("resource", "mask_atlas")],
+            );
+        }
+        measure(
+            probe,
+            Stage::WgpuMaskPassEncode,
+            vec![
+                ProbeAttr::new("masks", render_plan.masks.len()),
+                ProbeAttr::new("mask_draw_calls", mask_uniform_slots(render_plan)),
+            ],
+            || {
+                self.prepare_mask_atlas(
+                    device,
+                    queue,
+                    encoder,
+                    render_plan,
+                    canvas,
+                    view,
+                    timestamp_writes,
+                )
+            },
+        );
+        counter(
+            probe,
+            Stage::WgpuMaskPassEncode,
+            "draw_calls",
+            mask_uniform_slots(render_plan) as u64,
+            Vec::new(),
+        );
+        counter(
+            probe,
+            Stage::WgpuMaskPassEncode,
+            "buffer_writes",
+            mask_uniform_slots(render_plan) as u64,
+            vec![ProbeAttr::new("buffer", "uniform")],
+        );
+    }
+
     fn ensure_offscreen_target(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         let width = width.max(1);
         let height = height.max(1);
@@ -950,6 +1423,45 @@ impl WgpuLive2DRenderer {
                 width,
                 height,
             ));
+        }
+    }
+
+    #[cfg(feature = "probe")]
+    fn ensure_offscreen_target_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        probe: &P,
+    ) where
+        P: ProbeSink,
+    {
+        let width = width.max(1);
+        let height = height.max(1);
+        let rebuild = self
+            .offscreen_target
+            .as_ref()
+            .map(|target| target.width != width || target.height != height)
+            .unwrap_or(true);
+        if rebuild {
+            measure(
+                probe,
+                Stage::WgpuOffscreenResize,
+                vec![
+                    ProbeAttr::new("width", width),
+                    ProbeAttr::new("height", height),
+                ],
+                || self.ensure_offscreen_target(device, width, height),
+            );
+            counter(
+                probe,
+                Stage::WgpuOffscreenResize,
+                "resource_rebuilds",
+                1,
+                vec![ProbeAttr::new("resource", "offscreen_target")],
+            );
+        } else {
+            self.ensure_offscreen_target(device, width, height);
         }
     }
 
@@ -1011,6 +1523,116 @@ impl WgpuLive2DRenderer {
         render_plan
     }
 
+    #[cfg(feature = "probe")]
+    fn prepare_scene_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        snapshot: &ModelSnapshot,
+        probe: &P,
+    ) -> RenderPlan
+    where
+        P: ProbeSink,
+    {
+        let render_plan = RenderPlanner::new().build_with_probe(snapshot, probe);
+        let topology = scene_topology(snapshot);
+        let textures = self.prepare_textures_with_probe(device, queue, snapshot, probe);
+        if self.scene_key.as_deref() == Some(snapshot.model_key.as_str())
+            && self.scene_topology.as_ref() == Some(&topology)
+            && self.gpu_scene.is_some()
+        {
+            counter(
+                probe,
+                Stage::WgpuSceneTopologyHit,
+                "cache_hits",
+                1,
+                vec![ProbeAttr::new("cache", "scene_topology")],
+            );
+            self.upload_scene_positions_with_probe(queue, snapshot, &render_plan, probe);
+            if let Some(gpu_scene) = &mut self.gpu_scene {
+                gpu_scene.textures = textures;
+            }
+            return render_plan;
+        }
+        counter(
+            probe,
+            Stage::WgpuSceneTopologyMiss,
+            "cache_misses",
+            1,
+            vec![ProbeAttr::new("cache", "scene_topology")],
+        );
+        self.scene_key = Some(snapshot.model_key.clone());
+        self.scene_topology = Some(topology);
+        let positions = gpu_scene_positions(snapshot, &render_plan);
+        let uvs = gpu_scene_uvs(snapshot, &render_plan);
+        let indices = gpu_scene_indices(snapshot, &render_plan);
+        measure(
+            probe,
+            Stage::WgpuBufferRebuild,
+            vec![
+                ProbeAttr::new("vertices", positions.len()),
+                ProbeAttr::new("indices", indices.len()),
+            ],
+            || {
+                let position_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Live2D Model Positions"),
+                    size: buffer_size::<GpuPosition>(positions.len()),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&position_buffer, 0, bytemuck::cast_slice(&positions));
+                let uv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Live2D Model UVs"),
+                    size: buffer_size::<GpuUv>(uvs.len()),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&uv_buffer, 0, bytemuck::cast_slice(&uvs));
+                let index_bytes = padded_index_bytes(&indices);
+                let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Live2D Model Indices"),
+                    size: index_bytes.len().max(1) as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                queue.write_buffer(&index_buffer, 0, &index_bytes);
+                counter(
+                    probe,
+                    Stage::WgpuBufferRebuild,
+                    "buffer_writes",
+                    3,
+                    Vec::new(),
+                );
+                counter(
+                    probe,
+                    Stage::WgpuBufferRebuild,
+                    "bytes",
+                    (positions.len() * std::mem::size_of::<GpuPosition>()
+                        + uvs.len() * std::mem::size_of::<GpuUv>()
+                        + index_bytes.len()) as u64,
+                    Vec::new(),
+                );
+                counter(
+                    probe,
+                    Stage::WgpuBufferRebuild,
+                    "resource_rebuilds",
+                    3,
+                    Vec::new(),
+                );
+                self.gpu_scene = Some(GpuScene {
+                    position_buffer,
+                    uv_buffer,
+                    index_buffer,
+                    positions,
+                    vertex_count: render_plan.model.vertex_count,
+                    index_count: render_plan.model.index_count,
+                    textures,
+                });
+            },
+        );
+        render_plan
+    }
+
     fn prepare_textures(
         &mut self,
         device: &wgpu::Device,
@@ -1037,6 +1659,79 @@ impl WgpuLive2DRenderer {
         bind_groups
     }
 
+    #[cfg(feature = "probe")]
+    fn prepare_textures_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        snapshot: &ModelSnapshot,
+        probe: &P,
+    ) -> Vec<wgpu::BindGroup>
+    where
+        P: ProbeSink,
+    {
+        let topology = texture_topology(snapshot);
+        if let Some(cache) = &self.texture_cache {
+            if cache.model_key == snapshot.model_key && cache.topology == topology {
+                counter(
+                    probe,
+                    Stage::WgpuTextureCacheHit,
+                    "cache_hits",
+                    1,
+                    vec![ProbeAttr::new("cache", "textures")],
+                );
+                return cache.bind_groups.clone();
+            }
+        }
+
+        counter(
+            probe,
+            Stage::WgpuTextureCacheMiss,
+            "cache_misses",
+            1,
+            vec![ProbeAttr::new("cache", "textures")],
+        );
+        let bind_groups = snapshot
+            .textures
+            .iter()
+            .map(|texture| {
+                measure(
+                    probe,
+                    Stage::WgpuTextureUpload,
+                    vec![
+                        ProbeAttr::new("width", texture.width),
+                        ProbeAttr::new("height", texture.height),
+                    ],
+                    || self.create_texture_bind_group(device, queue, texture),
+                )
+            })
+            .collect::<Vec<_>>();
+        counter(
+            probe,
+            Stage::WgpuTextureUpload,
+            "bytes",
+            snapshot
+                .textures
+                .iter()
+                .map(|texture| texture.rgba.len() as u64)
+                .sum(),
+            Vec::new(),
+        );
+        counter(
+            probe,
+            Stage::WgpuTextureUpload,
+            "resource_rebuilds",
+            bind_groups.len() as u64,
+            vec![ProbeAttr::new("resource", "texture_bind_group")],
+        );
+        self.texture_cache = Some(TextureCache {
+            model_key: snapshot.model_key.clone(),
+            topology,
+            bind_groups: bind_groups.clone(),
+        });
+        bind_groups
+    }
+
     fn ensure_uniform_capacity(&mut self, device: &wgpu::Device, required_slots: usize) {
         let required_slots = required_slots.max(1);
         if self.uniform_capacity >= required_slots {
@@ -1055,10 +1750,48 @@ impl WgpuLive2DRenderer {
             layout: &self.uniform_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: self.uniform_buffer.as_entire_binding(),
+                resource: uniform_binding(&self.uniform_buffer, self.uniform_stride),
             }],
         });
         self.uniform_capacity = new_capacity;
+    }
+
+    #[cfg(feature = "probe")]
+    fn ensure_uniform_capacity_with_probe<P>(
+        &mut self,
+        device: &wgpu::Device,
+        required_slots: usize,
+        probe: &P,
+    ) where
+        P: ProbeSink,
+    {
+        let required_slots = required_slots.max(1);
+        if self.uniform_capacity >= required_slots {
+            return;
+        }
+        measure(
+            probe,
+            Stage::WgpuUniformCapacityGrow,
+            vec![
+                ProbeAttr::new("old_capacity", self.uniform_capacity),
+                ProbeAttr::new("required_slots", required_slots),
+            ],
+            || self.ensure_uniform_capacity(device, required_slots),
+        );
+        counter(
+            probe,
+            Stage::WgpuUniformCapacityGrow,
+            "resource_rebuilds",
+            2,
+            vec![ProbeAttr::new("resource", "uniform_buffer_and_bind_group")],
+        );
+        counter(
+            probe,
+            Stage::WgpuUniformCapacityGrow,
+            "bytes",
+            self.uniform_stride * self.uniform_capacity as u64,
+            Vec::new(),
+        );
     }
 
     fn upload_scene_positions(
@@ -1083,6 +1816,44 @@ impl WgpuLive2DRenderer {
             );
         }
         gpu_scene.positions = positions;
+    }
+
+    #[cfg(feature = "probe")]
+    fn upload_scene_positions_with_probe<P>(
+        &mut self,
+        queue: &wgpu::Queue,
+        snapshot: &ModelSnapshot,
+        render_plan: &RenderPlan,
+        probe: &P,
+    ) where
+        P: ProbeSink,
+    {
+        let Some(gpu_scene) = &self.gpu_scene else {
+            return;
+        };
+        let positions = gpu_scene_positions(snapshot, render_plan);
+        let uploads = position_uploads(&gpu_scene.positions, &positions, render_plan);
+        let bytes = uploads
+            .iter()
+            .map(|upload| {
+                (upload.vertex_range.end - upload.vertex_range.start) as u64
+                    * std::mem::size_of::<GpuPosition>() as u64
+            })
+            .sum();
+        measure(
+            probe,
+            Stage::WgpuPositionUpload,
+            vec![ProbeAttr::new("uploads", uploads.len())],
+            || self.upload_scene_positions(queue, snapshot, render_plan),
+        );
+        counter(
+            probe,
+            Stage::WgpuPositionUpload,
+            "buffer_writes",
+            uploads.len() as u64,
+            Vec::new(),
+        );
+        counter(probe, Stage::WgpuPositionUpload, "bytes", bytes, Vec::new());
     }
 
     fn create_texture_bind_group(
@@ -1154,6 +1925,69 @@ fn aligned_uniform_stride(device: &wgpu::Device) -> u64 {
         std::mem::size_of::<Live2dUniform>() as u64,
         device.limits().min_uniform_buffer_offset_alignment.max(1) as u64,
     )
+}
+
+fn uniform_binding(buffer: &wgpu::Buffer, uniform_stride: u64) -> wgpu::BindingResource<'_> {
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer,
+        offset: 0,
+        size: wgpu::BufferSize::new(uniform_stride),
+    })
+}
+
+#[cfg(feature = "probe")]
+fn read_timestamp_values(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    query_count: u32,
+) -> Result<Vec<u64>, String> {
+    let byte_count = query_count as u64 * std::mem::size_of::<u64>() as u64;
+    let values = {
+        let slice = buffer.slice(0..byte_count);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .map_err(|err| format!("failed to receive timestamp map result: {err}"))?
+            .map_err(|err| format!("failed to map timestamp buffer: {err}"))?;
+        let data = slice.get_mapped_range();
+        data.chunks_exact(std::mem::size_of::<u64>())
+            .map(|chunk| u64::from_ne_bytes(chunk.try_into().expect("u64 timestamp chunk")))
+            .collect::<Vec<_>>()
+    };
+    buffer.unmap();
+    Ok(values)
+}
+
+#[cfg(feature = "probe")]
+fn record_gpu_pass_nanos<P>(
+    probe: &P,
+    stage: Stage,
+    pass: &'static str,
+    values: &[u64],
+    indices: (u32, u32),
+    timestamp_period: f64,
+) where
+    P: ProbeSink,
+{
+    let Some(start) = values.get(indices.0 as usize) else {
+        return;
+    };
+    let Some(end) = values.get(indices.1 as usize) else {
+        return;
+    };
+    let nanos = ((*end).saturating_sub(*start) as f64 * timestamp_period)
+        .round()
+        .min(u64::MAX as f64) as u64;
+    counter(
+        probe,
+        stage,
+        "gpu_pass_nanos",
+        nanos,
+        vec![ProbeAttr::new("pass", pass)],
+    );
 }
 
 fn align_to(value: u64, alignment: u64) -> u64 {

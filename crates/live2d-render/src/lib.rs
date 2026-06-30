@@ -1,4 +1,6 @@
 use live2d_core::{BlendMode, DrawableId, DrawableRanges, MaskRef, MaterialKey, ModelSnapshot};
+#[cfg(feature = "probe")]
+use live2d_probe::{counter, measure, ProbeAttr, ProbeSink, Stage};
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -84,6 +86,68 @@ impl RenderPlan {
         backend.end_model();
     }
 
+    #[cfg(feature = "probe")]
+    pub fn dispatch_with_probe<B, P>(&self, backend: &mut B, probe: &P)
+    where
+        B: Live2DRenderBackend,
+        P: ProbeSink,
+    {
+        measure(
+            probe,
+            Stage::RenderDispatchTotal,
+            vec![
+                ProbeAttr::new("draws", self.draws.len()),
+                ProbeAttr::new("masks", self.masks.len()),
+            ],
+            || {
+                backend.begin_model(&self.model);
+                if !self.masks.is_empty() {
+                    backend.begin_clip_masks(&self.masks);
+                    for mask in &self.masks {
+                        backend.begin_clip_mask(mask);
+                        for drawable_id in &mask.drawable_ids {
+                            let call = measure(
+                                probe,
+                                Stage::RenderMaskLookup,
+                                vec![ProbeAttr::new("mask", mask.id.0)],
+                                || self.draw_for_id(drawable_id),
+                            );
+                            if let Some(call) = call {
+                                backend.draw_mask_drawable(mask, call);
+                                counter(
+                                    probe,
+                                    Stage::RenderMaskLookup,
+                                    "draw_calls",
+                                    1,
+                                    Vec::new(),
+                                );
+                            }
+                        }
+                        backend.end_clip_mask(mask);
+                    }
+                    backend.end_clip_masks();
+                }
+                backend.begin_main_pass();
+                for draw in &self.draws {
+                    measure(
+                        probe,
+                        Stage::RenderMainDrawDispatch,
+                        vec![ProbeAttr::new("drawable", draw.drawable_id.as_ref())],
+                        || backend.draw_drawable(draw),
+                    );
+                    counter(
+                        probe,
+                        Stage::RenderMainDrawDispatch,
+                        "draw_calls",
+                        1,
+                        Vec::new(),
+                    );
+                }
+                backend.end_model();
+            },
+        );
+    }
+
     fn draw_for_id(&self, drawable_id: &DrawableId) -> Option<&DrawCommand> {
         self.draws
             .iter()
@@ -154,6 +218,117 @@ impl RenderPlanner {
             masks,
             draws,
         }
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn build_with_probe<P>(&self, snapshot: &ModelSnapshot, probe: &P) -> RenderPlan
+    where
+        P: ProbeSink,
+    {
+        measure(
+            probe,
+            Stage::RenderPlanTotal,
+            vec![
+                ProbeAttr::new("drawables", snapshot.drawables.len()),
+                ProbeAttr::new("textures", snapshot.textures.len()),
+            ],
+            || {
+                let model = measure(probe, Stage::RenderModelCtxBuild, Vec::new(), || {
+                    build_model_ctx(snapshot)
+                });
+                let drawable_ranges = model
+                    .drawables
+                    .iter()
+                    .map(|drawable| {
+                        (
+                            drawable.drawable_id.clone(),
+                            (drawable.texture_index, drawable.ranges.clone()),
+                        )
+                    })
+                    .collect::<HashMap<_, _>>();
+                let mut mask_refs = HashMap::new();
+                let mut drawables = snapshot.drawables.iter().collect::<Vec<_>>();
+                measure(probe, Stage::RenderOrderSort, Vec::new(), || {
+                    drawables.sort_by_key(|drawable| drawable.render_order);
+                });
+
+                let mut masks = Vec::new();
+                let draws = measure(
+                    probe,
+                    Stage::RenderDrawCommandBuild,
+                    vec![ProbeAttr::new("candidate_drawables", drawables.len())],
+                    || {
+                        drawables
+                            .into_iter()
+                            .filter_map(|drawable| {
+                                let (texture_index, ranges) =
+                                    drawable_ranges.get(&drawable.id)?.clone();
+                                let mask = drawable.clipping.as_ref().map(|clipping| {
+                                    measure(
+                                        probe,
+                                        Stage::RenderMaskDedup,
+                                        vec![ProbeAttr::new(
+                                            "mask_drawables",
+                                            clipping.drawable_ids.len(),
+                                        )],
+                                        || {
+                                            let mask_key =
+                                                (clipping.drawable_ids.clone(), clipping.inverted);
+                                            if let Some(mask_ref) = mask_refs.get(&mask_key) {
+                                                return *mask_ref;
+                                            }
+                                            let mask_ref = MaskRef(masks.len());
+                                            masks.push(MaskPass {
+                                                id: mask_ref,
+                                                drawable_ids: clipping.drawable_ids.clone(),
+                                                inverted: clipping.inverted,
+                                            });
+                                            mask_refs.insert(mask_key, mask_ref);
+                                            mask_ref
+                                        },
+                                    )
+                                });
+                                Some(DrawCommand {
+                                    drawable_id: drawable.id.clone(),
+                                    texture_index,
+                                    vertex_range: ranges.vertex_range,
+                                    index_range: ranges.index_range,
+                                    opacity: drawable.opacity,
+                                    blend_mode: drawable.blend_mode,
+                                    mask,
+                                    inverted_mask: drawable
+                                        .clipping
+                                        .as_ref()
+                                        .map(|clipping| clipping.inverted)
+                                        .unwrap_or(false),
+                                    material: MaterialKey::Default,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                );
+
+                counter(
+                    probe,
+                    Stage::RenderPlanTotal,
+                    "draw_calls",
+                    draws.len() as u64,
+                    Vec::new(),
+                );
+                counter(
+                    probe,
+                    Stage::RenderPlanTotal,
+                    "resource_rebuilds",
+                    masks.len() as u64,
+                    vec![ProbeAttr::new("resource", "mask_pass")],
+                );
+                RenderPlan {
+                    model,
+                    masks,
+                    draws,
+                }
+            },
+        )
     }
 }
 
@@ -359,6 +534,119 @@ mod tests {
                 Event::Draw(DrawableId::from("masked")),
                 Event::EndModel,
             ]
+        );
+    }
+
+    #[cfg(feature = "probe")]
+    #[test]
+    fn build_with_probe_matches_regular_build_and_records_stages() {
+        let snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: vec![TextureAsset {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 255, 255, 255],
+            }],
+            drawables: vec![
+                drawable("mask", 0, None),
+                drawable(
+                    "face",
+                    10,
+                    Some(ClippingInfo {
+                        drawable_ids: vec![DrawableId::from("mask")],
+                        inverted: false,
+                    }),
+                ),
+            ],
+        };
+        let planner = RenderPlanner::new();
+        let recorder = live2d_probe::ProbeRecorder::new();
+
+        let expected = planner.build(&snapshot);
+        let actual = planner.build_with_probe(&snapshot, &recorder);
+        let analysis = live2d_probe::ProbeAnalysis::from_data(&recorder.data());
+
+        assert_eq!(actual, expected);
+        assert!(analysis
+            .stages
+            .contains_key(&live2d_probe::Stage::RenderPlanTotal));
+        assert_eq!(
+            analysis
+                .stages
+                .get(&live2d_probe::Stage::RenderPlanTotal)
+                .unwrap()
+                .draw_calls,
+            expected.draws.len() as u64
+        );
+    }
+
+    #[cfg(feature = "probe")]
+    #[test]
+    fn dispatch_with_probe_preserves_backend_events_and_counts_draws() {
+        let snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![
+                drawable("mask", 0, None),
+                drawable(
+                    "masked",
+                    1,
+                    Some(ClippingInfo {
+                        drawable_ids: vec![DrawableId::from("mask")],
+                        inverted: false,
+                    }),
+                ),
+            ],
+        };
+        let plan = RenderPlanner::new().build(&snapshot);
+        let recorder = live2d_probe::ProbeRecorder::new();
+        let mut backend = RecordingBackend::default();
+
+        plan.dispatch_with_probe(&mut backend, &recorder);
+        let analysis = live2d_probe::ProbeAnalysis::from_data(&recorder.data());
+
+        assert_eq!(
+            backend.events,
+            vec![
+                Event::BeginModel {
+                    vertices: 2,
+                    indices: 2,
+                },
+                Event::BeginClipMasks(1),
+                Event::BeginClipMask {
+                    id: MaskRef(0),
+                    inverted: false,
+                },
+                Event::MaskDrawable {
+                    mask: MaskRef(0),
+                    drawable: DrawableId::from("mask"),
+                },
+                Event::EndClipMask(MaskRef(0)),
+                Event::BeginMainPass,
+                Event::Draw(DrawableId::from("mask")),
+                Event::Draw(DrawableId::from("masked")),
+                Event::EndModel,
+            ]
+        );
+        assert_eq!(
+            analysis
+                .stages
+                .get(&live2d_probe::Stage::RenderMainDrawDispatch)
+                .unwrap()
+                .draw_calls,
+            2
+        );
+        assert_eq!(
+            analysis
+                .stages
+                .get(&live2d_probe::Stage::RenderMaskLookup)
+                .unwrap()
+                .draw_calls,
+            1
         );
     }
 

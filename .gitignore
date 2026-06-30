@@ -3,3 +3,4 @@
 /vendor/
 /.cargo/config.toml
 /sdk-downloads/
+/.env

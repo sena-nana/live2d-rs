@@ -2,10 +2,12 @@
 members = [
     "crates/live2d-sys",
     "crates/live2d-core",
+    "crates/live2d-probe",
     "crates/live2d-runtime",
     "crates/live2d-render",
     "crates/live2d-wgpu",
     "crates/live2d",
+    "crates/live2d-perf",
 ]
 resolver = "2"
 
@@ -20,6 +22,7 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 image = { version = "0.25.8", default-features = false, features = ["png"] }
 live2d = { path = "crates/live2d" }
 live2d-core = { path = "crates/live2d-core" }
+live2d-probe = { path = "crates/live2d-probe" }
 live2d-render = { path = "crates/live2d-render" }
 live2d-runtime = { path = "crates/live2d-runtime" }
 live2d-sys = { path = "crates/live2d-sys" }

@@ -1,0 +1,30 @@
+[package]
+name = "live2d-perf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+live2d-core.workspace = true
+live2d-probe.workspace = true
+live2d-render = { workspace = true, features = ["probe"] }
+live2d-runtime = { workspace = true, features = ["probe"] }
+live2d-wgpu = { workspace = true, optional = true, features = ["probe"] }
+pollster.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = "0.5.1"
+
+[features]
+default = []
+wgpu = ["dep:live2d-wgpu", "dep:wgpu"]
+live2d-cubism = ["live2d-runtime/live2d-cubism"]
+
+[[bench]]
+name = "render_plan"
+harness = false

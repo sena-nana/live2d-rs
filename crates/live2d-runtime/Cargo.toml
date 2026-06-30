@@ -8,9 +8,11 @@ repository.workspace = true
 [dependencies]
 image = { workspace = true, optional = true }
 live2d-core.workspace = true
+live2d-probe = { workspace = true, optional = true }
 live2d-sys = { workspace = true, optional = true }
 serde_json.workspace = true
 
 [features]
 default = []
 live2d-cubism = ["dep:image", "dep:live2d-sys", "live2d-sys/cubism-core"]
+probe = ["dep:live2d-probe"]

@@ -8,5 +8,10 @@ repository.workspace = true
 [dependencies]
 bytemuck.workspace = true
 live2d-core.workspace = true
+live2d-probe = { workspace = true, optional = true }
 live2d-render.workspace = true
 wgpu.workspace = true
+
+[features]
+default = []
+probe = ["dep:live2d-probe", "live2d-render/probe"]

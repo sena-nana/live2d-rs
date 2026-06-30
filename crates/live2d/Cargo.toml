@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 live2d-core.workspace = true
+live2d-probe = { workspace = true, optional = true }
 live2d-render.workspace = true
 live2d-runtime.workspace = true
 live2d-wgpu = { workspace = true, optional = true }
@@ -15,3 +16,9 @@ live2d-wgpu = { workspace = true, optional = true }
 default = []
 wgpu = ["dep:live2d-wgpu"]
 live2d-cubism = ["live2d-runtime/live2d-cubism"]
+probe = [
+    "dep:live2d-probe",
+    "live2d-render/probe",
+    "live2d-runtime/probe",
+]
+wgpu-probe = ["wgpu", "probe", "live2d-wgpu/probe"]
