@@ -417,20 +417,23 @@ impl GpuUploadPlan {
     }
 }
 
-struct WgpuRenderBackend<'a, 'pass, 'view> {
-    queue: &'a wgpu::Queue,
+struct WgpuRenderBackend<'a, 'pass> {
     pass: &'a mut wgpu::RenderPass<'pass>,
     pipelines: &'a PipelineCache,
-    uniform_buffer: &'a wgpu::Buffer,
     uniform_bind_group: &'a wgpu::BindGroup,
     uniform_stride: u64,
     uniform_index: usize,
     mask_bind_group: &'a wgpu::BindGroup,
     mask_atlas: Option<&'a MaskAtlas>,
     gpu_scene: &'a GpuScene,
-    canvas: [f32; 4],
-    view: &'view WgpuLive2DView,
-    target_ids: HashSet<&'view str>,
+    last_pipeline_key: Option<PipelineKey>,
+    last_texture_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UniformUploadStats {
+    writes: u64,
+    bytes: u64,
 }
 
 enum MaskDrawLookup<'a> {
@@ -540,13 +543,16 @@ impl PipelineCache {
         }
     }
 
-    fn mesh(&self, blend_mode: BlendMode, masked: bool) -> &wgpu::RenderPipeline {
-        let key = PipelineKey {
+    fn mesh_key(&self, blend_mode: BlendMode, masked: bool) -> PipelineKey {
+        PipelineKey {
             target_format: self.target_format,
             blend_mode,
             masked,
             shader_variant: ShaderVariant::DefaultMesh,
-        };
+        }
+    }
+
+    fn pipeline(&self, key: PipelineKey) -> &wgpu::RenderPipeline {
         self.pipelines
             .get(&key)
             .expect("default Live2D mesh pipeline is prebuilt")
@@ -565,7 +571,7 @@ impl PipelineCache {
     }
 }
 
-impl<'a, 'pass, 'view> Live2DRenderBackend for WgpuRenderBackend<'a, 'pass, 'view> {
+impl<'a, 'pass> Live2DRenderBackend for WgpuRenderBackend<'a, 'pass> {
     fn begin_model(&mut self, _ctx: &ModelRenderCtx) {
         self.pass.push_debug_group("live2d model");
         self.pass.set_bind_group(2, self.mask_bind_group, &[]);
@@ -619,43 +625,22 @@ impl<'a, 'pass, 'view> Live2DRenderBackend for WgpuRenderBackend<'a, 'pass, 'vie
         let Ok(base_vertex) = i32::try_from(draw.vertex_range.start) else {
             return;
         };
-        let effect =
-            if self.target_ids.is_empty() || self.target_ids.contains(draw.drawable_id.as_ref()) {
-                [
-                    self.view.effect[0],
-                    self.view.effect[1],
-                    self.view.effect[2],
-                    self.view.effect[3] * draw.opacity.clamp(0.0, 1.0),
-                ]
-            } else {
-                [1.0, 1.0, 1.0, 1.0]
-            };
         let mask = mask_uniform(draw, self.mask_atlas);
         let masked = mask[3] != 0.0;
-        self.pass
-            .set_pipeline(self.pipelines.mesh(draw.blend_mode, masked));
-        let uniform = Live2dUniform {
-            viewport: [
-                self.view.width.max(1) as f32,
-                self.view.height.max(1) as f32,
-                0.0,
-                0.0,
-            ],
-            view_transform: self.view.transform,
-            canvas: self.canvas,
-            effect,
-            mask,
-        };
+        let pipeline_key = self.pipelines.mesh_key(draw.blend_mode, masked);
+        if self.last_pipeline_key != Some(pipeline_key) {
+            self.pass
+                .set_pipeline(self.pipelines.pipeline(pipeline_key));
+            self.last_pipeline_key = Some(pipeline_key);
+        }
         let uniform_offset = self.uniform_stride * self.uniform_index as u64;
         self.uniform_index += 1;
-        self.queue.write_buffer(
-            self.uniform_buffer,
-            uniform_offset,
-            bytemuck::bytes_of(&uniform),
-        );
         self.pass
             .set_bind_group(0, self.uniform_bind_group, &[uniform_offset as u32]);
-        self.pass.set_bind_group(1, texture, &[]);
+        if self.last_texture_index != Some(draw.texture_index) {
+            self.pass.set_bind_group(1, texture, &[]);
+            self.last_texture_index = Some(draw.texture_index);
+        }
         self.pass.insert_debug_marker(draw.drawable_id.as_ref());
         self.pass
             .draw_indexed(draw.index_range.clone(), base_vertex, 0..1);
@@ -1153,25 +1138,27 @@ impl WgpuLive2DRenderer {
         let mask_bind_group = active_mask_atlas
             .map(|atlas| &atlas.bind_group)
             .unwrap_or(&self.fallback_mask_bind_group);
-        let target_ids = view
-            .target_drawable_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let mut backend = WgpuRenderBackend {
+        upload_main_uniforms(
             queue,
+            &self.uniform_buffer,
+            self.uniform_stride,
+            first_uniform_slot,
+            render_plan,
+            canvas,
+            &view,
+            active_mask_atlas,
+        );
+        let mut backend = WgpuRenderBackend {
             pass,
             pipelines: &self.pipelines,
-            uniform_buffer: &self.uniform_buffer,
             uniform_bind_group: &self.uniform_bind_group,
             uniform_stride: self.uniform_stride,
             uniform_index: first_uniform_slot,
             mask_bind_group,
             mask_atlas: active_mask_atlas,
             gpu_scene,
-            canvas: live2d_canvas_uniform(canvas),
-            view: &view,
-            target_ids,
+            last_pipeline_key: None,
+            last_texture_index: None,
         };
         render_plan.dispatch(&mut backend);
     }
@@ -1201,25 +1188,27 @@ impl WgpuLive2DRenderer {
         let mask_bind_group = active_mask_atlas
             .map(|atlas| &atlas.bind_group)
             .unwrap_or(&self.fallback_mask_bind_group);
-        let target_ids = view
-            .target_drawable_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
-        let mut backend = WgpuRenderBackend {
+        let uniform_upload = upload_main_uniforms(
             queue,
+            &self.uniform_buffer,
+            self.uniform_stride,
+            first_uniform_slot,
+            render_plan,
+            canvas,
+            &view,
+            active_mask_atlas,
+        );
+        let mut backend = WgpuRenderBackend {
             pass,
             pipelines: &self.pipelines,
-            uniform_buffer: &self.uniform_buffer,
             uniform_bind_group: &self.uniform_bind_group,
             uniform_stride: self.uniform_stride,
             uniform_index: first_uniform_slot,
             mask_bind_group,
             mask_atlas: active_mask_atlas,
             gpu_scene,
-            canvas: live2d_canvas_uniform(canvas),
-            view: &view,
-            target_ids,
+            last_pipeline_key: None,
+            last_texture_index: None,
         };
         counter(
             probe,
@@ -1232,7 +1221,14 @@ impl WgpuLive2DRenderer {
             probe,
             Stage::WgpuMainPassEncode,
             "buffer_writes",
-            render_plan.draws.len() as u64,
+            uniform_upload.writes,
+            vec![ProbeAttr::new("buffer", "uniform")],
+        );
+        counter(
+            probe,
+            Stage::WgpuMainPassEncode,
+            "bytes",
+            uniform_upload.bytes,
             vec![ProbeAttr::new("buffer", "uniform")],
         );
         render_plan.dispatch_with_probe(&mut backend, probe);
@@ -1325,6 +1321,7 @@ impl WgpuLive2DRenderer {
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&mask_uniform));
         pass.set_bind_group(0, &self.uniform_bind_group, &[0]);
 
+        let mut last_texture_index = None;
         for (slot, mask) in render_plan.masks.iter().enumerate() {
             let slot_x = (slot % mask_atlas.columns) as f32 * mask_atlas.slot_width as f32;
             let slot_y = (slot / mask_atlas.columns) as f32 * mask_atlas.slot_height as f32;
@@ -1347,7 +1344,10 @@ impl WgpuLive2DRenderer {
                 let Ok(base_vertex) = i32::try_from(draw.vertex_range.start) else {
                     continue;
                 };
-                pass.set_bind_group(1, texture, &[]);
+                if last_texture_index != Some(draw.texture_index) {
+                    pass.set_bind_group(1, texture, &[]);
+                    last_texture_index = Some(draw.texture_index);
+                }
                 pass.insert_debug_marker(draw.drawable_id.as_ref());
                 pass.draw_indexed(draw.index_range.clone(), base_vertex, 0..1);
             }
@@ -2252,6 +2252,85 @@ fn mask_uniform_for_layout(draw: &DrawCommand, layout: Option<MaskAtlasLayout>) 
     ]
 }
 
+fn upload_main_uniforms(
+    queue: &wgpu::Queue,
+    uniform_buffer: &wgpu::Buffer,
+    uniform_stride: u64,
+    first_uniform_slot: usize,
+    render_plan: &RenderPlan,
+    canvas: &CanvasInfo,
+    view: &WgpuLive2DView,
+    mask_atlas: Option<&MaskAtlas>,
+) -> UniformUploadStats {
+    let bytes = main_uniform_upload_bytes(render_plan, canvas, view, mask_atlas, uniform_stride);
+    if bytes.is_empty() {
+        return UniformUploadStats::default();
+    }
+
+    queue.write_buffer(
+        uniform_buffer,
+        uniform_stride * first_uniform_slot as u64,
+        &bytes,
+    );
+    UniformUploadStats {
+        writes: 1,
+        bytes: bytes.len() as u64,
+    }
+}
+
+fn main_uniform_upload_bytes(
+    render_plan: &RenderPlan,
+    canvas: &CanvasInfo,
+    view: &WgpuLive2DView,
+    mask_atlas: Option<&MaskAtlas>,
+    uniform_stride: u64,
+) -> Vec<u8> {
+    if render_plan.draws.is_empty() {
+        return Vec::new();
+    }
+
+    let uniform_stride = uniform_stride as usize;
+    let uniform_size = std::mem::size_of::<Live2dUniform>();
+    debug_assert!(uniform_stride >= uniform_size);
+    let mut bytes = vec![0; uniform_stride * render_plan.draws.len()];
+    let target_ids = view
+        .target_drawable_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let viewport = [
+        view.width.max(1) as f32,
+        view.height.max(1) as f32,
+        0.0,
+        0.0,
+    ];
+    let canvas = live2d_canvas_uniform(canvas);
+
+    for (index, draw) in render_plan.draws.iter().enumerate() {
+        let effect = if target_ids.is_empty() || target_ids.contains(draw.drawable_id.as_ref()) {
+            [
+                view.effect[0],
+                view.effect[1],
+                view.effect[2],
+                view.effect[3] * draw.opacity.clamp(0.0, 1.0),
+            ]
+        } else {
+            [1.0, 1.0, 1.0, 1.0]
+        };
+        let uniform = Live2dUniform {
+            viewport,
+            view_transform: view.transform,
+            canvas,
+            effect,
+            mask: mask_uniform(draw, mask_atlas),
+        };
+        let offset = index * uniform_stride;
+        bytes[offset..offset + uniform_size].copy_from_slice(bytemuck::bytes_of(&uniform));
+    }
+
+    bytes
+}
+
 fn create_live2d_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -2651,6 +2730,34 @@ mod tests {
         assert_eq!(mask_draw_call_count(&render_plan), 2);
         assert_eq!(mask_uniform_slots(&render_plan), 1);
         assert_eq!(uniform_slots(&render_plan), render_plan.draws.len() + 1);
+    }
+
+    #[test]
+    fn main_uniform_upload_bytes_pack_aligned_draw_slots() {
+        let render_plan = RenderPlanner::new().build(&masked_snapshot());
+        let stride = align_to(std::mem::size_of::<Live2dUniform>() as u64, 256);
+        let view = WgpuLive2DView {
+            transform: [0.1, 0.2, 1.5, 0.0],
+            width: 320,
+            height: 240,
+            effect: [0.4, 0.5, 0.6, 0.7],
+            target_drawable_ids: vec!["masked".to_owned()],
+        };
+
+        let bytes =
+            main_uniform_upload_bytes(&render_plan, &CanvasInfo::default(), &view, None, stride);
+        let first =
+            bytemuck::from_bytes::<Live2dUniform>(&bytes[..std::mem::size_of::<Live2dUniform>()]);
+        let second_offset = stride as usize;
+        let second = bytemuck::from_bytes::<Live2dUniform>(
+            &bytes[second_offset..second_offset + std::mem::size_of::<Live2dUniform>()],
+        );
+
+        assert_eq!(bytes.len(), stride as usize * render_plan.draws.len());
+        assert_eq!(first.effect, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(second.effect, [0.4, 0.5, 0.6, 0.7]);
+        assert_eq!(second.viewport, [320.0, 240.0, 0.0, 0.0]);
+        assert_eq!(second.view_transform, view.transform);
     }
 
     #[test]
