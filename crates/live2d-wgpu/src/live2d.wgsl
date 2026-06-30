@@ -45,11 +45,17 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let color = textureSample(model_texture, model_sampler, input.uv);
     var alpha = color.a * u.effect.a;
     if (abs(u.mask.w) > 0.000001) {
+        let slot_origin = u.mask.xz;
+        let slot_scale = vec2<f32>(u.mask.y, abs(u.mask.w));
+        let mask_size = vec2<f32>(textureDimensions(mask_texture));
+        let half_texel = 0.5 / max(mask_size, vec2<f32>(1.0, 1.0));
+        let slot_min = slot_origin + half_texel;
+        let slot_max = max(slot_min, slot_origin + slot_scale - half_texel);
         let mask_uv = vec2<f32>(
-            u.mask.x + input.screen_uv.x * u.mask.y,
-            u.mask.z + input.screen_uv.y * abs(u.mask.w),
+            slot_origin.x + input.screen_uv.x * slot_scale.x,
+            slot_origin.y + input.screen_uv.y * slot_scale.y,
         );
-        let mask_alpha = textureSample(mask_texture, mask_sampler, mask_uv).a;
+        let mask_alpha = textureSample(mask_texture, mask_sampler, clamp(mask_uv, slot_min, slot_max)).a;
         let coverage = select(mask_alpha, 1.0 - mask_alpha, u.mask.w < 0.0);
         alpha *= coverage;
     }

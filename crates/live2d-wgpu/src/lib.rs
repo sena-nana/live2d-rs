@@ -439,6 +439,20 @@ struct WgpuRenderBackend<'a, 'pass> {
     last_texture_index: Option<usize>,
 }
 
+struct WgpuMaskRenderBackend<'a, 'pass> {
+    pass: &'a mut wgpu::RenderPass<'pass>,
+    pipelines: &'a PipelineCache,
+    uniform_bind_group: &'a wgpu::BindGroup,
+    uniform_stride: u64,
+    uniform_index: usize,
+    fallback_mask_bind_group: &'a wgpu::BindGroup,
+    gpu_scene: &'a GpuScene,
+    layout: MaskAtlasLayout,
+    skip_mask: bool,
+    last_texture_index: Option<usize>,
+    draw_calls: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct UniformUploadStats {
     writes: u64,
@@ -659,6 +673,70 @@ impl<'a, 'pass> Live2DRenderBackend for WgpuRenderBackend<'a, 'pass> {
         self.pass.pop_debug_group();
         self.pass.pop_debug_group();
     }
+}
+
+impl<'a, 'pass> Live2DRenderBackend for WgpuMaskRenderBackend<'a, 'pass> {
+    fn begin_model(&mut self, _ctx: &ModelRenderCtx) {
+        self.pass.set_pipeline(self.pipelines.mask_writer());
+        self.pass
+            .set_vertex_buffer(0, self.gpu_scene.position_buffer.slice(..));
+        self.pass
+            .set_vertex_buffer(1, self.gpu_scene.uv_buffer.slice(..));
+        self.pass.set_index_buffer(
+            self.gpu_scene.index_buffer.slice(..),
+            wgpu::IndexFormat::Uint16,
+        );
+        self.pass
+            .set_bind_group(2, self.fallback_mask_bind_group, &[]);
+    }
+
+    fn begin_clip_mask(&mut self, mask: &MaskPass) {
+        self.skip_mask = mask.id.0 >= self.layout.slots;
+        if self.skip_mask {
+            return;
+        }
+        let slot_x = (mask.id.0 % self.layout.columns) as f32 * self.layout.slot_width as f32;
+        let slot_y = (mask.id.0 / self.layout.columns) as f32 * self.layout.slot_height as f32;
+        self.pass.set_viewport(
+            slot_x,
+            slot_y,
+            self.layout.slot_width as f32,
+            self.layout.slot_height as f32,
+            0.0,
+            1.0,
+        );
+    }
+
+    fn draw_mask_drawable(&mut self, _mask: &MaskPass, draw: &DrawCommand) {
+        if self.skip_mask {
+            return;
+        }
+        let uniform_offset = self.uniform_stride * self.uniform_index as u64;
+        self.uniform_index += 1;
+        let Some(texture) = self.gpu_scene.textures.get(draw.texture_index) else {
+            return;
+        };
+        if draw.vertex_range.end > self.gpu_scene.vertex_count
+            || draw.index_range.end > self.gpu_scene.index_count
+        {
+            return;
+        }
+        let Ok(base_vertex) = i32::try_from(draw.vertex_range.start) else {
+            return;
+        };
+        self.pass
+            .set_bind_group(0, self.uniform_bind_group, &[uniform_offset as u32]);
+        if self.last_texture_index != Some(draw.texture_index) {
+            self.pass.set_bind_group(1, texture, &[]);
+            self.last_texture_index = Some(draw.texture_index);
+        }
+        self.pass.insert_debug_marker(draw.drawable_id.as_ref());
+        self.pass
+            .draw_indexed(draw.index_range.clone(), base_vertex, 0..1);
+        self.draw_calls += 1;
+    }
+
+    fn draw_drawable(&mut self, _call: &DrawCommand) {}
 }
 
 type TextureTopology = Vec<(u32, u32, usize)>;
@@ -1342,62 +1420,33 @@ impl WgpuLive2DRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.push_debug_group("live2d mask atlas");
-        pass.set_pipeline(self.pipelines.mask_writer());
-        pass.set_vertex_buffer(0, gpu_scene.position_buffer.slice(..));
-        pass.set_vertex_buffer(1, gpu_scene.uv_buffer.slice(..));
-        pass.set_index_buffer(gpu_scene.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-        pass.set_bind_group(2, &self.fallback_mask_bind_group, &[]);
-
-        let mask_uniform = Live2dUniform {
-            viewport: [
-                mask_atlas.slot_width as f32,
-                mask_atlas.slot_height as f32,
-                0.0,
-                0.0,
-            ],
-            view_transform: view.transform,
-            canvas: live2d_canvas_uniform(canvas),
-            effect: [1.0, 1.0, 1.0, 1.0],
-            mask: [0.0, 0.0, 0.0, 0.0],
-        };
-        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&mask_uniform));
-        pass.set_bind_group(0, &self.uniform_bind_group, &[0]);
-
-        let mut last_texture_index = None;
-        let mut draw_calls = 0;
-        for (slot, mask) in render_plan.masks.iter().enumerate() {
-            let slot_x = (slot % mask_atlas.columns) as f32 * mask_atlas.slot_width as f32;
-            let slot_y = (slot / mask_atlas.columns) as f32 * mask_atlas.slot_height as f32;
-            pass.push_debug_group(&format!("mask {}", mask.id.0));
-            pass.set_viewport(
-                slot_x,
-                slot_y,
-                mask_atlas.slot_width as f32,
-                mask_atlas.slot_height as f32,
-                0.0,
-                1.0,
-            );
-            for drawable_id in &mask.drawable_ids {
-                let Some(draw) = draw_lookup.get(drawable_id.as_ref()) else {
-                    continue;
-                };
-                let Some(texture) = gpu_scene.textures.get(draw.texture_index) else {
-                    continue;
-                };
-                let Ok(base_vertex) = i32::try_from(draw.vertex_range.start) else {
-                    continue;
-                };
-                if last_texture_index != Some(draw.texture_index) {
-                    pass.set_bind_group(1, texture, &[]);
-                    last_texture_index = Some(draw.texture_index);
-                }
-                pass.insert_debug_marker(draw.drawable_id.as_ref());
-                pass.draw_indexed(draw.index_range.clone(), base_vertex, 0..1);
-                draw_calls += 1;
-            }
-            pass.pop_debug_group();
+        let uniform_bytes = mask_uniform_upload_bytes(
+            render_plan,
+            &draw_lookup,
+            canvas,
+            view,
+            layout,
+            self.uniform_stride,
+        );
+        if !uniform_bytes.is_empty() {
+            queue.write_buffer(&self.uniform_buffer, 0, &uniform_bytes);
         }
+        pass.push_debug_group("live2d mask atlas");
+        let mut backend = WgpuMaskRenderBackend {
+            pass: &mut pass,
+            pipelines: &self.pipelines,
+            uniform_bind_group: &self.uniform_bind_group,
+            uniform_stride: self.uniform_stride,
+            uniform_index: 0,
+            fallback_mask_bind_group: &self.fallback_mask_bind_group,
+            gpu_scene,
+            layout,
+            skip_mask: false,
+            last_texture_index: None,
+            draw_calls: 0,
+        };
+        render_plan.dispatch(&mut backend);
+        let draw_calls = backend.draw_calls;
         pass.pop_debug_group();
         drop(pass);
         if let Some(mask_atlas) = &mut self.mask_atlas {
@@ -1407,7 +1456,7 @@ impl WgpuLive2DRenderer {
         MaskAtlasUpdate {
             encoded: true,
             draw_calls,
-            uniform_writes: 1,
+            uniform_writes: usize::from(!uniform_bytes.is_empty()),
         }
     }
 
@@ -2154,7 +2203,7 @@ fn uniform_slots(render_plan: &RenderPlan) -> usize {
 }
 
 fn mask_uniform_slots(render_plan: &RenderPlan) -> usize {
-    usize::from(!render_plan.masks.is_empty())
+    mask_draw_call_count(render_plan)
 }
 
 fn mask_draw_call_count(render_plan: &RenderPlan) -> usize {
@@ -2163,6 +2212,57 @@ fn mask_draw_call_count(render_plan: &RenderPlan) -> usize {
         .iter()
         .map(|mask| mask.drawable_ids.len())
         .sum()
+}
+
+fn mask_writer_uniform(
+    draw: &DrawCommand,
+    canvas: &CanvasInfo,
+    view: &WgpuLive2DView,
+    layout: MaskAtlasLayout,
+) -> Live2dUniform {
+    Live2dUniform {
+        viewport: [
+            layout.slot_width as f32,
+            layout.slot_height as f32,
+            0.0,
+            0.0,
+        ],
+        view_transform: view.transform,
+        canvas: live2d_canvas_uniform(canvas),
+        effect: [1.0, 1.0, 1.0, draw.opacity.clamp(0.0, 1.0)],
+        mask: [0.0, 0.0, 0.0, 0.0],
+    }
+}
+
+fn mask_uniform_upload_bytes(
+    render_plan: &RenderPlan,
+    draw_lookup: &MaskDrawLookup<'_>,
+    canvas: &CanvasInfo,
+    view: &WgpuLive2DView,
+    layout: MaskAtlasLayout,
+    uniform_stride: u64,
+) -> Vec<u8> {
+    let uniform_stride = uniform_stride as usize;
+    let uniform_size = std::mem::size_of::<Live2dUniform>();
+    debug_assert!(uniform_stride >= uniform_size);
+    let mut bytes = Vec::new();
+
+    for mask in &render_plan.masks {
+        if mask.id.0 >= layout.slots {
+            continue;
+        }
+        for drawable_id in &mask.drawable_ids {
+            let Some(draw) = draw_lookup.get(drawable_id.as_ref()) else {
+                continue;
+            };
+            let offset = bytes.len();
+            bytes.resize(offset + uniform_stride, 0);
+            let uniform = mask_writer_uniform(draw, canvas, view, layout);
+            bytes[offset..offset + uniform_size].copy_from_slice(bytemuck::bytes_of(&uniform));
+        }
+    }
+
+    bytes
 }
 
 fn create_empty_mask_bind_group(
@@ -2322,6 +2422,7 @@ fn mask_atlas_static_signature(
             mix_u64(&mut signature, draw.vertex_range.end as u64);
             mix_u64(&mut signature, draw.index_range.start as u64);
             mix_u64(&mut signature, draw.index_range.end as u64);
+            mix_u64(&mut signature, draw.opacity.to_bits() as u64);
         }
     }
 
@@ -2905,7 +3006,7 @@ mod tests {
     }
 
     #[test]
-    fn mask_writer_uniform_slot_is_shared_across_mask_draws() {
+    fn mask_writer_uniform_slots_track_mask_draws() {
         let mut snapshot = masked_snapshot();
         snapshot.drawables.push(Drawable {
             id: DrawableId::from("mask_extra"),
@@ -2929,8 +3030,77 @@ mod tests {
         let render_plan = RenderPlanner::new().build(&snapshot);
 
         assert_eq!(mask_draw_call_count(&render_plan), 2);
-        assert_eq!(mask_uniform_slots(&render_plan), 1);
-        assert_eq!(uniform_slots(&render_plan), render_plan.draws.len() + 1);
+        assert_eq!(mask_uniform_slots(&render_plan), 2);
+        assert_eq!(uniform_slots(&render_plan), render_plan.draws.len() + 2);
+    }
+
+    #[test]
+    fn mask_writer_uniform_upload_bytes_pack_mask_draw_opacity() {
+        let mut snapshot = masked_snapshot();
+        snapshot.drawables[0].opacity = 0.35;
+        let render_plan = RenderPlanner::new().build(&snapshot);
+        let draw_lookup = MaskDrawLookup::new(&render_plan);
+        let layout = mask_atlas_layout(160, 120, render_plan.masks.len(), 512);
+        let stride = align_to(std::mem::size_of::<Live2dUniform>() as u64, 256);
+        let view = WgpuLive2DView {
+            transform: [0.1, 0.2, 1.5, 0.0],
+            width: 160,
+            height: 120,
+            effect: [0.4, 0.5, 0.6, 0.7],
+            target_drawable_ids: Vec::new(),
+        };
+
+        let bytes = mask_uniform_upload_bytes(
+            &render_plan,
+            &draw_lookup,
+            &CanvasInfo::default(),
+            &view,
+            layout,
+            stride,
+        );
+        let uniform =
+            bytemuck::from_bytes::<Live2dUniform>(&bytes[..std::mem::size_of::<Live2dUniform>()]);
+
+        assert_eq!(bytes.len(), stride as usize);
+        assert_eq!(uniform.viewport, [160.0, 120.0, 0.0, 0.0]);
+        assert_eq!(uniform.view_transform, view.transform);
+        assert_eq!(uniform.effect, [1.0, 1.0, 1.0, 0.35]);
+    }
+
+    #[test]
+    fn mask_atlas_signature_changes_when_mask_draw_opacity_changes() {
+        let base = masked_snapshot();
+        let mut changed = base.clone();
+        changed.drawables[0].opacity = 0.5;
+        let base_plan = RenderPlanner::new().build(&base);
+        let changed_plan = RenderPlanner::new().build(&changed);
+        let view = WgpuLive2DView {
+            transform: [0.0, 0.0, 1.0, 0.0],
+            width: 160,
+            height: 120,
+            effect: [1.0; 4],
+            target_drawable_ids: Vec::new(),
+        };
+        let layout = mask_atlas_layout(160, 120, base_plan.masks.len(), 512);
+        let base_lookup = MaskDrawLookup::new(&base_plan);
+        let changed_lookup = MaskDrawLookup::new(&changed_plan);
+
+        assert_ne!(
+            mask_atlas_static_signature(
+                &base_plan,
+                &base_lookup,
+                &CanvasInfo::default(),
+                &view,
+                layout,
+            ),
+            mask_atlas_static_signature(
+                &changed_plan,
+                &changed_lookup,
+                &CanvasInfo::default(),
+                &view,
+                layout,
+            )
+        );
     }
 
     #[test]
