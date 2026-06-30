@@ -81,7 +81,7 @@ fn run() -> Result<(), String> {
 fn print_help() {
     println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--model <path>]");
     println!("scenarios: synthetic-render-plan, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize");
-    println!("profiles: small, medium, large, mask-heavy, texture-heavy, target-filter");
+    println!("profiles: small, medium, large, mask-heavy, static-mask-heavy, texture-heavy, target-filter");
 }
 
 fn uses_synthetic_config(scenario: &str) -> bool {

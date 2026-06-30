@@ -156,6 +156,7 @@ pub struct SyntheticConfig {
     pub mask_groups: usize,
     pub mask_members: usize,
     pub animated_ratio: f32,
+    pub static_masks: bool,
     pub target_drawables: usize,
     pub frames: usize,
     pub canvas_size: [f32; 2],
@@ -172,6 +173,7 @@ impl SyntheticConfig {
             mask_groups: 2,
             mask_members: 2,
             animated_ratio: 0.25,
+            static_masks: false,
             target_drawables: 4,
             frames: 60,
             canvas_size: [2.0, 2.0],
@@ -188,6 +190,7 @@ impl SyntheticConfig {
             mask_groups: 8,
             mask_members: 4,
             animated_ratio: 0.5,
+            static_masks: false,
             target_drawables: 12,
             frames: 180,
             canvas_size: [2.0, 2.0],
@@ -204,6 +207,7 @@ impl SyntheticConfig {
             mask_groups: 32,
             mask_members: 8,
             animated_ratio: 0.75,
+            static_masks: false,
             target_drawables: 32,
             frames: 300,
             canvas_size: [2.0, 2.0],
@@ -215,6 +219,13 @@ impl SyntheticConfig {
             mask_groups: 64,
             mask_members: 12,
             ..Self::medium()
+        }
+    }
+
+    pub fn static_mask_heavy() -> Self {
+        Self {
+            static_masks: true,
+            ..Self::mask_heavy()
         }
     }
 
@@ -238,6 +249,7 @@ impl SyntheticConfig {
             "small" => Self::small(),
             "large" => Self::large(),
             "mask-heavy" => Self::mask_heavy(),
+            "static-mask-heavy" => Self::static_mask_heavy(),
             "texture-heavy" => Self::texture_heavy(),
             "target-filter" => Self::target_filter(),
             _ => Self::medium(),
@@ -260,6 +272,7 @@ impl SyntheticConfig {
             ("mask_groups".into(), self.mask_groups.to_string()),
             ("mask_members".into(), self.mask_members.to_string()),
             ("animated_ratio".into(), self.animated_ratio.to_string()),
+            ("static_masks".into(), self.static_masks.to_string()),
             ("target_drawables".into(), self.target_drawables.to_string()),
             ("frames".into(), self.frames.to_string()),
             (
@@ -300,7 +313,7 @@ pub fn synthetic_snapshot(config: &SyntheticConfig, frame: usize) -> ModelSnapsh
                     config.vertices_per_drawable,
                     index,
                     frame,
-                    index < animated_drawables,
+                    index < animated_drawables && !(config.static_masks && index < mask_count),
                 ),
                 indices: synthetic_indices(
                     config.indices_per_drawable,
@@ -475,6 +488,7 @@ mod tests {
             mask_groups: 2,
             mask_members: 2,
             animated_ratio: 0.5,
+            static_masks: false,
             target_drawables: 4,
             frames: 1,
             canvas_size: [3.0, 4.0],

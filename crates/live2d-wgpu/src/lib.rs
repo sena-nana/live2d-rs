@@ -258,6 +258,7 @@ pub struct WgpuLive2DRenderer {
     scene_topology: Option<SceneTopology>,
     texture_cache: Option<TextureCache>,
     mask_atlas: Option<MaskAtlas>,
+    mask_atlas_dirty: bool,
     offscreen_target: Option<OffscreenTarget>,
     gpu_scene: Option<GpuScene>,
     render_world: RenderWorld,
@@ -371,8 +372,16 @@ struct MaskAtlas {
     slot_height: u32,
     columns: usize,
     slots: usize,
+    signature: Option<u64>,
     view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MaskAtlasUpdate {
+    encoded: bool,
+    draw_calls: usize,
+    uniform_writes: usize,
 }
 
 struct OffscreenTarget {
@@ -753,6 +762,7 @@ impl WgpuLive2DRenderer {
             scene_topology: None,
             texture_cache: None,
             mask_atlas: None,
+            mask_atlas_dirty: true,
             offscreen_target: None,
             gpu_scene: None,
             render_world: RenderWorld::new(),
@@ -1245,14 +1255,14 @@ impl WgpuLive2DRenderer {
         canvas: &CanvasInfo,
         view: &WgpuLive2DView,
         timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
-    ) {
+    ) -> MaskAtlasUpdate {
         let Some(gpu_scene) = &self.gpu_scene else {
-            return;
+            return MaskAtlasUpdate::default();
         };
         let slots = render_plan.masks.len();
         if slots == 0 {
             self.mask_atlas = None;
-            return;
+            return MaskAtlasUpdate::default();
         }
         let layout = mask_atlas_layout(
             view.width,
@@ -1260,19 +1270,9 @@ impl WgpuLive2DRenderer {
             slots,
             device.limits().max_texture_dimension_2d,
         );
-        let rebuild = self
-            .mask_atlas
-            .as_ref()
-            .map(|atlas| {
-                atlas.width != layout.width
-                    || atlas.height != layout.height
-                    || atlas.slot_width != layout.slot_width
-                    || atlas.slot_height != layout.slot_height
-                    || atlas.columns != layout.columns
-                    || atlas.slots != layout.slots
-            })
-            .unwrap_or(true);
+        let rebuild = mask_atlas_needs_rebuild(self.mask_atlas.as_ref(), layout);
         if rebuild {
+            self.mask_atlas_dirty = true;
             self.mask_atlas = Some(create_mask_atlas(
                 device,
                 &self.texture_layout,
@@ -1280,8 +1280,38 @@ impl WgpuLive2DRenderer {
                 layout,
             ));
         }
+        let draw_lookup = MaskDrawLookup::new(render_plan);
+        let signature =
+            mask_atlas_static_signature(render_plan, &draw_lookup, canvas, view, layout);
+        let cache_hit = !self.mask_atlas_dirty
+            && self.mask_atlas.as_ref().and_then(|atlas| atlas.signature) == Some(signature);
+        if cache_hit {
+            if let Some(timestamp_writes) = timestamp_writes {
+                let mask_atlas = self
+                    .mask_atlas
+                    .as_ref()
+                    .expect("mask atlas exists for cached mask pass");
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Live2D Mask Atlas Cache Hit"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &mask_atlas.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: Some(timestamp_writes),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+            }
+            return MaskAtlasUpdate::default();
+        }
         let Some(mask_atlas) = &self.mask_atlas else {
-            return;
+            return MaskAtlasUpdate::default();
         };
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1307,7 +1337,6 @@ impl WgpuLive2DRenderer {
         pass.set_index_buffer(gpu_scene.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
         pass.set_bind_group(2, &self.fallback_mask_bind_group, &[]);
 
-        let draw_lookup = MaskDrawLookup::new(render_plan);
         let mask_uniform = Live2dUniform {
             viewport: [
                 mask_atlas.slot_width as f32,
@@ -1324,6 +1353,7 @@ impl WgpuLive2DRenderer {
         pass.set_bind_group(0, &self.uniform_bind_group, &[0]);
 
         let mut last_texture_index = None;
+        let mut draw_calls = 0;
         for (slot, mask) in render_plan.masks.iter().enumerate() {
             let slot_x = (slot % mask_atlas.columns) as f32 * mask_atlas.slot_width as f32;
             let slot_y = (slot / mask_atlas.columns) as f32 * mask_atlas.slot_height as f32;
@@ -1352,10 +1382,21 @@ impl WgpuLive2DRenderer {
                 }
                 pass.insert_debug_marker(draw.drawable_id.as_ref());
                 pass.draw_indexed(draw.index_range.clone(), base_vertex, 0..1);
+                draw_calls += 1;
             }
             pass.pop_debug_group();
         }
         pass.pop_debug_group();
+        drop(pass);
+        if let Some(mask_atlas) = &mut self.mask_atlas {
+            mask_atlas.signature = Some(signature);
+        }
+        self.mask_atlas_dirty = false;
+        MaskAtlasUpdate {
+            encoded: true,
+            draw_calls,
+            uniform_writes: 1,
+        }
     }
 
     #[cfg(feature = "probe")]
@@ -1423,7 +1464,7 @@ impl WgpuLive2DRenderer {
                 vec![ProbeAttr::new("resource", "mask_atlas")],
             );
         }
-        measure(
+        let update = measure(
             probe,
             Stage::WgpuMaskPassEncode,
             vec![
@@ -1442,18 +1483,35 @@ impl WgpuLive2DRenderer {
                 )
             },
         );
+        if update.encoded {
+            counter(
+                probe,
+                Stage::WgpuMaskPassEncode,
+                "cache_misses",
+                1,
+                vec![ProbeAttr::new("cache", "mask_atlas")],
+            );
+        } else {
+            counter(
+                probe,
+                Stage::WgpuMaskPassEncode,
+                "cache_hits",
+                1,
+                vec![ProbeAttr::new("cache", "mask_atlas")],
+            );
+        }
         counter(
             probe,
             Stage::WgpuMaskPassEncode,
             "draw_calls",
-            mask_draw_call_count(render_plan) as u64,
+            update.draw_calls as u64,
             Vec::new(),
         );
         counter(
             probe,
             Stage::WgpuMaskPassEncode,
             "buffer_writes",
-            mask_uniform_slots(render_plan) as u64,
+            update.uniform_writes as u64,
             vec![ProbeAttr::new("buffer", "uniform")],
         );
     }
@@ -1523,7 +1581,18 @@ impl WgpuLive2DRenderer {
     ) -> RenderPlan {
         let render_plan = self.render_world.build(snapshot);
         let topology = scene_topology(snapshot);
+        let texture_topology = texture_topology(snapshot);
+        let texture_dirty = self
+            .texture_cache
+            .as_ref()
+            .map(|cache| {
+                cache.model_key != snapshot.model_key || cache.topology != texture_topology
+            })
+            .unwrap_or(true);
         let textures = self.prepare_textures(device, queue, snapshot);
+        if texture_dirty {
+            self.mask_atlas_dirty = true;
+        }
         if self.scene_key.as_deref() == Some(snapshot.model_key.as_str())
             && self.scene_topology.as_ref() == Some(&topology)
             && self.gpu_scene.is_some()
@@ -1536,6 +1605,7 @@ impl WgpuLive2DRenderer {
         }
         self.scene_key = Some(snapshot.model_key.clone());
         self.scene_topology = Some(topology);
+        self.mask_atlas_dirty = true;
         let positions = gpu_scene_positions(snapshot, &render_plan);
         let uvs = gpu_scene_uvs(snapshot, &render_plan);
         let indices = gpu_scene_indices(snapshot, &render_plan);
@@ -1586,7 +1656,18 @@ impl WgpuLive2DRenderer {
     {
         let render_plan = self.render_world.build_with_probe(snapshot, probe);
         let topology = scene_topology(snapshot);
+        let texture_topology = texture_topology(snapshot);
+        let texture_dirty = self
+            .texture_cache
+            .as_ref()
+            .map(|cache| {
+                cache.model_key != snapshot.model_key || cache.topology != texture_topology
+            })
+            .unwrap_or(true);
         let textures = self.prepare_textures_with_probe(device, queue, snapshot, probe);
+        if texture_dirty {
+            self.mask_atlas_dirty = true;
+        }
         if self.scene_key.as_deref() == Some(snapshot.model_key.as_str())
             && self.scene_topology.as_ref() == Some(&topology)
             && self.gpu_scene.is_some()
@@ -1613,6 +1694,7 @@ impl WgpuLive2DRenderer {
         );
         self.scene_key = Some(snapshot.model_key.clone());
         self.scene_topology = Some(topology);
+        self.mask_atlas_dirty = true;
         let positions = gpu_scene_positions(snapshot, &render_plan);
         let uvs = gpu_scene_uvs(snapshot, &render_plan);
         let indices = gpu_scene_indices(snapshot, &render_plan);
@@ -1850,14 +1932,19 @@ impl WgpuLive2DRenderer {
         snapshot: &ModelSnapshot,
         render_plan: &RenderPlan,
     ) {
-        let Some(gpu_scene) = &mut self.gpu_scene else {
-            return;
+        let mask_dirty = {
+            let Some(gpu_scene) = &mut self.gpu_scene else {
+                return;
+            };
+            if gpu_scene.vertex_count != render_plan.model.vertex_count {
+                return;
+            }
+            let upload_plan = gpu_position_upload_plan(&gpu_scene.positions, snapshot, render_plan);
+            let mask_dirty = position_uploads_touch_masks(&upload_plan.uploads, render_plan);
+            apply_gpu_upload_plan(queue, gpu_scene, upload_plan);
+            mask_dirty
         };
-        if gpu_scene.vertex_count != render_plan.model.vertex_count {
-            return;
-        }
-        let upload_plan = gpu_position_upload_plan(&gpu_scene.positions, snapshot, render_plan);
-        apply_gpu_upload_plan(queue, gpu_scene, upload_plan);
+        self.mask_atlas_dirty |= mask_dirty;
     }
 
     #[cfg(feature = "probe")]
@@ -1878,6 +1965,7 @@ impl WgpuLive2DRenderer {
         }
         let mut uploads = 0;
         let mut bytes = 0;
+        let mut mask_dirty = false;
         measure(probe, Stage::WgpuPositionUpload, Vec::new(), || {
             let Some(gpu_scene) = &mut self.gpu_scene else {
                 return;
@@ -1885,8 +1973,10 @@ impl WgpuLive2DRenderer {
             let upload_plan = gpu_position_upload_plan(&gpu_scene.positions, snapshot, render_plan);
             uploads = upload_plan.uploads.len();
             bytes = upload_plan.upload_bytes();
+            mask_dirty = position_uploads_touch_masks(&upload_plan.uploads, render_plan);
             apply_gpu_upload_plan(queue, gpu_scene, upload_plan);
         });
+        self.mask_atlas_dirty |= mask_dirty;
         counter(
             probe,
             Stage::WgpuPositionUpload,
@@ -2103,6 +2193,7 @@ fn create_mask_atlas(
         slot_height: atlas_layout.slot_height,
         columns: atlas_layout.columns,
         slots: atlas_layout.slots,
+        signature: None,
         view,
         bind_group,
     }
@@ -2159,6 +2250,89 @@ fn create_mask_bind_group(
             },
         ],
     })
+}
+
+fn mask_atlas_needs_rebuild(mask_atlas: Option<&MaskAtlas>, layout: MaskAtlasLayout) -> bool {
+    mask_atlas
+        .map(|atlas| {
+            atlas.width != layout.width
+                || atlas.height != layout.height
+                || atlas.slot_width != layout.slot_width
+                || atlas.slot_height != layout.slot_height
+                || atlas.columns != layout.columns
+                || atlas.slots != layout.slots
+        })
+        .unwrap_or(true)
+}
+
+fn mask_atlas_static_signature(
+    render_plan: &RenderPlan,
+    draw_lookup: &MaskDrawLookup<'_>,
+    canvas: &CanvasInfo,
+    view: &WgpuLive2DView,
+    layout: MaskAtlasLayout,
+) -> u64 {
+    let mut signature = 0xcbf2_9ce4_8422_2325;
+    mix_u64(&mut signature, layout.width as u64);
+    mix_u64(&mut signature, layout.height as u64);
+    mix_u64(&mut signature, layout.slot_width as u64);
+    mix_u64(&mut signature, layout.slot_height as u64);
+    mix_u64(&mut signature, layout.columns as u64);
+    mix_u64(&mut signature, layout.rows as u64);
+    mix_u64(&mut signature, layout.slots as u64);
+    mix_f32_slice(&mut signature, &view.transform);
+    mix_f32_slice(&mut signature, &live2d_canvas_uniform(canvas));
+
+    mix_u64(&mut signature, render_plan.masks.len() as u64);
+    for (mask_index, mask) in render_plan.masks.iter().enumerate() {
+        mix_u64(&mut signature, mask_index as u64);
+        mix_u64(&mut signature, mask.drawable_ids.len() as u64);
+        for drawable_id in &mask.drawable_ids {
+            let Some(draw) = draw_lookup.get(drawable_id.as_ref()) else {
+                mix_u64(&mut signature, 0);
+                continue;
+            };
+            mix_u64(&mut signature, 1);
+            mix_u64(&mut signature, draw.texture_index as u64);
+            mix_u64(&mut signature, draw.vertex_range.start as u64);
+            mix_u64(&mut signature, draw.vertex_range.end as u64);
+            mix_u64(&mut signature, draw.index_range.start as u64);
+            mix_u64(&mut signature, draw.index_range.end as u64);
+        }
+    }
+
+    signature
+}
+
+fn position_uploads_touch_masks(uploads: &[PositionUpload], render_plan: &RenderPlan) -> bool {
+    if uploads.is_empty() || render_plan.masks.is_empty() {
+        return false;
+    }
+    let draw_lookup = MaskDrawLookup::new(render_plan);
+    render_plan
+        .masks
+        .iter()
+        .flat_map(|mask| &mask.drawable_ids)
+        .filter_map(|drawable_id| draw_lookup.get(drawable_id.as_ref()))
+        .any(|draw| {
+            uploads.iter().any(|upload| {
+                upload.vertex_range.start < draw.vertex_range.end
+                    && draw.vertex_range.start < upload.vertex_range.end
+            })
+        })
+}
+
+fn mix_f32_slice(signature: &mut u64, values: &[f32]) {
+    for value in values {
+        mix_u64(signature, value.to_bits() as u64);
+    }
+}
+
+fn mix_u64(signature: &mut u64, value: u64) {
+    *signature ^= value
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(*signature << 6)
+        .wrapping_add(*signature >> 2);
 }
 
 fn mask_atlas_layout(
@@ -2733,6 +2907,27 @@ mod tests {
         assert_eq!(mask_draw_call_count(&render_plan), 2);
         assert_eq!(mask_uniform_slots(&render_plan), 1);
         assert_eq!(uniform_slots(&render_plan), render_plan.draws.len() + 1);
+    }
+
+    #[test]
+    fn mask_atlas_dirty_ranges_track_only_mask_inputs() {
+        let snapshot = masked_snapshot();
+        let render_plan = RenderPlanner::new().build(&snapshot);
+
+        assert!(position_uploads_touch_masks(
+            &[PositionUpload {
+                vertex_range: 0..1,
+                byte_offset: 0,
+            }],
+            &render_plan,
+        ));
+        assert!(!position_uploads_touch_masks(
+            &[PositionUpload {
+                vertex_range: 1..2,
+                byte_offset: std::mem::size_of::<GpuPosition>() as u64,
+            }],
+            &render_plan,
+        ));
     }
 
     #[test]
