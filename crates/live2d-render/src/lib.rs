@@ -25,6 +25,20 @@ pub struct DrawableRenderCtx {
     pub ranges: DrawableRanges,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+struct DrawableTable {
+    vertex_ranges: Vec<Range<u32>>,
+    index_ranges: Vec<Range<u32>>,
+    render_orders: Vec<i32>,
+    source_indices: Vec<usize>,
+}
+
+impl DrawableTable {
+    fn len(&self) -> usize {
+        self.source_indices.len()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaskPass {
     pub id: MaskRef,
@@ -161,28 +175,20 @@ impl RenderPlanner {
     }
 
     pub fn build(&self, snapshot: &ModelSnapshot) -> RenderPlan {
-        let model = build_model_ctx(snapshot);
-        let drawable_ranges = model
-            .drawables
-            .iter()
-            .map(|drawable| {
-                (
-                    drawable.drawable_id.clone(),
-                    (drawable.texture_index, drawable.ranges.clone()),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let (model, table) = build_model_ctx_and_table(snapshot);
         let mut mask_refs = HashMap::new();
-        let mut drawables = snapshot.drawables.iter().collect::<Vec<_>>();
-        drawables.sort_by_key(|drawable| drawable.render_order);
+        let ordered_rows = sorted_drawable_rows(&table);
 
         let mut masks = Vec::new();
-        let draws = drawables
+        let draws = ordered_rows
             .into_iter()
-            .filter_map(|drawable| {
-                let (texture_index, ranges) = drawable_ranges.get(&drawable.id)?.clone();
+            .map(|row| {
+                let drawable = &snapshot.drawables[table.source_indices[row]];
                 let mask = drawable.clipping.as_ref().map(|clipping| {
-                    let mask_key = (clipping.drawable_ids.clone(), clipping.inverted);
+                    let mask_key = MaskKey {
+                        drawable_ids: &clipping.drawable_ids,
+                        inverted: clipping.inverted,
+                    };
                     if let Some(mask_ref) = mask_refs.get(&mask_key) {
                         return *mask_ref;
                     }
@@ -195,21 +201,7 @@ impl RenderPlanner {
                     mask_refs.insert(mask_key, mask_ref);
                     mask_ref
                 });
-                Some(DrawCommand {
-                    drawable_id: drawable.id.clone(),
-                    texture_index,
-                    vertex_range: ranges.vertex_range,
-                    index_range: ranges.index_range,
-                    opacity: drawable.opacity,
-                    blend_mode: drawable.blend_mode,
-                    mask,
-                    inverted_mask: drawable
-                        .clipping
-                        .as_ref()
-                        .map(|clipping| clipping.inverted)
-                        .unwrap_or(false),
-                    material: MaterialKey::Default,
-                })
+                draw_command_for_row(snapshot, &table, row, mask)
             })
             .collect();
 
@@ -233,36 +225,24 @@ impl RenderPlanner {
                 ProbeAttr::new("textures", snapshot.textures.len()),
             ],
             || {
-                let model = measure(probe, Stage::RenderModelCtxBuild, Vec::new(), || {
-                    build_model_ctx(snapshot)
+                let (model, table) = measure(probe, Stage::RenderModelCtxBuild, Vec::new(), || {
+                    build_model_ctx_and_table(snapshot)
                 });
-                let drawable_ranges = model
-                    .drawables
-                    .iter()
-                    .map(|drawable| {
-                        (
-                            drawable.drawable_id.clone(),
-                            (drawable.texture_index, drawable.ranges.clone()),
-                        )
-                    })
-                    .collect::<HashMap<_, _>>();
                 let mut mask_refs = HashMap::new();
-                let mut drawables = snapshot.drawables.iter().collect::<Vec<_>>();
-                measure(probe, Stage::RenderOrderSort, Vec::new(), || {
-                    drawables.sort_by_key(|drawable| drawable.render_order);
+                let ordered_rows = measure(probe, Stage::RenderOrderSort, Vec::new(), || {
+                    sorted_drawable_rows(&table)
                 });
 
                 let mut masks = Vec::new();
                 let draws = measure(
                     probe,
                     Stage::RenderDrawCommandBuild,
-                    vec![ProbeAttr::new("candidate_drawables", drawables.len())],
+                    vec![ProbeAttr::new("candidate_drawables", ordered_rows.len())],
                     || {
-                        drawables
+                        ordered_rows
                             .into_iter()
-                            .filter_map(|drawable| {
-                                let (texture_index, ranges) =
-                                    drawable_ranges.get(&drawable.id)?.clone();
+                            .map(|row| {
+                                let drawable = &snapshot.drawables[table.source_indices[row]];
                                 let mask = drawable.clipping.as_ref().map(|clipping| {
                                     measure(
                                         probe,
@@ -272,8 +252,10 @@ impl RenderPlanner {
                                             clipping.drawable_ids.len(),
                                         )],
                                         || {
-                                            let mask_key =
-                                                (clipping.drawable_ids.clone(), clipping.inverted);
+                                            let mask_key = MaskKey {
+                                                drawable_ids: &clipping.drawable_ids,
+                                                inverted: clipping.inverted,
+                                            };
                                             if let Some(mask_ref) = mask_refs.get(&mask_key) {
                                                 return *mask_ref;
                                             }
@@ -288,21 +270,7 @@ impl RenderPlanner {
                                         },
                                     )
                                 });
-                                Some(DrawCommand {
-                                    drawable_id: drawable.id.clone(),
-                                    texture_index,
-                                    vertex_range: ranges.vertex_range,
-                                    index_range: ranges.index_range,
-                                    opacity: drawable.opacity,
-                                    blend_mode: drawable.blend_mode,
-                                    mask,
-                                    inverted_mask: drawable
-                                        .clipping
-                                        .as_ref()
-                                        .map(|clipping| clipping.inverted)
-                                        .unwrap_or(false),
-                                    material: MaterialKey::Default,
-                                })
+                                draw_command_for_row(snapshot, &table, row, mask)
                             })
                             .collect::<Vec<_>>()
                     },
@@ -332,35 +300,93 @@ impl RenderPlanner {
     }
 }
 
-fn build_model_ctx(snapshot: &ModelSnapshot) -> ModelRenderCtx {
+fn build_model_ctx_and_table(snapshot: &ModelSnapshot) -> (ModelRenderCtx, DrawableTable) {
+    let table = build_drawable_table(snapshot);
+    let model = ModelRenderCtx {
+        vertex_count: table.vertex_ranges.last().map_or(0, |range| range.end),
+        index_count: table.index_ranges.last().map_or(0, |range| range.end),
+        drawables: (0..table.len())
+            .map(|row| DrawableRenderCtx {
+                drawable_id: snapshot.drawables[table.source_indices[row]].id.clone(),
+                texture_index: snapshot.drawables[table.source_indices[row]].texture_index,
+                ranges: DrawableRanges {
+                    vertex_range: table.vertex_ranges[row].clone(),
+                    index_range: table.index_ranges[row].clone(),
+                },
+            })
+            .collect(),
+    };
+
+    (model, table)
+}
+
+fn build_drawable_table(snapshot: &ModelSnapshot) -> DrawableTable {
     let mut vertex_offset = 0;
     let mut index_offset = 0;
-    let drawables = snapshot
-        .drawables
-        .iter()
-        .filter(|drawable| !drawable.vertices.is_empty() && !drawable.indices.is_empty())
-        .map(|drawable| {
-            let vertex_count = drawable.vertices.len() as u32;
-            let index_count = drawable.indices.len() as u32;
-            let ranges = DrawableRanges {
-                vertex_range: vertex_offset..vertex_offset + vertex_count,
-                index_range: index_offset..index_offset + index_count,
-            };
-            vertex_offset += vertex_count;
-            index_offset += index_count;
-            DrawableRenderCtx {
-                drawable_id: drawable.id.clone(),
-                texture_index: drawable.texture_index,
-                ranges,
-            }
-        })
-        .collect();
+    let drawable_count = snapshot.drawables.len();
+    let mut table = DrawableTable {
+        vertex_ranges: Vec::with_capacity(drawable_count),
+        index_ranges: Vec::with_capacity(drawable_count),
+        render_orders: Vec::with_capacity(drawable_count),
+        source_indices: Vec::with_capacity(drawable_count),
+    };
 
-    ModelRenderCtx {
-        vertex_count: vertex_offset,
-        index_count: index_offset,
-        drawables,
+    for (source_index, drawable) in snapshot.drawables.iter().enumerate() {
+        if drawable.vertices.is_empty() || drawable.indices.is_empty() {
+            continue;
+        }
+
+        let vertex_count = drawable.vertices.len() as u32;
+        let index_count = drawable.indices.len() as u32;
+        table
+            .vertex_ranges
+            .push(vertex_offset..vertex_offset + vertex_count);
+        table
+            .index_ranges
+            .push(index_offset..index_offset + index_count);
+        table.render_orders.push(drawable.render_order);
+        table.source_indices.push(source_index);
+        vertex_offset += vertex_count;
+        index_offset += index_count;
     }
+
+    table
+}
+
+fn sorted_drawable_rows(table: &DrawableTable) -> Vec<usize> {
+    let mut rows = (0..table.len()).collect::<Vec<_>>();
+    rows.sort_by_key(|row| table.render_orders[*row]);
+    rows
+}
+
+fn draw_command_for_row(
+    snapshot: &ModelSnapshot,
+    table: &DrawableTable,
+    row: usize,
+    mask: Option<MaskRef>,
+) -> DrawCommand {
+    let drawable = &snapshot.drawables[table.source_indices[row]];
+    DrawCommand {
+        drawable_id: drawable.id.clone(),
+        texture_index: drawable.texture_index,
+        vertex_range: table.vertex_ranges[row].clone(),
+        index_range: table.index_ranges[row].clone(),
+        opacity: drawable.opacity,
+        blend_mode: drawable.blend_mode,
+        mask,
+        inverted_mask: drawable
+            .clipping
+            .as_ref()
+            .map(|clipping| clipping.inverted)
+            .unwrap_or(false),
+        material: MaterialKey::Default,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct MaskKey<'a> {
+    drawable_ids: &'a [DrawableId],
+    inverted: bool,
 }
 
 #[cfg(test)]
