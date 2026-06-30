@@ -1,5 +1,6 @@
 use live2d_perf::{
-    run_dispatch_null_backend, run_real_model_load, run_render_plan, SyntheticConfig,
+    run_dispatch_null_backend, run_real_model_load, run_render_plan, run_render_world_switch,
+    SyntheticConfig,
 };
 use live2d_probe::RunReport;
 use std::{
@@ -40,6 +41,7 @@ fn run() -> Result<(), String> {
 
     let mut report = match scenario.as_str() {
         "synthetic-render-plan" => run_render_plan(&config),
+        "render-world-switch" => run_render_world_switch(&config),
         "dispatch-null-backend" => {
             let (report, backend) = run_dispatch_null_backend(&config);
             println!(
@@ -63,7 +65,7 @@ fn run() -> Result<(), String> {
         }
         _ => {
             return Err(format!(
-                "unknown scenario `{scenario}`; expected synthetic-render-plan, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, or wgpu-resize"
+                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, or wgpu-resize"
             ));
         }
     };
@@ -80,7 +82,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--model <path>]");
-    println!("scenarios: synthetic-render-plan, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize");
+    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize");
     println!("profiles: small, medium, large, mask-heavy, static-mask-heavy, texture-heavy, target-filter");
 }
 
@@ -88,6 +90,7 @@ fn uses_synthetic_config(scenario: &str) -> bool {
     matches!(
         scenario,
         "synthetic-render-plan"
+            | "render-world-switch"
             | "dispatch-null-backend"
             | "wgpu-cold"
             | "wgpu-warm"

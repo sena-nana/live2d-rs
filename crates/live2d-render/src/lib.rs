@@ -74,7 +74,7 @@ pub struct RenderPlanner;
 
 #[derive(Debug, Clone, Default)]
 pub struct RenderWorld {
-    cache: Option<RenderWorldCache>,
+    caches: HashMap<String, RenderWorldCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,14 +287,14 @@ impl RenderWorld {
     }
 
     pub fn clear(&mut self) {
-        self.cache = None;
+        self.caches.clear();
     }
 
     pub fn build(&mut self, snapshot: &ModelSnapshot) -> RenderPlan {
         self.ensure_cache(snapshot);
         let cache = self
-            .cache
-            .as_mut()
+            .caches
+            .get_mut(&snapshot.model_key)
             .expect("render world cache is initialized");
         refresh_cached_render_order(snapshot, cache);
         render_plan_from_cache(snapshot, cache)
@@ -314,8 +314,8 @@ impl RenderWorld {
             ],
             || {
                 let cache_rebuild = self
-                    .cache
-                    .as_ref()
+                    .caches
+                    .get(&snapshot.model_key)
                     .map_or(true, |cache| !render_world_cache_matches(cache, snapshot));
                 if cache_rebuild {
                     let (model, table) =
@@ -331,19 +331,22 @@ impl RenderWorld {
                         vec![ProbeAttr::new("candidate_drawables", ordered_rows.len())],
                         || build_mask_group_table(snapshot, &table, &ordered_rows),
                     );
-                    self.cache = Some(RenderWorldCache {
-                        model_key: snapshot.model_key.clone(),
-                        clipping_by_row: clipping_by_row(snapshot, &table),
-                        model,
-                        table,
-                        ordered_rows,
-                        mask_table,
-                    });
+                    self.caches.insert(
+                        snapshot.model_key.clone(),
+                        RenderWorldCache {
+                            model_key: snapshot.model_key.clone(),
+                            clipping_by_row: clipping_by_row(snapshot, &table),
+                            model,
+                            table,
+                            ordered_rows,
+                            mask_table,
+                        },
+                    );
                 }
 
                 let cache = self
-                    .cache
-                    .as_mut()
+                    .caches
+                    .get_mut(&snapshot.model_key)
                     .expect("render world cache is initialized");
                 let order_changed = if cache_rebuild {
                     false
@@ -397,11 +400,14 @@ impl RenderWorld {
 
     fn ensure_cache(&mut self, snapshot: &ModelSnapshot) {
         let rebuild = self
-            .cache
-            .as_ref()
+            .caches
+            .get(&snapshot.model_key)
             .map_or(true, |cache| !render_world_cache_matches(cache, snapshot));
         if rebuild {
-            self.cache = Some(build_render_world_cache(snapshot));
+            self.caches.insert(
+                snapshot.model_key.clone(),
+                build_render_world_cache(snapshot),
+            );
         }
     }
 }
@@ -812,6 +818,41 @@ mod tests {
             .map(|draw| draw.drawable_id.as_ref())
             .collect::<Vec<_>>();
 
+        assert_eq!(draw_ids, ["b", "a"]);
+    }
+
+    #[test]
+    fn render_world_retains_multiple_model_caches() {
+        let mut model_a = ModelSnapshot {
+            model_key: "model-a".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![drawable("a", 0, None), drawable("b", 1, None)],
+        };
+        let model_b = ModelSnapshot {
+            model_key: "model-b".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![drawable("a", 0, None), drawable("b", 1, None)],
+        };
+        let mut world = RenderWorld::new();
+
+        assert_eq!(world.build(&model_a), RenderPlanner::new().build(&model_a));
+        assert_eq!(world.build(&model_b), RenderPlanner::new().build(&model_b));
+        assert_eq!(world.caches.len(), 2);
+
+        model_a.drawables[0].render_order = 2;
+        model_a.drawables[1].render_order = 1;
+        let plan = world.build(&model_a);
+        let draw_ids = plan
+            .draws
+            .iter()
+            .map(|draw| draw.drawable_id.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(world.caches.len(), 2);
         assert_eq!(draw_ids, ["b", "a"]);
     }
 

@@ -2,7 +2,9 @@ use live2d_core::{
     BlendMode, CanvasInfo, ClippingInfo, Drawable, DrawableId, ModelSnapshot, TextureAsset, Vertex,
 };
 use live2d_probe::{ProbeRecorder, RunReport};
-use live2d_render::{DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlanner};
+use live2d_render::{
+    DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlanner, RenderWorld,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
 
@@ -360,6 +362,17 @@ pub fn run_render_plan(config: &SyntheticConfig) -> RunReport {
         config.as_report_config(),
         Vec::new(),
     )
+}
+
+pub fn run_render_world_switch(config: &SyntheticConfig) -> RunReport {
+    let recorder = ProbeRecorder::new();
+    let mut world = RenderWorld::new();
+    for frame in 0..config.frames.max(1) {
+        let mut snapshot = synthetic_snapshot(config, frame);
+        snapshot.model_key = format!("synthetic-switch-{}", frame % 2);
+        let _ = world.build_with_probe(&snapshot, &recorder);
+    }
+    recorder.report("render-world-switch", config.as_report_config(), Vec::new())
 }
 
 pub fn run_dispatch_null_backend(config: &SyntheticConfig) -> (RunReport, CountingBackend) {
