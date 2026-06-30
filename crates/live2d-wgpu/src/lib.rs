@@ -3,7 +3,7 @@ use live2d_core::{BlendMode, CanvasInfo, Drawable, ModelSnapshot, TextureAsset};
 #[cfg(feature = "probe")]
 use live2d_probe::{counter, gauge, measure, ProbeAttr, ProbeSink, Stage};
 use live2d_render::{
-    DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlan, RenderPlanner,
+    DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlan, RenderWorld,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -260,6 +260,7 @@ pub struct WgpuLive2DRenderer {
     mask_atlas: Option<MaskAtlas>,
     offscreen_target: Option<OffscreenTarget>,
     gpu_scene: Option<GpuScene>,
+    render_world: RenderWorld,
     #[cfg(feature = "probe")]
     pending_gpu_timestamps: Vec<GpuTimestampFrame>,
 }
@@ -754,6 +755,7 @@ impl WgpuLive2DRenderer {
             mask_atlas: None,
             offscreen_target: None,
             gpu_scene: None,
+            render_world: RenderWorld::new(),
             #[cfg(feature = "probe")]
             pending_gpu_timestamps: Vec::new(),
         }
@@ -1519,7 +1521,7 @@ impl WgpuLive2DRenderer {
         queue: &wgpu::Queue,
         snapshot: &ModelSnapshot,
     ) -> RenderPlan {
-        let render_plan = RenderPlanner::new().build(snapshot);
+        let render_plan = self.render_world.build(snapshot);
         let topology = scene_topology(snapshot);
         let textures = self.prepare_textures(device, queue, snapshot);
         if self.scene_key.as_deref() == Some(snapshot.model_key.as_str())
@@ -1582,7 +1584,7 @@ impl WgpuLive2DRenderer {
     where
         P: ProbeSink,
     {
-        let render_plan = RenderPlanner::new().build_with_probe(snapshot, probe);
+        let render_plan = self.render_world.build_with_probe(snapshot, probe);
         let topology = scene_topology(snapshot);
         let textures = self.prepare_textures_with_probe(device, queue, snapshot, probe);
         if self.scene_key.as_deref() == Some(snapshot.model_key.as_str())
@@ -2599,6 +2601,7 @@ mod tests {
     use live2d_core::{
         BlendMode, CanvasInfo, ClippingInfo, DrawableId, MaskRef, MaterialKey, TextureAsset, Vertex,
     };
+    use live2d_render::RenderPlanner;
 
     #[test]
     fn pads_odd_index_upload_bytes_without_changing_draw_count() {

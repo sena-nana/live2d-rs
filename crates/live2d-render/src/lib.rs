@@ -1,4 +1,6 @@
-use live2d_core::{BlendMode, DrawableId, DrawableRanges, MaskRef, MaterialKey, ModelSnapshot};
+use live2d_core::{
+    BlendMode, ClippingInfo, DrawableId, DrawableRanges, MaskRef, MaterialKey, ModelSnapshot,
+};
 #[cfg(feature = "probe")]
 use live2d_probe::{counter, measure, ProbeAttr, ProbeSink, Stage};
 use std::collections::HashMap;
@@ -69,6 +71,21 @@ pub struct DrawCommand {
 
 #[derive(Debug, Clone, Default)]
 pub struct RenderPlanner;
+
+#[derive(Debug, Clone, Default)]
+pub struct RenderWorld {
+    cache: Option<RenderWorldCache>,
+}
+
+#[derive(Debug, Clone)]
+struct RenderWorldCache {
+    model_key: String,
+    model: ModelRenderCtx,
+    table: DrawableTable,
+    ordered_rows: Vec<usize>,
+    mask_table: MaskGroupTable,
+    clipping_by_row: Vec<Option<ClippingInfo>>,
+}
 
 pub trait Live2DRenderBackend {
     fn begin_model(&mut self, _ctx: &ModelRenderCtx) {}
@@ -264,6 +281,131 @@ impl RenderPlanner {
     }
 }
 
+impl RenderWorld {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.cache = None;
+    }
+
+    pub fn build(&mut self, snapshot: &ModelSnapshot) -> RenderPlan {
+        self.ensure_cache(snapshot);
+        let cache = self
+            .cache
+            .as_mut()
+            .expect("render world cache is initialized");
+        refresh_cached_render_order(snapshot, cache);
+        render_plan_from_cache(snapshot, cache)
+    }
+
+    #[cfg(feature = "probe")]
+    pub fn build_with_probe<P>(&mut self, snapshot: &ModelSnapshot, probe: &P) -> RenderPlan
+    where
+        P: ProbeSink,
+    {
+        measure(
+            probe,
+            Stage::RenderPlanTotal,
+            vec![
+                ProbeAttr::new("drawables", snapshot.drawables.len()),
+                ProbeAttr::new("textures", snapshot.textures.len()),
+            ],
+            || {
+                let cache_rebuild = self
+                    .cache
+                    .as_ref()
+                    .map_or(true, |cache| !render_world_cache_matches(cache, snapshot));
+                if cache_rebuild {
+                    let (model, table) =
+                        measure(probe, Stage::RenderModelCtxBuild, Vec::new(), || {
+                            build_model_ctx_and_table(snapshot)
+                        });
+                    let ordered_rows = measure(probe, Stage::RenderOrderSort, Vec::new(), || {
+                        sorted_drawable_rows(&table)
+                    });
+                    let mask_table = measure(
+                        probe,
+                        Stage::RenderMaskDedup,
+                        vec![ProbeAttr::new("candidate_drawables", ordered_rows.len())],
+                        || build_mask_group_table(snapshot, &table, &ordered_rows),
+                    );
+                    self.cache = Some(RenderWorldCache {
+                        model_key: snapshot.model_key.clone(),
+                        clipping_by_row: clipping_by_row(snapshot, &table),
+                        model,
+                        table,
+                        ordered_rows,
+                        mask_table,
+                    });
+                }
+
+                let cache = self
+                    .cache
+                    .as_mut()
+                    .expect("render world cache is initialized");
+                let order_changed = if cache_rebuild {
+                    false
+                } else {
+                    measure(probe, Stage::RenderOrderSort, Vec::new(), || {
+                        refresh_cached_render_order(snapshot, cache)
+                    })
+                };
+                if order_changed {
+                    cache.mask_table = measure(
+                        probe,
+                        Stage::RenderMaskDedup,
+                        vec![ProbeAttr::new(
+                            "candidate_drawables",
+                            cache.ordered_rows.len(),
+                        )],
+                        || build_mask_group_table(snapshot, &cache.table, &cache.ordered_rows),
+                    );
+                }
+                let draws = measure(
+                    probe,
+                    Stage::RenderDrawCommandBuild,
+                    vec![ProbeAttr::new(
+                        "candidate_drawables",
+                        cache.ordered_rows.len(),
+                    )],
+                    || draw_commands_from_cache(snapshot, cache),
+                );
+                counter(
+                    probe,
+                    Stage::RenderPlanTotal,
+                    "draw_calls",
+                    draws.len() as u64,
+                    Vec::new(),
+                );
+                counter(
+                    probe,
+                    Stage::RenderPlanTotal,
+                    "resource_rebuilds",
+                    cache.mask_table.masks.len() as u64,
+                    vec![ProbeAttr::new("resource", "mask_pass")],
+                );
+                RenderPlan {
+                    model: cache.model.clone(),
+                    masks: cache.mask_table.masks.clone(),
+                    draws,
+                }
+            },
+        )
+    }
+
+    fn ensure_cache(&mut self, snapshot: &ModelSnapshot) {
+        let rebuild = self
+            .cache
+            .as_ref()
+            .map_or(true, |cache| !render_world_cache_matches(cache, snapshot));
+        if rebuild {
+            self.cache = Some(build_render_world_cache(snapshot));
+        }
+    }
+}
+
 fn build_model_ctx_and_table(snapshot: &ModelSnapshot) -> (ModelRenderCtx, DrawableTable) {
     let table = build_drawable_table(snapshot);
     let model = ModelRenderCtx {
@@ -321,6 +463,104 @@ fn sorted_drawable_rows(table: &DrawableTable) -> Vec<usize> {
     let mut rows = (0..table.len()).collect::<Vec<_>>();
     rows.sort_by_key(|row| table.render_orders[*row]);
     rows
+}
+
+fn build_render_world_cache(snapshot: &ModelSnapshot) -> RenderWorldCache {
+    let (model, table) = build_model_ctx_and_table(snapshot);
+    let ordered_rows = sorted_drawable_rows(&table);
+    let mask_table = build_mask_group_table(snapshot, &table, &ordered_rows);
+    let clipping_by_row = clipping_by_row(snapshot, &table);
+    RenderWorldCache {
+        model_key: snapshot.model_key.clone(),
+        model,
+        table,
+        ordered_rows,
+        mask_table,
+        clipping_by_row,
+    }
+}
+
+fn render_world_cache_matches(cache: &RenderWorldCache, snapshot: &ModelSnapshot) -> bool {
+    if cache.model_key != snapshot.model_key {
+        return false;
+    }
+    let mut renderable_count = 0;
+    for drawable in &snapshot.drawables {
+        if !drawable.vertices.is_empty() && !drawable.indices.is_empty() {
+            renderable_count += 1;
+        }
+    }
+    if renderable_count != cache.table.len() {
+        return false;
+    }
+
+    for row in 0..cache.table.len() {
+        let source_index = cache.table.source_indices[row];
+        let Some(drawable) = snapshot.drawables.get(source_index) else {
+            return false;
+        };
+        let model_drawable = &cache.model.drawables[row];
+        let vertex_count =
+            cache.table.vertex_ranges[row].end - cache.table.vertex_ranges[row].start;
+        let index_count = cache.table.index_ranges[row].end - cache.table.index_ranges[row].start;
+        if drawable.vertices.is_empty()
+            || drawable.indices.is_empty()
+            || drawable.id != model_drawable.drawable_id
+            || drawable.texture_index != model_drawable.texture_index
+            || drawable.vertices.len() as u32 != vertex_count
+            || drawable.indices.len() as u32 != index_count
+            || drawable.clipping.as_ref() != cache.clipping_by_row[row].as_ref()
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn clipping_by_row(snapshot: &ModelSnapshot, table: &DrawableTable) -> Vec<Option<ClippingInfo>> {
+    table
+        .source_indices
+        .iter()
+        .map(|source_index| snapshot.drawables[*source_index].clipping.clone())
+        .collect()
+}
+
+fn refresh_cached_render_order(snapshot: &ModelSnapshot, cache: &mut RenderWorldCache) -> bool {
+    let mut changed = false;
+    for row in 0..cache.table.len() {
+        let render_order = snapshot.drawables[cache.table.source_indices[row]].render_order;
+        if cache.table.render_orders[row] != render_order {
+            cache.table.render_orders[row] = render_order;
+            changed = true;
+        }
+    }
+    if changed {
+        cache.ordered_rows = sorted_drawable_rows(&cache.table);
+    }
+    changed
+}
+
+fn draw_commands_from_cache(
+    snapshot: &ModelSnapshot,
+    cache: &RenderWorldCache,
+) -> Vec<DrawCommand> {
+    cache
+        .ordered_rows
+        .iter()
+        .map(|row| {
+            let mask = cache.mask_table.mask_refs_by_row[*row];
+            draw_command_for_row(snapshot, &cache.table, *row, mask)
+        })
+        .collect()
+}
+
+fn render_plan_from_cache(snapshot: &ModelSnapshot, cache: &RenderWorldCache) -> RenderPlan {
+    RenderPlan {
+        model: cache.model.clone(),
+        masks: cache.mask_table.masks.clone(),
+        draws: draw_commands_from_cache(snapshot, cache),
+    }
 }
 
 fn build_mask_group_table(
@@ -545,6 +785,34 @@ mod tests {
         assert_eq!(plan.draws[0].index_range, 3..9);
         assert_eq!(plan.draws[1].vertex_range, 0..2);
         assert_eq!(plan.draws[1].index_range, 0..3);
+    }
+
+    #[test]
+    fn render_world_matches_planner_and_refreshes_render_order() {
+        let mut snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![drawable("b", 20, None), drawable("a", 10, None)],
+        };
+        let mut world = RenderWorld::new();
+
+        assert_eq!(
+            world.build(&snapshot),
+            RenderPlanner::new().build(&snapshot)
+        );
+
+        snapshot.drawables[0].render_order = 0;
+        snapshot.drawables[1].render_order = 30;
+        let plan = world.build(&snapshot);
+        let draw_ids = plan
+            .draws
+            .iter()
+            .map(|draw| draw.drawable_id.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(draw_ids, ["b", "a"]);
     }
 
     #[test]
