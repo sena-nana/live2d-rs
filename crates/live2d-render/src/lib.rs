@@ -79,7 +79,6 @@ pub struct RenderWorld {
 
 #[derive(Debug, Clone)]
 struct RenderWorldCache {
-    model_key: String,
     model: ModelRenderCtx,
     table: DrawableTable,
     ordered_rows: Vec<usize>,
@@ -334,7 +333,6 @@ impl RenderWorld {
                     self.caches.insert(
                         snapshot.model_key.clone(),
                         RenderWorldCache {
-                            model_key: snapshot.model_key.clone(),
                             clipping_by_row: clipping_by_row(snapshot, &table),
                             model,
                             table,
@@ -477,7 +475,6 @@ fn build_render_world_cache(snapshot: &ModelSnapshot) -> RenderWorldCache {
     let mask_table = build_mask_group_table(snapshot, &table, &ordered_rows);
     let clipping_by_row = clipping_by_row(snapshot, &table);
     RenderWorldCache {
-        model_key: snapshot.model_key.clone(),
         model,
         table,
         ordered_rows,
@@ -487,9 +484,6 @@ fn build_render_world_cache(snapshot: &ModelSnapshot) -> RenderWorldCache {
 }
 
 fn render_world_cache_matches(cache: &RenderWorldCache, snapshot: &ModelSnapshot) -> bool {
-    if cache.model_key != snapshot.model_key {
-        return false;
-    }
     let mut renderable_count = 0;
     for drawable in &snapshot.drawables {
         if !drawable.vertices.is_empty() && !drawable.indices.is_empty() {

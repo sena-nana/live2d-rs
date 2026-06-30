@@ -1135,8 +1135,7 @@ impl WgpuLive2DRenderer {
     }
 
     fn active_gpu_scene_mut(&mut self) -> Option<&mut GpuScene> {
-        let key = self.active_scene_key.clone()?;
-        self.gpu_scenes.get_mut(&key)
+        self.gpu_scenes.get_mut(self.active_scene_key.as_deref()?)
     }
 
     fn encode_render_from_uniform_slot<'pass>(
