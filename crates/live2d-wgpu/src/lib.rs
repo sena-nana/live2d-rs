@@ -397,6 +397,25 @@ struct PositionUpload {
     byte_offset: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct GpuUploadPlan {
+    positions: Vec<GpuPosition>,
+    uploads: Vec<PositionUpload>,
+}
+
+impl GpuUploadPlan {
+    #[cfg(feature = "probe")]
+    fn upload_bytes(&self) -> u64 {
+        self.uploads
+            .iter()
+            .map(|upload| {
+                (upload.vertex_range.end - upload.vertex_range.start) as u64
+                    * std::mem::size_of::<GpuPosition>() as u64
+            })
+            .sum()
+    }
+}
+
 struct WgpuRenderBackend<'a, 'pass, 'view> {
     queue: &'a wgpu::Queue,
     pass: &'a mut wgpu::RenderPass<'pass>,
@@ -1806,16 +1825,8 @@ impl WgpuLive2DRenderer {
         if gpu_scene.vertex_count != render_plan.model.vertex_count {
             return;
         }
-        let positions = gpu_scene_positions(snapshot, render_plan);
-        for upload in position_uploads(&gpu_scene.positions, &positions, render_plan) {
-            let range = upload.vertex_range.start as usize..upload.vertex_range.end as usize;
-            queue.write_buffer(
-                &gpu_scene.position_buffer,
-                upload.byte_offset,
-                bytemuck::cast_slice(&positions[range]),
-            );
-        }
-        gpu_scene.positions = positions;
+        let upload_plan = gpu_position_upload_plan(&gpu_scene.positions, snapshot, render_plan);
+        apply_gpu_upload_plan(queue, gpu_scene, upload_plan);
     }
 
     #[cfg(feature = "probe")]
@@ -1831,26 +1842,25 @@ impl WgpuLive2DRenderer {
         let Some(gpu_scene) = &self.gpu_scene else {
             return;
         };
-        let positions = gpu_scene_positions(snapshot, render_plan);
-        let uploads = position_uploads(&gpu_scene.positions, &positions, render_plan);
-        let bytes = uploads
-            .iter()
-            .map(|upload| {
-                (upload.vertex_range.end - upload.vertex_range.start) as u64
-                    * std::mem::size_of::<GpuPosition>() as u64
-            })
-            .sum();
-        measure(
-            probe,
-            Stage::WgpuPositionUpload,
-            vec![ProbeAttr::new("uploads", uploads.len())],
-            || self.upload_scene_positions(queue, snapshot, render_plan),
-        );
+        if gpu_scene.vertex_count != render_plan.model.vertex_count {
+            return;
+        }
+        let mut uploads = 0;
+        let mut bytes = 0;
+        measure(probe, Stage::WgpuPositionUpload, Vec::new(), || {
+            let Some(gpu_scene) = &mut self.gpu_scene else {
+                return;
+            };
+            let upload_plan = gpu_position_upload_plan(&gpu_scene.positions, snapshot, render_plan);
+            uploads = upload_plan.uploads.len();
+            bytes = upload_plan.upload_bytes();
+            apply_gpu_upload_plan(queue, gpu_scene, upload_plan);
+        });
         counter(
             probe,
             Stage::WgpuPositionUpload,
             "buffer_writes",
-            uploads.len() as u64,
+            uploads as u64,
             Vec::new(),
         );
         counter(probe, Stage::WgpuPositionUpload, "bytes", bytes, Vec::new());
@@ -2351,31 +2361,91 @@ fn gpu_scene_positions(snapshot: &ModelSnapshot, render_plan: &RenderPlan) -> Ve
     positions
 }
 
-fn position_uploads(
+fn gpu_position_upload_plan(
     previous: &[GpuPosition],
-    next: &[GpuPosition],
+    snapshot: &ModelSnapshot,
     render_plan: &RenderPlan,
-) -> Vec<PositionUpload> {
-    if previous.len() != next.len() {
-        return vec![PositionUpload {
-            vertex_range: 0..next.len() as u32,
-            byte_offset: 0,
-        }];
+) -> GpuUploadPlan {
+    if previous.len() != render_plan.model.vertex_count as usize {
+        let positions = gpu_scene_positions(snapshot, render_plan);
+        let uploads = full_position_upload(&positions);
+        return GpuUploadPlan { positions, uploads };
     }
 
+    let mut positions = Vec::with_capacity(render_plan.model.vertex_count as usize);
     let mut uploads = Vec::new();
-    for drawable in &render_plan.model.drawables {
-        let start = drawable.ranges.vertex_range.start as usize;
-        let end = drawable.ranges.vertex_range.end as usize;
-        if end > previous.len() || previous[start..end] == next[start..end] {
-            continue;
+    let mut dirty_start = None;
+
+    for drawable in renderable_drawables(snapshot) {
+        for vertex in &drawable.vertices {
+            let position = GpuPosition {
+                position: vertex.position,
+            };
+            let index = positions.len();
+            let Some(previous_position) = previous.get(index) else {
+                positions.push(position);
+                continue;
+            };
+            let is_dirty = *previous_position != position;
+            match (dirty_start, is_dirty) {
+                (None, true) => dirty_start = Some(index),
+                (Some(start), false) => {
+                    uploads.push(PositionUpload {
+                        vertex_range: start as u32..index as u32,
+                        byte_offset: position_byte_offset(start),
+                    });
+                    dirty_start = None;
+                }
+                _ => {}
+            }
+            positions.push(position);
         }
+    }
+
+    if positions.len() != previous.len() {
+        let uploads = full_position_upload(&positions);
+        return GpuUploadPlan { positions, uploads };
+    }
+
+    if let Some(start) = dirty_start {
         uploads.push(PositionUpload {
-            vertex_range: drawable.ranges.vertex_range.clone(),
-            byte_offset: start as u64 * std::mem::size_of::<GpuPosition>() as u64,
+            vertex_range: start as u32..positions.len() as u32,
+            byte_offset: position_byte_offset(start),
         });
     }
-    uploads
+
+    GpuUploadPlan { positions, uploads }
+}
+
+fn full_position_upload(positions: &[GpuPosition]) -> Vec<PositionUpload> {
+    if positions.is_empty() {
+        Vec::new()
+    } else {
+        vec![PositionUpload {
+            vertex_range: 0..positions.len() as u32,
+            byte_offset: 0,
+        }]
+    }
+}
+
+fn position_byte_offset(vertex_index: usize) -> u64 {
+    vertex_index as u64 * std::mem::size_of::<GpuPosition>() as u64
+}
+
+fn apply_gpu_upload_plan(
+    queue: &wgpu::Queue,
+    gpu_scene: &mut GpuScene,
+    upload_plan: GpuUploadPlan,
+) {
+    for upload in &upload_plan.uploads {
+        let range = upload.vertex_range.start as usize..upload.vertex_range.end as usize;
+        queue.write_buffer(
+            &gpu_scene.position_buffer,
+            upload.byte_offset,
+            bytemuck::cast_slice(&upload_plan.positions[range]),
+        );
+    }
+    gpu_scene.positions = upload_plan.positions;
 }
 
 fn gpu_scene_uvs(snapshot: &ModelSnapshot, render_plan: &RenderPlan) -> Vec<GpuUv> {
@@ -2594,38 +2664,44 @@ mod tests {
     }
 
     #[test]
-    fn position_uploads_only_cover_changed_drawable_ranges() {
+    fn position_upload_plan_merges_contiguous_dirty_vertices() {
         let base = snapshot_with_drawables(&[("a", 0, 2, 3), ("b", 1, 3, 3)]);
         let mut next = base.clone();
+        next.drawables[0].vertices[1].position = [10.0, 11.0];
         next.drawables[1].vertices[0].position = [20.0, 21.0];
         let plan = RenderPlanner::new().build(&base);
         let previous = gpu_scene_positions(&base, &plan);
-        let next_positions = gpu_scene_positions(&next, &plan);
+        let upload_plan = gpu_position_upload_plan(&previous, &next, &plan);
 
         assert_eq!(
-            position_uploads(&previous, &next_positions, &plan),
+            upload_plan.uploads,
             vec![PositionUpload {
-                vertex_range: 2..5,
-                byte_offset: 2 * std::mem::size_of::<GpuPosition>() as u64,
+                vertex_range: 1..3,
+                byte_offset: std::mem::size_of::<GpuPosition>() as u64,
             }]
         );
+        assert_eq!(upload_plan.positions, gpu_scene_positions(&next, &plan));
     }
 
     #[test]
-    fn position_uploads_fall_back_to_full_range_when_lengths_differ() {
+    fn position_upload_plan_falls_back_to_full_range_when_lengths_differ() {
         let base = snapshot_with_drawables(&[("a", 0, 2, 3)]);
         let next = snapshot_with_drawables(&[("a", 0, 3, 3)]);
         let base_plan = RenderPlanner::new().build(&base);
         let next_plan = RenderPlanner::new().build(&next);
         let previous = gpu_scene_positions(&base, &base_plan);
-        let next_positions = gpu_scene_positions(&next, &next_plan);
+        let upload_plan = gpu_position_upload_plan(&previous, &next, &next_plan);
 
         assert_eq!(
-            position_uploads(&previous, &next_positions, &next_plan),
+            upload_plan.uploads,
             vec![PositionUpload {
                 vertex_range: 0..3,
                 byte_offset: 0,
             }]
+        );
+        assert_eq!(
+            upload_plan.positions,
+            gpu_scene_positions(&next, &next_plan)
         );
     }
 
