@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
-use live2d_core::{CanvasInfo, ModelSnapshot, TextureAsset};
-use std::collections::HashSet;
+use live2d_core::{CanvasInfo, Drawable, ModelSnapshot, TextureAsset};
+use live2d_render::RenderPlanner;
+use std::collections::{HashMap, HashSet};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -183,7 +184,7 @@ struct Live2dUniform {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 struct GpuVertex {
     position: [f32; 2],
     uv: [f32; 2],
@@ -196,21 +197,23 @@ pub struct WgpuLive2DRenderer {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     scene_key: Option<String>,
+    scene_topology: Option<SceneTopology>,
     gpu_scene: Option<GpuScene>,
 }
 
 struct GpuScene {
-    drawables: Vec<GpuDrawable>,
+    drawables: HashMap<String, GpuDrawable>,
     textures: Vec<wgpu::BindGroup>,
 }
 
 struct GpuDrawable {
-    id: String,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    vertex_count: usize,
     index_count: u32,
-    texture_index: usize,
 }
+
+type SceneTopology = (usize, Vec<(String, usize, usize, usize)>);
 
 impl WgpuLive2DRenderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -331,6 +334,7 @@ impl WgpuLive2DRenderer {
             uniform_buffer,
             uniform_bind_group,
             scene_key: None,
+            scene_topology: None,
             gpu_scene: None,
         }
     }
@@ -341,7 +345,7 @@ impl WgpuLive2DRenderer {
         queue: &wgpu::Queue,
         snapshot: &ModelSnapshot,
     ) {
-        self.ensure_scene(device, queue, snapshot);
+        self.prepare_scene(device, queue, snapshot);
     }
 
     pub fn render<'pass>(
@@ -352,10 +356,11 @@ impl WgpuLive2DRenderer {
         snapshot: &ModelSnapshot,
         view: WgpuLive2DView,
     ) {
-        self.ensure_scene(device, queue, snapshot);
+        self.prepare_scene(device, queue, snapshot);
         let Some(gpu_scene) = &self.gpu_scene else {
             return;
         };
+        let render_plan = RenderPlanner::new().build(snapshot);
         let target_ids = view
             .target_drawable_ids
             .iter()
@@ -363,12 +368,21 @@ impl WgpuLive2DRenderer {
             .collect::<HashSet<_>>();
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-        for drawable in &gpu_scene.drawables {
-            let Some(texture) = gpu_scene.textures.get(drawable.texture_index) else {
+        for draw in &render_plan.draws {
+            let Some(drawable) = gpu_scene.drawables.get(draw.drawable_id.as_ref()) else {
                 continue;
             };
-            let effect = if target_ids.is_empty() || target_ids.contains(drawable.id.as_str()) {
-                view.effect
+            let Some(texture) = gpu_scene.textures.get(draw.texture_index) else {
+                continue;
+            };
+            let effect = if target_ids.is_empty() || target_ids.contains(draw.drawable_id.as_ref())
+            {
+                [
+                    view.effect[0],
+                    view.effect[1],
+                    view.effect[2],
+                    view.effect[3] * draw.opacity.clamp(0.0, 1.0),
+                ]
             } else {
                 [1.0, 1.0, 1.0, 1.0]
             };
@@ -391,16 +405,21 @@ impl WgpuLive2DRenderer {
         }
     }
 
-    fn ensure_scene(
+    fn prepare_scene(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         snapshot: &ModelSnapshot,
     ) {
-        if self.scene_key.as_deref() == Some(snapshot.model_key.as_str()) {
+        let topology = scene_topology(snapshot);
+        if self.scene_key.as_deref() == Some(snapshot.model_key.as_str())
+            && self.scene_topology.as_ref() == Some(&topology)
+        {
+            self.upload_scene_vertices(queue, snapshot);
             return;
         }
         self.scene_key = Some(snapshot.model_key.clone());
+        self.scene_topology = Some(topology);
         let textures = snapshot
             .textures
             .iter()
@@ -411,14 +430,8 @@ impl WgpuLive2DRenderer {
             .iter()
             .filter(|drawable| !drawable.vertices.is_empty() && !drawable.indices.is_empty())
             .map(|drawable| {
-                let vertices = drawable
-                    .vertices
-                    .iter()
-                    .map(|vertex| GpuVertex {
-                        position: vertex.position,
-                        uv: vertex.uv,
-                    })
-                    .collect::<Vec<_>>();
+                let id = drawable.id.as_ref().to_owned();
+                let vertices = gpu_vertices(drawable);
                 let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Live2D Drawable Vertices"),
                     size: (vertices.len() * std::mem::size_of::<GpuVertex>()) as u64,
@@ -434,19 +447,45 @@ impl WgpuLive2DRenderer {
                     mapped_at_creation: false,
                 });
                 queue.write_buffer(&index_buffer, 0, &index_bytes);
-                GpuDrawable {
-                    id: drawable.id.as_ref().to_owned(),
-                    vertex_buffer,
-                    index_buffer,
-                    index_count: drawable.indices.len() as u32,
-                    texture_index: drawable.texture_index,
-                }
+                (
+                    id,
+                    GpuDrawable {
+                        vertex_buffer,
+                        index_buffer,
+                        vertex_count: drawable.vertices.len(),
+                        index_count: drawable.indices.len() as u32,
+                    },
+                )
             })
             .collect();
         self.gpu_scene = Some(GpuScene {
             drawables,
             textures,
         });
+    }
+
+    fn upload_scene_vertices(&self, queue: &wgpu::Queue, snapshot: &ModelSnapshot) {
+        let Some(gpu_scene) = &self.gpu_scene else {
+            return;
+        };
+        for drawable in snapshot
+            .drawables
+            .iter()
+            .filter(|drawable| !drawable.vertices.is_empty() && !drawable.indices.is_empty())
+        {
+            let Some(gpu_drawable) = gpu_scene.drawables.get(drawable.id.as_ref()) else {
+                continue;
+            };
+            if gpu_drawable.vertex_count != drawable.vertices.len() {
+                continue;
+            }
+            let vertices = gpu_vertices(drawable);
+            queue.write_buffer(
+                &gpu_drawable.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&vertices),
+            );
+        }
     }
 
     fn create_texture_bind_group(
@@ -513,6 +552,36 @@ fn live2d_canvas_uniform(canvas: &CanvasInfo) -> [f32; 4] {
     ]
 }
 
+fn scene_topology(snapshot: &ModelSnapshot) -> SceneTopology {
+    (
+        snapshot.textures.len(),
+        snapshot
+            .drawables
+            .iter()
+            .filter(|drawable| !drawable.vertices.is_empty() && !drawable.indices.is_empty())
+            .map(|drawable| {
+                (
+                    drawable.id.as_ref().to_owned(),
+                    drawable.vertices.len(),
+                    drawable.indices.len(),
+                    drawable.texture_index,
+                )
+            })
+            .collect(),
+    )
+}
+
+fn gpu_vertices(drawable: &Drawable) -> Vec<GpuVertex> {
+    drawable
+        .vertices
+        .iter()
+        .map(|vertex| GpuVertex {
+            position: vertex.position,
+            uv: vertex.uv,
+        })
+        .collect()
+}
+
 fn padded_index_bytes(indices: &[u16]) -> Vec<u8> {
     let bytes = bytemuck::cast_slice(indices);
     let aligned_len = bytes
@@ -527,6 +596,7 @@ fn padded_index_bytes(indices: &[u16]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use live2d_core::{BlendMode, CanvasInfo, DrawableId, TextureAsset, Vertex};
 
     #[test]
     fn pads_odd_index_upload_bytes_without_changing_draw_count() {
@@ -552,5 +622,75 @@ mod tests {
         let effect = uniform.live2d_effect();
 
         assert_eq!(effect, [0.65, 0.8, 1.1, 0.75]);
+    }
+
+    #[test]
+    fn scene_topology_allows_dynamic_vertex_upload_without_rebuild() {
+        let mut next = snapshot_with_drawable("mesh", 0, 2, 3, 0, 1);
+        next.drawables[0].vertices[0].position = [2.0, 3.0];
+
+        assert_eq!(
+            scene_topology(&snapshot_with_drawable("mesh", 0, 2, 3, 0, 1)),
+            scene_topology(&next)
+        );
+        assert_ne!(
+            gpu_vertices(&snapshot_with_drawable("mesh", 0, 2, 3, 0, 1).drawables[0]),
+            gpu_vertices(&next.drawables[0])
+        );
+    }
+
+    #[test]
+    fn scene_topology_changes_for_static_gpu_resource_shape() {
+        let base = snapshot_with_drawable("mesh", 0, 2, 3, 0, 1);
+
+        assert_ne!(
+            scene_topology(&base),
+            scene_topology(&snapshot_with_drawable("mesh", 0, 3, 3, 0, 1))
+        );
+        assert_ne!(
+            scene_topology(&base),
+            scene_topology(&snapshot_with_drawable("mesh", 0, 2, 4, 0, 1))
+        );
+        assert_ne!(
+            scene_topology(&base),
+            scene_topology(&snapshot_with_drawable("mesh", 0, 2, 3, 1, 2))
+        );
+    }
+
+    fn snapshot_with_drawable(
+        id: &str,
+        render_order: i32,
+        vertex_count: usize,
+        index_count: usize,
+        texture_index: usize,
+        texture_count: usize,
+    ) -> ModelSnapshot {
+        ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            drawables: vec![Drawable {
+                id: DrawableId::from(id),
+                render_order,
+                texture_index,
+                vertices: (0..vertex_count)
+                    .map(|index| Vertex {
+                        position: [index as f32, index as f32 + 1.0],
+                        uv: [0.0, 0.0],
+                    })
+                    .collect(),
+                indices: (0..index_count).map(|index| index as u16).collect(),
+                opacity: 1.0,
+                blend_mode: BlendMode::Normal,
+                clipping: None,
+            }],
+            textures: (0..texture_count)
+                .map(|_| TextureAsset {
+                    width: 1,
+                    height: 1,
+                    rgba: vec![255, 255, 255, 255],
+                })
+                .collect(),
+        }
     }
 }
