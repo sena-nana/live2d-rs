@@ -4,6 +4,8 @@ use live2d_probe::{counter, measure, ProbeAttr, ProbeSink, Stage};
 use std::collections::HashMap;
 use std::ops::Range;
 
+const DRAW_LOOKUP_INDEX_THRESHOLD: usize = 8 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderPlan {
     pub model: ModelRenderCtx,
@@ -81,11 +83,12 @@ impl RenderPlan {
     {
         backend.begin_model(&self.model);
         if !self.masks.is_empty() {
+            let draw_lookup = DrawLookup::new(&self.draws, mask_drawable_count(&self.masks));
             backend.begin_clip_masks(&self.masks);
             for mask in &self.masks {
                 backend.begin_clip_mask(mask);
                 for drawable_id in &mask.drawable_ids {
-                    if let Some(call) = self.draw_for_id(drawable_id) {
+                    if let Some(call) = draw_lookup.get(drawable_id) {
                         backend.draw_mask_drawable(mask, call);
                     }
                 }
@@ -116,6 +119,8 @@ impl RenderPlan {
             || {
                 backend.begin_model(&self.model);
                 if !self.masks.is_empty() {
+                    let draw_lookup =
+                        DrawLookup::new(&self.draws, mask_drawable_count(&self.masks));
                     backend.begin_clip_masks(&self.masks);
                     for mask in &self.masks {
                         backend.begin_clip_mask(mask);
@@ -124,7 +129,7 @@ impl RenderPlan {
                                 probe,
                                 Stage::RenderMaskLookup,
                                 vec![ProbeAttr::new("mask", mask.id.0)],
-                                || self.draw_for_id(drawable_id),
+                                || draw_lookup.get(drawable_id),
                             );
                             if let Some(call) = call {
                                 backend.draw_mask_drawable(mask, call);
@@ -160,12 +165,6 @@ impl RenderPlan {
                 backend.end_model();
             },
         );
-    }
-
-    fn draw_for_id(&self, drawable_id: &DrawableId) -> Option<&DrawCommand> {
-        self.draws
-            .iter()
-            .find(|draw| draw.drawable_id == *drawable_id)
     }
 }
 
@@ -381,6 +380,36 @@ fn draw_command_for_row(
             .unwrap_or(false),
         material: MaterialKey::Default,
     }
+}
+
+enum DrawLookup<'a> {
+    Linear(&'a [DrawCommand]),
+    Indexed(HashMap<&'a DrawableId, &'a DrawCommand>),
+}
+
+impl<'a> DrawLookup<'a> {
+    fn new(draws: &'a [DrawCommand], mask_drawables: usize) -> Self {
+        if mask_drawables.saturating_mul(draws.len()) <= DRAW_LOOKUP_INDEX_THRESHOLD {
+            return Self::Linear(draws);
+        }
+
+        let mut lookup = HashMap::with_capacity(draws.len());
+        for draw in draws {
+            lookup.insert(&draw.drawable_id, draw);
+        }
+        Self::Indexed(lookup)
+    }
+
+    fn get(&self, drawable_id: &DrawableId) -> Option<&'a DrawCommand> {
+        match self {
+            Self::Linear(draws) => draws.iter().find(|draw| draw.drawable_id == *drawable_id),
+            Self::Indexed(lookup) => lookup.get(drawable_id).copied(),
+        }
+    }
+}
+
+fn mask_drawable_count(masks: &[MaskPass]) -> usize {
+    masks.iter().map(|mask| mask.drawable_ids.len()).sum()
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
