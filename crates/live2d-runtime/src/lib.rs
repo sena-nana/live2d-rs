@@ -11,6 +11,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod motion;
+pub use motion::{Live2DMotion, MotionEvaluation};
+
 #[cfg(not(feature = "live2d-cubism"))]
 const RUNTIME_UNAVAILABLE: &str = "live2d_runtime_unavailable";
 
@@ -52,10 +55,12 @@ impl AssetResolver for FsAssetResolver {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Live2DInstance {
     snapshot: ModelSnapshot,
     elapsed_seconds: f32,
+    #[cfg(feature = "live2d-cubism")]
+    model: runtime::CubismLive2DModel,
 }
 
 impl Live2DInstance {
@@ -64,11 +69,7 @@ impl Live2DInstance {
     }
 
     pub fn load_file(model_json_path: impl AsRef<Path>) -> Result<Self, String> {
-        let snapshot = load_snapshot(model_json_path)?;
-        Ok(Self {
-            snapshot,
-            elapsed_seconds: 0.0,
-        })
+        runtime::load_instance(model_json_path.as_ref())
     }
 
     pub fn update(&mut self, dt: f32) {
@@ -81,6 +82,42 @@ impl Live2DInstance {
 
     pub fn snapshot(&self) -> &ModelSnapshot {
         &self.snapshot
+    }
+
+    pub fn apply_motion(
+        &mut self,
+        motion: &Live2DMotion,
+        elapsed_seconds: f32,
+        loop_playback: bool,
+    ) -> Result<(), String> {
+        let evaluation = motion.sample(elapsed_seconds, loop_playback);
+        self.apply_evaluation(evaluation)
+    }
+
+    pub fn reset_pose(&mut self) -> Result<(), String> {
+        self.apply_evaluation(MotionEvaluation {
+            model_opacity: Some(1.0),
+            parameters: Vec::new(),
+        })
+    }
+
+    fn apply_evaluation(&mut self, evaluation: MotionEvaluation) -> Result<(), String> {
+        #[cfg(feature = "live2d-cubism")]
+        {
+            self.model.reset_parameters()?;
+            self.model.write_parameters(&evaluation.parameters)?;
+            self.snapshot = self.model.snapshot(
+                self.snapshot.model_key.clone(),
+                self.snapshot.textures.clone(),
+                evaluation.model_opacity.unwrap_or(1.0),
+            )?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "live2d-cubism"))]
+        {
+            let _ = evaluation;
+            Err(RUNTIME_UNAVAILABLE.into())
+        }
     }
 }
 
@@ -274,6 +311,14 @@ mod runtime {
         Err(RUNTIME_UNAVAILABLE.into())
     }
 
+    pub fn load_instance(model_json_path: &Path) -> Result<Live2DInstance, String> {
+        let snapshot = load_snapshot(model_json_path)?;
+        Ok(Live2DInstance {
+            snapshot,
+            elapsed_seconds: 0.0,
+        })
+    }
+
     #[cfg(feature = "probe")]
     pub fn inspect_art_meshes_with_probe<P>(
         model_json_path: &Path,
@@ -308,48 +353,132 @@ mod runtime {
     use super::*;
     use std::ffi::CStr;
 
+    #[derive(Debug)]
+    pub(crate) struct CubismLive2DModel {
+        _moc_bytes: Vec<u8>,
+        _model_bytes: Vec<u8>,
+        model: *mut live2d_sys::CsmModel,
+        parameter_ids: Vec<String>,
+        parameter_defaults: Vec<f32>,
+    }
+
+    unsafe impl Send for CubismLive2DModel {}
+    unsafe impl Sync for CubismLive2DModel {}
+
+    impl CubismLive2DModel {
+        fn load(files: &ModelFiles) -> Result<Self, String> {
+            let mut moc_bytes = fs::read(&files.moc_path).map_err(|_| "live2d_moc_unreadable")?;
+            let moc = unsafe {
+                live2d_sys::csmReviveMocInPlace(moc_bytes.as_mut_ptr().cast(), moc_bytes.len() as _)
+            };
+            if moc.is_null() {
+                return Err("live2d_moc_invalid".into());
+            }
+            let model_size = unsafe { live2d_sys::csmGetSizeofModel(moc) } as usize;
+            if model_size == 0 {
+                return Err("live2d_model_allocation_failed".into());
+            }
+            let mut model_bytes = vec![0_u8; model_size];
+            let model = unsafe {
+                live2d_sys::csmInitializeModelInPlace(
+                    moc,
+                    model_bytes.as_mut_ptr().cast(),
+                    model_bytes.len() as _,
+                )
+            };
+            if model.is_null() {
+                return Err("live2d_model_initialization_failed".into());
+            }
+            unsafe { live2d_sys::csmUpdateModel(model) };
+            let (parameter_ids, parameter_defaults) = unsafe { read_parameters(model)? };
+            Ok(Self {
+                _moc_bytes: moc_bytes,
+                _model_bytes: model_bytes,
+                model,
+                parameter_ids,
+                parameter_defaults,
+            })
+        }
+
+        pub(crate) fn reset_parameters(&mut self) -> Result<(), String> {
+            let values = unsafe { parameter_values_mut(self.model, self.parameter_ids.len())? };
+            if values.len() != self.parameter_defaults.len() {
+                return Err("live2d_parameter_table_changed".into());
+            }
+            values.copy_from_slice(&self.parameter_defaults);
+            Ok(())
+        }
+
+        pub(crate) fn write_parameters(
+            &mut self,
+            parameters: &[(String, f32)],
+        ) -> Result<(), String> {
+            if parameters.is_empty() {
+                return Ok(());
+            }
+            let writes = parameters
+                .iter()
+                .filter_map(|(id, value)| {
+                    self.parameter_ids
+                        .iter()
+                        .position(|candidate| candidate == id)
+                        .map(|index| (index, *value))
+                })
+                .collect::<Vec<_>>();
+            let values = unsafe { parameter_values_mut(self.model, self.parameter_ids.len())? };
+            for (index, value) in writes {
+                values[index] = value;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn snapshot(
+            &mut self,
+            model_key: String,
+            textures: Vec<TextureAsset>,
+            model_opacity: f32,
+        ) -> Result<ModelSnapshot, String> {
+            unsafe { live2d_sys::csmUpdateModel(self.model) };
+            let (canvas, mut drawables, art_meshes) = unsafe { snapshot_model(self.model)? };
+            let opacity = model_opacity.clamp(0.0, 1.0);
+            for drawable in &mut drawables {
+                drawable.opacity *= opacity;
+            }
+            Ok(ModelSnapshot {
+                model_key,
+                canvas,
+                art_meshes,
+                drawables,
+                textures,
+            })
+        }
+    }
+
     pub fn inspect_art_meshes(model_json_path: &Path) -> Result<Vec<ArtMeshInfo>, String> {
         Ok(load_snapshot(model_json_path)?.art_meshes)
     }
 
-    pub fn load_snapshot(model_json_path: &Path) -> Result<ModelSnapshot, String> {
+    pub fn load_instance(model_json_path: &Path) -> Result<Live2DInstance, String> {
         let files = resolve_model_files(model_json_path)?;
         if !files.missing_files.is_empty() {
             return Err("live2d_model_assets_missing".into());
         }
         let textures = load_textures(&files.texture_paths)?;
-        let mut moc_bytes = fs::read(&files.moc_path).map_err(|_| "live2d_moc_unreadable")?;
-        let moc = unsafe {
-            live2d_sys::csmReviveMocInPlace(moc_bytes.as_mut_ptr().cast(), moc_bytes.len() as _)
-        };
-        if moc.is_null() {
-            return Err("live2d_moc_invalid".into());
-        }
-        let model_size = unsafe { live2d_sys::csmGetSizeofModel(moc) } as usize;
-        if model_size == 0 {
-            return Err("live2d_model_allocation_failed".into());
-        }
-        let mut model_bytes = vec![0_u8; model_size];
-        let model = unsafe {
-            live2d_sys::csmInitializeModelInPlace(
-                moc,
-                model_bytes.as_mut_ptr().cast(),
-                model_bytes.len() as _,
-            )
-        };
-        if model.is_null() {
-            return Err("live2d_model_initialization_failed".into());
-        }
-        unsafe { live2d_sys::csmUpdateModel(model) };
-        let (canvas, drawables, art_meshes) = unsafe { snapshot_model(model)? };
-
-        Ok(ModelSnapshot {
-            model_key: files.model_json_path.to_string_lossy().into_owned(),
-            canvas,
-            art_meshes,
-            drawables,
+        let mut model = CubismLive2DModel::load(&files)?;
+        let snapshot = model.snapshot(
+            files.model_json_path.to_string_lossy().into_owned(),
             textures,
+            1.0,
+        )?;
+        Ok(Live2DInstance {
+            snapshot,
+            elapsed_seconds: 0.0,
+            model,
         })
+    }
+
+    pub fn load_snapshot(model_json_path: &Path) -> Result<ModelSnapshot, String> {
+        Ok(load_instance(model_json_path)?.snapshot)
     }
 
     #[cfg(feature = "probe")]
@@ -445,6 +574,45 @@ mod runtime {
                 textures,
             })
         })
+    }
+
+    unsafe fn read_parameters(
+        model: *mut live2d_sys::CsmModel,
+    ) -> Result<(Vec<String>, Vec<f32>), String> {
+        let count = live2d_sys::csmGetParameterCount(model).max(0) as usize;
+        if count == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let ids = live2d_sys::csmGetParameterIds(model);
+        let defaults = live2d_sys::csmGetParameterDefaultValues(model);
+        if ids.is_null() || defaults.is_null() {
+            return Err("live2d_parameter_table_unavailable".into());
+        }
+        let id_slice = std::slice::from_raw_parts(ids, count);
+        let default_slice = std::slice::from_raw_parts(defaults, count);
+        let mut parameter_ids = Vec::with_capacity(count);
+        for id in id_slice {
+            if id.is_null() {
+                parameter_ids.push(String::new());
+            } else {
+                parameter_ids.push(CStr::from_ptr(*id).to_string_lossy().into_owned());
+            }
+        }
+        Ok((parameter_ids, default_slice.to_vec()))
+    }
+
+    unsafe fn parameter_values_mut(
+        model: *mut live2d_sys::CsmModel,
+        count: usize,
+    ) -> Result<&'static mut [f32], String> {
+        if count == 0 {
+            return Ok(&mut []);
+        }
+        let values = live2d_sys::csmGetParameterValues(model);
+        if values.is_null() {
+            return Err("live2d_parameter_values_unavailable".into());
+        }
+        Ok(std::slice::from_raw_parts_mut(values, count))
     }
 
     unsafe fn snapshot_model(

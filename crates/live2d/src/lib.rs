@@ -5,7 +5,7 @@ pub use live2d_runtime as runtime;
 #[cfg(feature = "wgpu")]
 pub use live2d_wgpu as wgpu;
 
-pub use live2d_runtime::Live2DInstance;
+pub use live2d_runtime::{Live2DInstance, Live2DMotion, MotionEvaluation};
 
 #[cfg(feature = "probe")]
 pub use live2d_probe as probe;
