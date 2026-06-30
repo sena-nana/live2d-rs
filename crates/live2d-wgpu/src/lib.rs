@@ -527,8 +527,15 @@ impl<'a, 'pass, 'view> Live2DRenderBackend for WgpuRenderBackend<'a, 'pass, 'vie
     }
 }
 
-type SceneTopology = (usize, Vec<(String, usize, usize, usize)>);
 type TextureTopology = Vec<(u32, u32, usize)>;
+type SceneTopology = Vec<DrawableTopology>;
+
+#[derive(Debug, Clone, PartialEq)]
+struct DrawableTopology {
+    drawable_id: String,
+    uvs: Vec<[f32; 2]>,
+    indices: Vec<u16>,
+}
 
 impl WgpuLive2DRenderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -954,15 +961,19 @@ impl WgpuLive2DRenderer {
     ) -> RenderPlan {
         let render_plan = RenderPlanner::new().build(snapshot);
         let topology = scene_topology(snapshot);
+        let textures = self.prepare_textures(device, queue, snapshot);
         if self.scene_key.as_deref() == Some(snapshot.model_key.as_str())
             && self.scene_topology.as_ref() == Some(&topology)
+            && self.gpu_scene.is_some()
         {
             self.upload_scene_positions(queue, snapshot, &render_plan);
+            if let Some(gpu_scene) = &mut self.gpu_scene {
+                gpu_scene.textures = textures;
+            }
             return render_plan;
         }
         self.scene_key = Some(snapshot.model_key.clone());
         self.scene_topology = Some(topology);
-        let textures = self.prepare_textures(device, queue, snapshot);
         let positions = gpu_scene_positions(snapshot, &render_plan);
         let uvs = gpu_scene_uvs(snapshot, &render_plan);
         let indices = gpu_scene_indices(snapshot, &render_plan);
@@ -1479,19 +1490,13 @@ fn live2d_blend_state(blend_mode: BlendMode) -> wgpu::BlendState {
 }
 
 fn scene_topology(snapshot: &ModelSnapshot) -> SceneTopology {
-    (
-        snapshot.textures.len(),
-        renderable_drawables(snapshot)
-            .map(|drawable| {
-                (
-                    drawable.id.as_ref().to_owned(),
-                    drawable.vertices.len(),
-                    drawable.indices.len(),
-                    drawable.texture_index,
-                )
-            })
-            .collect(),
-    )
+    renderable_drawables(snapshot)
+        .map(|drawable| DrawableTopology {
+            drawable_id: drawable.id.as_ref().to_owned(),
+            uvs: drawable.vertices.iter().map(|vertex| vertex.uv).collect(),
+            indices: drawable.indices.clone(),
+        })
+        .collect()
 }
 
 fn texture_topology(snapshot: &ModelSnapshot) -> TextureTopology {
@@ -1714,8 +1719,12 @@ mod tests {
     }
 
     #[test]
-    fn scene_topology_changes_for_static_gpu_resource_shape() {
+    fn scene_topology_changes_for_static_gpu_buffer_data() {
         let base = snapshot_with_drawable("mesh", 0, 2, 3, 0, 1);
+        let mut changed_uv = base.clone();
+        changed_uv.drawables[0].vertices[0].uv = [0.5, 0.25];
+        let mut changed_indices = base.clone();
+        changed_indices.drawables[0].indices[0] = 1;
 
         assert_ne!(
             scene_topology(&base),
@@ -1725,10 +1734,8 @@ mod tests {
             scene_topology(&base),
             scene_topology(&snapshot_with_drawable("mesh", 0, 2, 4, 0, 1))
         );
-        assert_ne!(
-            scene_topology(&base),
-            scene_topology(&snapshot_with_drawable("mesh", 0, 2, 3, 1, 2))
-        );
+        assert_ne!(scene_topology(&base), scene_topology(&changed_uv));
+        assert_ne!(scene_topology(&base), scene_topology(&changed_indices));
     }
 
     #[test]
