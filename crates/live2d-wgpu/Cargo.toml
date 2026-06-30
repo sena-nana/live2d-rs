@@ -1,0 +1,12 @@
+[package]
+name = "live2d-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytemuck.workspace = true
+live2d-core.workspace = true
+live2d-render.workspace = true
+wgpu.workspace = true

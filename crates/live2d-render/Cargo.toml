@@ -1,0 +1,9 @@
+[package]
+name = "live2d-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+live2d-core.workspace = true

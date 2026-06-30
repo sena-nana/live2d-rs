@@ -1,0 +1,33 @@
+{
+  "sessionId": "native-replay-fixture",
+  "sentAt": "2026-06-27T00:00:00.000Z",
+  "sourceBaseUrl": "http://127.0.0.1:19576",
+  "activeChannelIndex": 0,
+  "channels": [
+    {
+      "name": "shader-replay",
+      "maskOpacity": 1,
+      "maskFeather": 0,
+      "renderMode": "normal",
+      "artMeshIds": [],
+      "maskArtMeshIds": [],
+      "parts": ["recolor"],
+      "values": {
+        "color": "#33ccff",
+        "strength": 0.86,
+        "brightness": 1.18
+      }
+    }
+  ],
+  "effectParts": [
+    {
+      "id": "recolor",
+      "label": "Recolor",
+      "defaultsOn": {
+        "color": "#ffbd2e",
+        "strength": 0.64
+      }
+    }
+  ],
+  "live2dModel": null
+}

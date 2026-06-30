@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/live2d-sys",
+    "crates/live2d-core",
+    "crates/live2d-runtime",
+    "crates/live2d-render",
+    "crates/live2d-wgpu",
+    "crates/live2d",
+    "crates/nanavts-display",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sena-nana/live2d-rs"
+
+[workspace.dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+image = { version = "0.25.8", default-features = false, features = ["png"] }
+live2d = { path = "crates/live2d" }
+live2d-core = { path = "crates/live2d-core" }
+live2d-render = { path = "crates/live2d-render" }
+live2d-runtime = { path = "crates/live2d-runtime" }
+live2d-sys = { path = "crates/live2d-sys" }
+live2d-wgpu = { path = "crates/live2d-wgpu" }
+pollster = "0.4.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+wgpu = "29.0.3"
+winit = "0.30.13"

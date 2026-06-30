@@ -1,0 +1,16 @@
+[package]
+name = "live2d-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+image = { workspace = true, optional = true }
+live2d-core.workspace = true
+live2d-sys = { workspace = true, optional = true }
+serde_json.workspace = true
+
+[features]
+default = []
+live2d-cubism = ["dep:image", "dep:live2d-sys", "live2d-sys/cubism-core"]
