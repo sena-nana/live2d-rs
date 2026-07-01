@@ -69,6 +69,7 @@ pub struct Drawable {
     pub texture_index: usize,
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u16>,
+    pub visible: bool,
     pub opacity: f32,
     pub blend_mode: BlendMode,
     pub clipping: Option<ClippingInfo>,

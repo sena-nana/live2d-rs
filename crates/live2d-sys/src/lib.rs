@@ -1,12 +1,28 @@
 use std::os::raw::c_void;
 #[cfg(feature = "cubism-core")]
-use std::os::raw::{c_char, c_int, c_uint};
+use std::os::raw::{c_char, c_int, c_uchar, c_uint};
 
 #[repr(C)]
 pub struct CsmMoc(c_void);
 
 #[repr(C)]
 pub struct CsmModel(c_void);
+
+#[cfg(feature = "cubism-core")]
+#[allow(non_camel_case_types)]
+pub type csmFlags = c_uchar;
+
+#[cfg(feature = "cubism-core")]
+#[allow(non_upper_case_globals)]
+pub const csmBlendAdditive: csmFlags = 1 << 0;
+
+#[cfg(feature = "cubism-core")]
+#[allow(non_upper_case_globals)]
+pub const csmBlendMultiplicative: csmFlags = 1 << 1;
+
+#[cfg(feature = "cubism-core")]
+#[allow(non_upper_case_globals)]
+pub const csmIsVisible: csmFlags = 1 << 0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -37,8 +53,13 @@ extern "C" {
     );
     pub fn csmGetDrawableCount(model: *const CsmModel) -> c_int;
     pub fn csmGetDrawableIds(model: *const CsmModel) -> *const *const c_char;
+    pub fn csmGetDrawableConstantFlags(model: *const CsmModel) -> *const csmFlags;
+    pub fn csmGetDrawableDynamicFlags(model: *const CsmModel) -> *const csmFlags;
     pub fn csmGetRenderOrders(model: *const CsmModel) -> *const c_int;
     pub fn csmGetDrawableTextureIndices(model: *const CsmModel) -> *const c_int;
+    pub fn csmGetDrawableOpacities(model: *const CsmModel) -> *const f32;
+    pub fn csmGetDrawableMaskCounts(model: *const CsmModel) -> *const c_int;
+    pub fn csmGetDrawableMasks(model: *const CsmModel) -> *const *const c_int;
     pub fn csmGetDrawableVertexCounts(model: *const CsmModel) -> *const c_int;
     pub fn csmGetDrawableVertexPositions(model: *const CsmModel) -> *const *const CsmVector2;
     pub fn csmGetDrawableVertexUvs(model: *const CsmModel) -> *const *const CsmVector2;

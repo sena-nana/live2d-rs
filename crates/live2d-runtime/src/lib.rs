@@ -1,6 +1,8 @@
 use live2d_core::{ArtMeshInfo, ModelSnapshot};
 #[cfg(feature = "live2d-cubism")]
-use live2d_core::{BlendMode, CanvasInfo, Drawable, DrawableId, TextureAsset, Vertex};
+use live2d_core::{
+    BlendMode, CanvasInfo, ClippingInfo, Drawable, DrawableId, TextureAsset, Vertex,
+};
 #[cfg(all(feature = "probe", feature = "live2d-cubism"))]
 use live2d_probe::ProbeAttr;
 #[cfg(feature = "probe")]
@@ -439,11 +441,8 @@ mod runtime {
             model_opacity: f32,
         ) -> Result<ModelSnapshot, String> {
             unsafe { live2d_sys::csmUpdateModel(self.model) };
-            let (canvas, mut drawables, art_meshes) = unsafe { snapshot_model(self.model)? };
             let opacity = model_opacity.clamp(0.0, 1.0);
-            for drawable in &mut drawables {
-                drawable.opacity *= opacity;
-            }
+            let (canvas, drawables, art_meshes) = unsafe { snapshot_model(self.model, opacity)? };
             Ok(ModelSnapshot {
                 model_key,
                 canvas,
@@ -556,7 +555,7 @@ mod runtime {
                 probe,
                 Stage::RuntimeSnapshotExtract,
                 Vec::new(),
-                || unsafe { snapshot_model(model) },
+                || unsafe { snapshot_model(model, 1.0) },
             )?;
             counter(
                 probe,
@@ -617,6 +616,7 @@ mod runtime {
 
     unsafe fn snapshot_model(
         model: *mut live2d_sys::CsmModel,
+        model_opacity: f32,
     ) -> Result<(CanvasInfo, Vec<Drawable>, Vec<ArtMeshInfo>), String> {
         let mut canvas_size = live2d_sys::CsmVector2 { x: 2.0, y: 2.0 };
         let mut canvas_origin = live2d_sys::CsmVector2 { x: 0.0, y: 0.0 };
@@ -629,16 +629,26 @@ mod runtime {
         );
         let count = live2d_sys::csmGetDrawableCount(model).max(0) as usize;
         let ids = live2d_sys::csmGetDrawableIds(model);
+        let constant_flags = live2d_sys::csmGetDrawableConstantFlags(model);
+        let dynamic_flags = live2d_sys::csmGetDrawableDynamicFlags(model);
         let render_orders = live2d_sys::csmGetRenderOrders(model);
         let texture_indices = live2d_sys::csmGetDrawableTextureIndices(model);
+        let opacities = live2d_sys::csmGetDrawableOpacities(model);
+        let mask_counts = live2d_sys::csmGetDrawableMaskCounts(model);
+        let masks = live2d_sys::csmGetDrawableMasks(model);
         let vertex_counts = live2d_sys::csmGetDrawableVertexCounts(model);
         let vertex_positions = live2d_sys::csmGetDrawableVertexPositions(model);
         let vertex_uvs = live2d_sys::csmGetDrawableVertexUvs(model);
         let index_counts = live2d_sys::csmGetDrawableIndexCounts(model);
         let indices = live2d_sys::csmGetDrawableIndices(model);
         if ids.is_null()
+            || constant_flags.is_null()
+            || dynamic_flags.is_null()
             || render_orders.is_null()
             || texture_indices.is_null()
+            || opacities.is_null()
+            || mask_counts.is_null()
+            || masks.is_null()
             || vertex_counts.is_null()
             || vertex_positions.is_null()
             || vertex_uvs.is_null()
@@ -648,33 +658,28 @@ mod runtime {
             return Err("live2d_model_snapshot_failed".into());
         }
 
-        let mut drawables = Vec::new();
+        struct DrawableMeta {
+            id: DrawableId,
+            source_index: usize,
+            render_order: i32,
+            texture_index: usize,
+            visible: bool,
+            opacity: f32,
+            blend_mode: BlendMode,
+            clipping: Option<ClippingInfo>,
+            mask_indices: Vec<usize>,
+        }
+
+        let opacity_scale = model_opacity.clamp(0.0, 1.0);
+        let mut id_by_index = Vec::with_capacity(count);
         let mut art_meshes = Vec::new();
         for index in 0..count {
             let id_ptr = *ids.add(index);
             if id_ptr.is_null() {
+                id_by_index.push(None);
                 continue;
             }
             let id = CStr::from_ptr(id_ptr).to_string_lossy().into_owned();
-            let vertex_count = *vertex_counts.add(index) as usize;
-            let index_count = *index_counts.add(index) as usize;
-            let pos_ptr = *vertex_positions.add(index);
-            let uv_ptr = *vertex_uvs.add(index);
-            let index_ptr = *indices.add(index);
-            if pos_ptr.is_null() || uv_ptr.is_null() || index_ptr.is_null() {
-                continue;
-            }
-            let positions = std::slice::from_raw_parts(pos_ptr, vertex_count);
-            let uvs = std::slice::from_raw_parts(uv_ptr, vertex_count);
-            let vertices = positions
-                .iter()
-                .zip(uvs.iter())
-                .map(|(position, uv)| Vertex {
-                    position: [position.x, position.y],
-                    uv: [uv.x, uv.y],
-                })
-                .collect::<Vec<_>>();
-            let drawable_indices = std::slice::from_raw_parts(index_ptr, index_count).to_vec();
             let drawable_id = DrawableId(id);
             art_meshes.push(ArtMeshInfo {
                 id: drawable_id.clone(),
@@ -683,15 +688,109 @@ mod runtime {
                 index,
                 mask_type: "unknown".into(),
             });
-            drawables.push(Drawable {
+            id_by_index.push(Some(drawable_id));
+        }
+
+        let mut metas = Vec::new();
+        for index in 0..count {
+            let Some(drawable_id) = id_by_index[index].clone() else {
+                continue;
+            };
+            let constant = *constant_flags.add(index);
+            let dynamic = *dynamic_flags.add(index);
+            let mask_count = (*mask_counts.add(index)).max(0) as usize;
+            let mut mask_indices = Vec::new();
+            let mut mask_ids = Vec::new();
+            if mask_count > 0 {
+                let mask_ptr = *masks.add(index);
+                if mask_ptr.is_null() {
+                    return Err("live2d_model_snapshot_failed".into());
+                }
+                for mask_index in std::slice::from_raw_parts(mask_ptr, mask_count) {
+                    let mask_index = *mask_index;
+                    if mask_index < 0 {
+                        continue;
+                    }
+                    let mask_index = mask_index as usize;
+                    if let Some(Some(mask_id)) = id_by_index.get(mask_index) {
+                        mask_indices.push(mask_index);
+                        mask_ids.push(mask_id.clone());
+                    }
+                }
+            }
+            let clipping = if mask_ids.is_empty() {
+                None
+            } else {
+                Some(ClippingInfo {
+                    drawable_ids: mask_ids,
+                    inverted: false,
+                })
+            };
+            let blend_mode = if constant & live2d_sys::csmBlendAdditive != 0 {
+                BlendMode::Additive
+            } else if constant & live2d_sys::csmBlendMultiplicative != 0 {
+                BlendMode::Multiplicative
+            } else {
+                BlendMode::Normal
+            };
+            metas.push(DrawableMeta {
                 id: drawable_id,
+                source_index: index,
                 render_order: *render_orders.add(index),
                 texture_index: (*texture_indices.add(index)).max(0) as usize,
+                visible: dynamic & live2d_sys::csmIsVisible != 0,
+                opacity: (*opacities.add(index) * opacity_scale).clamp(0.0, 1.0),
+                blend_mode,
+                clipping,
+                mask_indices,
+            });
+        }
+
+        let mut retained_indices = vec![false; count];
+        for meta in &metas {
+            if meta.visible && meta.opacity > 1e-6 {
+                retained_indices[meta.source_index] = true;
+                for mask_index in &meta.mask_indices {
+                    retained_indices[*mask_index] = true;
+                }
+            }
+        }
+
+        let mut drawables = Vec::with_capacity(metas.len());
+        for meta in metas {
+            let mut vertices = Vec::new();
+            let mut drawable_indices = Vec::new();
+            if retained_indices[meta.source_index] {
+                let vertex_count = *vertex_counts.add(meta.source_index) as usize;
+                let index_count = *index_counts.add(meta.source_index) as usize;
+                let pos_ptr = *vertex_positions.add(meta.source_index);
+                let uv_ptr = *vertex_uvs.add(meta.source_index);
+                let index_ptr = *indices.add(meta.source_index);
+                if pos_ptr.is_null() || uv_ptr.is_null() || index_ptr.is_null() {
+                    return Err("live2d_model_snapshot_failed".into());
+                }
+                let positions = std::slice::from_raw_parts(pos_ptr, vertex_count);
+                let uvs = std::slice::from_raw_parts(uv_ptr, vertex_count);
+                vertices = positions
+                    .iter()
+                    .zip(uvs.iter())
+                    .map(|(position, uv)| Vertex {
+                        position: [position.x, position.y],
+                        uv: [uv.x, uv.y],
+                    })
+                    .collect::<Vec<_>>();
+                drawable_indices = std::slice::from_raw_parts(index_ptr, index_count).to_vec();
+            }
+            drawables.push(Drawable {
+                id: meta.id,
+                render_order: meta.render_order,
+                texture_index: meta.texture_index,
                 vertices,
                 indices: drawable_indices,
-                opacity: 1.0,
-                blend_mode: BlendMode::Normal,
-                clipping: None,
+                visible: meta.visible,
+                opacity: meta.opacity,
+                blend_mode: meta.blend_mode,
+                clipping: meta.clipping,
             });
         }
         drawables.sort_by_key(|drawable| drawable.render_order);

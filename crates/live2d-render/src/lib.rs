@@ -1,17 +1,20 @@
 use live2d_core::{
-    BlendMode, ClippingInfo, DrawableId, DrawableRanges, MaskRef, MaterialKey, ModelSnapshot,
+    BlendMode, ClippingInfo, Drawable, DrawableId, DrawableRanges, MaskRef, MaterialKey,
+    ModelSnapshot,
 };
 #[cfg(feature = "probe")]
 use live2d_probe::{counter, measure, ProbeAttr, ProbeSink, Stage};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 const DRAW_LOOKUP_INDEX_THRESHOLD: usize = 8 * 1024;
+const DRAWABLE_OPACITY_EPSILON: f32 = 1e-6;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderPlan {
     pub model: ModelRenderCtx,
     pub masks: Vec<MaskPass>,
+    pub mask_draws: Vec<DrawCommand>,
     pub draws: Vec<DrawCommand>,
 }
 
@@ -84,6 +87,7 @@ struct RenderWorldCache {
     ordered_rows: Vec<usize>,
     mask_table: MaskGroupTable,
     clipping_by_row: Vec<Option<ClippingInfo>>,
+    draw_enabled_by_row: Vec<bool>,
 }
 
 pub trait Live2DRenderBackend {
@@ -105,7 +109,7 @@ impl RenderPlan {
     {
         backend.begin_model(&self.model);
         if !self.masks.is_empty() {
-            let draw_lookup = DrawLookup::new(&self.draws, mask_drawable_count(&self.masks));
+            let draw_lookup = DrawLookup::new(&self.mask_draws, mask_drawable_count(&self.masks));
             backend.begin_clip_masks(&self.masks);
             for mask in &self.masks {
                 backend.begin_clip_mask(mask);
@@ -142,7 +146,7 @@ impl RenderPlan {
                 backend.begin_model(&self.model);
                 if !self.masks.is_empty() {
                     let draw_lookup =
-                        DrawLookup::new(&self.draws, mask_drawable_count(&self.masks));
+                        DrawLookup::new(&self.mask_draws, mask_drawable_count(&self.masks));
                     backend.begin_clip_masks(&self.masks);
                     for mask in &self.masks {
                         backend.begin_clip_mask(mask);
@@ -200,17 +204,13 @@ impl RenderPlanner {
         let ordered_rows = sorted_drawable_rows(&table);
         let mask_table = build_mask_group_table(snapshot, &table, &ordered_rows);
 
-        let draws = ordered_rows
-            .into_iter()
-            .map(|row| {
-                let mask = mask_table.mask_refs_by_row[row];
-                draw_command_for_row(snapshot, &table, row, mask)
-            })
-            .collect();
+        let mask_draws = mask_draw_commands_from_table(snapshot, &table, &mask_table);
+        let draws = draw_commands_for_visible_rows(snapshot, &table, &ordered_rows, &mask_table);
 
         RenderPlan {
             model,
             masks: mask_table.masks,
+            mask_draws,
             draws,
         }
     }
@@ -241,19 +241,17 @@ impl RenderPlanner {
                     vec![ProbeAttr::new("candidate_drawables", ordered_rows.len())],
                     || build_mask_group_table(snapshot, &table, &ordered_rows),
                 );
+                let mask_draws = measure(
+                    probe,
+                    Stage::RenderDrawCommandBuild,
+                    vec![ProbeAttr::new("candidate_drawables", ordered_rows.len())],
+                    || mask_draw_commands_from_table(snapshot, &table, &mask_table),
+                );
                 let draws = measure(
                     probe,
                     Stage::RenderDrawCommandBuild,
                     vec![ProbeAttr::new("candidate_drawables", ordered_rows.len())],
-                    || {
-                        ordered_rows
-                            .into_iter()
-                            .map(|row| {
-                                let mask = mask_table.mask_refs_by_row[row];
-                                draw_command_for_row(snapshot, &table, row, mask)
-                            })
-                            .collect::<Vec<_>>()
-                    },
+                    || draw_commands_for_visible_rows(snapshot, &table, &ordered_rows, &mask_table),
                 );
 
                 counter(
@@ -273,6 +271,7 @@ impl RenderPlanner {
                 RenderPlan {
                     model,
                     masks: mask_table.masks,
+                    mask_draws,
                     draws,
                 }
             },
@@ -334,6 +333,7 @@ impl RenderWorld {
                         snapshot.model_key.clone(),
                         RenderWorldCache {
                             clipping_by_row: clipping_by_row(snapshot, &table),
+                            draw_enabled_by_row: draw_enabled_by_row(snapshot, &table),
                             model,
                             table,
                             ordered_rows,
@@ -364,6 +364,15 @@ impl RenderWorld {
                         || build_mask_group_table(snapshot, &cache.table, &cache.ordered_rows),
                     );
                 }
+                let mask_draws = measure(
+                    probe,
+                    Stage::RenderDrawCommandBuild,
+                    vec![ProbeAttr::new(
+                        "candidate_drawables",
+                        cache.ordered_rows.len(),
+                    )],
+                    || mask_draw_commands_from_table(snapshot, &cache.table, &cache.mask_table),
+                );
                 let draws = measure(
                     probe,
                     Stage::RenderDrawCommandBuild,
@@ -390,6 +399,7 @@ impl RenderWorld {
                 RenderPlan {
                     model: cache.model.clone(),
                     masks: cache.mask_table.masks.clone(),
+                    mask_draws,
                     draws,
                 }
             },
@@ -430,10 +440,50 @@ fn build_model_ctx_and_table(snapshot: &ModelSnapshot) -> (ModelRenderCtx, Drawa
     (model, table)
 }
 
+fn drawable_has_geometry(drawable: &Drawable) -> bool {
+    !drawable.vertices.is_empty() && !drawable.indices.is_empty()
+}
+
+fn drawable_should_draw(drawable: &Drawable) -> bool {
+    drawable.visible
+        && drawable.opacity > DRAWABLE_OPACITY_EPSILON
+        && drawable_has_geometry(drawable)
+}
+
+fn resident_drawable_indices(snapshot: &ModelSnapshot) -> Vec<usize> {
+    let drawable_index_by_id = snapshot
+        .drawables
+        .iter()
+        .enumerate()
+        .filter(|(_, drawable)| drawable_has_geometry(drawable))
+        .map(|(index, drawable)| (&drawable.id, index))
+        .collect::<HashMap<_, _>>();
+    let mut resident = HashSet::new();
+
+    for (index, drawable) in snapshot.drawables.iter().enumerate() {
+        if !drawable_should_draw(drawable) {
+            continue;
+        }
+        resident.insert(index);
+        if let Some(clipping) = drawable.clipping.as_ref() {
+            for drawable_id in &clipping.drawable_ids {
+                if let Some(mask_index) = drawable_index_by_id.get(drawable_id) {
+                    resident.insert(*mask_index);
+                }
+            }
+        }
+    }
+
+    (0..snapshot.drawables.len())
+        .filter(|index| resident.contains(index))
+        .collect()
+}
+
 fn build_drawable_table(snapshot: &ModelSnapshot) -> DrawableTable {
     let mut vertex_offset = 0;
     let mut index_offset = 0;
-    let drawable_count = snapshot.drawables.len();
+    let resident_indices = resident_drawable_indices(snapshot);
+    let drawable_count = resident_indices.len();
     let mut table = DrawableTable {
         vertex_ranges: Vec::with_capacity(drawable_count),
         index_ranges: Vec::with_capacity(drawable_count),
@@ -441,11 +491,8 @@ fn build_drawable_table(snapshot: &ModelSnapshot) -> DrawableTable {
         source_indices: Vec::with_capacity(drawable_count),
     };
 
-    for (source_index, drawable) in snapshot.drawables.iter().enumerate() {
-        if drawable.vertices.is_empty() || drawable.indices.is_empty() {
-            continue;
-        }
-
+    for source_index in resident_indices {
+        let drawable = &snapshot.drawables[source_index];
         let vertex_count = drawable.vertices.len() as u32;
         let index_count = drawable.indices.len() as u32;
         table
@@ -474,28 +521,28 @@ fn build_render_world_cache(snapshot: &ModelSnapshot) -> RenderWorldCache {
     let ordered_rows = sorted_drawable_rows(&table);
     let mask_table = build_mask_group_table(snapshot, &table, &ordered_rows);
     let clipping_by_row = clipping_by_row(snapshot, &table);
+    let draw_enabled_by_row = draw_enabled_by_row(snapshot, &table);
     RenderWorldCache {
         model,
         table,
         ordered_rows,
         mask_table,
         clipping_by_row,
+        draw_enabled_by_row,
     }
 }
 
 fn render_world_cache_matches(cache: &RenderWorldCache, snapshot: &ModelSnapshot) -> bool {
-    let mut renderable_count = 0;
-    for drawable in &snapshot.drawables {
-        if !drawable.vertices.is_empty() && !drawable.indices.is_empty() {
-            renderable_count += 1;
-        }
-    }
-    if renderable_count != cache.table.len() {
+    let resident_indices = resident_drawable_indices(snapshot);
+    if resident_indices.len() != cache.table.len() {
         return false;
     }
 
     for row in 0..cache.table.len() {
         let source_index = cache.table.source_indices[row];
+        if resident_indices[row] != source_index {
+            return false;
+        }
         let Some(drawable) = snapshot.drawables.get(source_index) else {
             return false;
         };
@@ -510,6 +557,7 @@ fn render_world_cache_matches(cache: &RenderWorldCache, snapshot: &ModelSnapshot
             || drawable.vertices.len() as u32 != vertex_count
             || drawable.indices.len() as u32 != index_count
             || drawable.clipping.as_ref() != cache.clipping_by_row[row].as_ref()
+            || drawable_should_draw(drawable) != cache.draw_enabled_by_row[row]
         {
             return false;
         }
@@ -523,6 +571,14 @@ fn clipping_by_row(snapshot: &ModelSnapshot, table: &DrawableTable) -> Vec<Optio
         .source_indices
         .iter()
         .map(|source_index| snapshot.drawables[*source_index].clipping.clone())
+        .collect()
+}
+
+fn draw_enabled_by_row(snapshot: &ModelSnapshot, table: &DrawableTable) -> Vec<bool> {
+    table
+        .source_indices
+        .iter()
+        .map(|source_index| drawable_should_draw(&snapshot.drawables[*source_index]))
         .collect()
 }
 
@@ -545,20 +601,19 @@ fn draw_commands_from_cache(
     snapshot: &ModelSnapshot,
     cache: &RenderWorldCache,
 ) -> Vec<DrawCommand> {
-    cache
-        .ordered_rows
-        .iter()
-        .map(|row| {
-            let mask = cache.mask_table.mask_refs_by_row[*row];
-            draw_command_for_row(snapshot, &cache.table, *row, mask)
-        })
-        .collect()
+    draw_commands_for_visible_rows(
+        snapshot,
+        &cache.table,
+        &cache.ordered_rows,
+        &cache.mask_table,
+    )
 }
 
 fn render_plan_from_cache(snapshot: &ModelSnapshot, cache: &RenderWorldCache) -> RenderPlan {
     RenderPlan {
         model: cache.model.clone(),
         masks: cache.mask_table.masks.clone(),
+        mask_draws: mask_draw_commands_from_table(snapshot, &cache.table, &cache.mask_table),
         draws: draw_commands_from_cache(snapshot, cache),
     }
 }
@@ -571,14 +626,31 @@ fn build_mask_group_table(
     let mut mask_refs = HashMap::new();
     let mut masks = Vec::new();
     let mut mask_refs_by_row = vec![None; table.len()];
+    let resident_ids = table
+        .source_indices
+        .iter()
+        .map(|source_index| &snapshot.drawables[*source_index].id)
+        .collect::<HashSet<_>>();
 
     for &row in ordered_rows {
         let drawable = &snapshot.drawables[table.source_indices[row]];
+        if !drawable_should_draw(drawable) {
+            continue;
+        }
         let Some(clipping) = drawable.clipping.as_ref() else {
             continue;
         };
+        let drawable_ids = clipping
+            .drawable_ids
+            .iter()
+            .filter(|drawable_id| resident_ids.contains(drawable_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if drawable_ids.is_empty() {
+            continue;
+        }
         let mask_key = MaskKey {
-            drawable_ids: &clipping.drawable_ids,
+            drawable_ids: drawable_ids.clone(),
             inverted: clipping.inverted,
         };
         let mask_ref = if let Some(mask_ref) = mask_refs.get(&mask_key) {
@@ -587,7 +659,7 @@ fn build_mask_group_table(
             let mask_ref = MaskRef(masks.len());
             masks.push(MaskPass {
                 id: mask_ref,
-                drawable_ids: clipping.drawable_ids.clone(),
+                drawable_ids: drawable_ids.clone(),
                 inverted: clipping.inverted,
             });
             mask_refs.insert(mask_key, mask_ref);
@@ -600,6 +672,45 @@ fn build_mask_group_table(
         masks,
         mask_refs_by_row,
     }
+}
+
+fn draw_commands_for_visible_rows(
+    snapshot: &ModelSnapshot,
+    table: &DrawableTable,
+    ordered_rows: &[usize],
+    mask_table: &MaskGroupTable,
+) -> Vec<DrawCommand> {
+    ordered_rows
+        .iter()
+        .filter_map(|row| {
+            let drawable = &snapshot.drawables[table.source_indices[*row]];
+            drawable_should_draw(drawable).then(|| {
+                let mask = mask_table.mask_refs_by_row[*row];
+                draw_command_for_row(snapshot, table, *row, mask)
+            })
+        })
+        .collect()
+}
+
+fn mask_draw_commands_from_table(
+    snapshot: &ModelSnapshot,
+    table: &DrawableTable,
+    mask_table: &MaskGroupTable,
+) -> Vec<DrawCommand> {
+    let referenced_ids = mask_table
+        .masks
+        .iter()
+        .flat_map(|mask| mask.drawable_ids.iter())
+        .collect::<HashSet<_>>();
+
+    (0..table.len())
+        .filter_map(|row| {
+            let drawable = &snapshot.drawables[table.source_indices[row]];
+            referenced_ids.contains(&drawable.id).then(|| {
+                draw_command_for_row(snapshot, table, row, mask_table.mask_refs_by_row[row])
+            })
+        })
+        .collect()
 }
 
 fn draw_command_for_row(
@@ -656,9 +767,9 @@ fn mask_drawable_count(masks: &[MaskPass]) -> usize {
     masks.iter().map(|mask| mask.drawable_ids.len()).sum()
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct MaskKey<'a> {
-    drawable_ids: &'a [DrawableId],
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MaskKey {
+    drawable_ids: Vec<DrawableId>,
     inverted: bool,
 }
 
@@ -698,22 +809,113 @@ mod tests {
             canvas: CanvasInfo::default(),
             art_meshes: Vec::new(),
             textures: Vec::new(),
-            drawables: vec![drawable(
-                "masked",
-                0,
-                Some(ClippingInfo {
-                    drawable_ids: vec![DrawableId::from("mask")],
-                    inverted: true,
-                }),
-            )],
+            drawables: vec![
+                drawable("mask", 0, None),
+                drawable(
+                    "masked",
+                    1,
+                    Some(ClippingInfo {
+                        drawable_ids: vec![DrawableId::from("mask")],
+                        inverted: true,
+                    }),
+                ),
+            ],
         };
 
         let plan = RenderPlanner::new().build(&snapshot);
 
         assert_eq!(plan.masks.len(), 1);
-        assert_eq!(plan.draws[0].mask, Some(MaskRef(0)));
+        assert_eq!(plan.draws[1].mask, Some(MaskRef(0)));
         assert!(plan.masks[0].inverted);
-        assert!(plan.draws[0].inverted_mask);
+        assert!(plan.draws[1].inverted_mask);
+    }
+
+    #[test]
+    fn visible_translucent_drawable_stays_in_main_draws() {
+        let mut snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![drawable("half", 0, None)],
+        };
+        snapshot.drawables[0].opacity = 0.35;
+
+        let plan = RenderPlanner::new().build(&snapshot);
+
+        assert_eq!(plan.draws.len(), 1);
+        assert_eq!(plan.draws[0].drawable_id.as_ref(), "half");
+        assert_eq!(plan.draws[0].opacity, 0.35);
+        assert_eq!(plan.model.drawables.len(), 1);
+    }
+
+    #[test]
+    fn transparent_unreferenced_drawables_are_not_resident() {
+        let mut hidden = drawable("hidden", 0, None);
+        hidden.visible = false;
+        let mut zero_alpha = drawable("zero", 1, None);
+        zero_alpha.opacity = 0.0;
+        let snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![hidden, zero_alpha, drawable("visible", 2, None)],
+        };
+
+        let plan = RenderPlanner::new().build(&snapshot);
+
+        assert_eq!(plan.model.drawables.len(), 1);
+        assert_eq!(plan.model.drawables[0].drawable_id.as_ref(), "visible");
+        assert!(plan.mask_draws.is_empty());
+        assert_eq!(plan.draws.len(), 1);
+        assert_eq!(plan.draws[0].drawable_id.as_ref(), "visible");
+    }
+
+    #[test]
+    fn transparent_mask_source_is_resident_but_not_main_drawn() {
+        let mut mask = drawable("mask", 0, None);
+        mask.visible = false;
+        let snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![
+                mask,
+                drawable(
+                    "masked",
+                    1,
+                    Some(ClippingInfo {
+                        drawable_ids: vec![DrawableId::from("mask")],
+                        inverted: false,
+                    }),
+                ),
+            ],
+        };
+
+        let plan = RenderPlanner::new().build(&snapshot);
+        let resident_ids = plan
+            .model
+            .drawables
+            .iter()
+            .map(|drawable| drawable.drawable_id.as_ref())
+            .collect::<Vec<_>>();
+        let draw_ids = plan
+            .draws
+            .iter()
+            .map(|draw| draw.drawable_id.as_ref())
+            .collect::<Vec<_>>();
+        let mask_draw_ids = plan
+            .mask_draws
+            .iter()
+            .map(|draw| draw.drawable_id.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(resident_ids, ["mask", "masked"]);
+        assert_eq!(draw_ids, ["masked"]);
+        assert_eq!(mask_draw_ids, ["mask"]);
+        assert_eq!(plan.masks[0].drawable_ids, vec![DrawableId::from("mask")]);
     }
 
     #[test]
@@ -813,6 +1015,67 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(draw_ids, ["b", "a"]);
+    }
+
+    #[test]
+    fn render_world_rebuilds_when_opacity_crosses_draw_threshold() {
+        let mut snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![drawable("fading", 0, None), drawable("visible", 1, None)],
+        };
+        let mut world = RenderWorld::new();
+
+        assert_eq!(world.build(&snapshot).model.drawables.len(), 2);
+
+        snapshot.drawables[0].opacity = 0.0;
+        let plan = world.build(&snapshot);
+
+        assert_eq!(plan, RenderPlanner::new().build(&snapshot));
+        assert_eq!(plan.model.drawables.len(), 1);
+        assert_eq!(plan.draws[0].drawable_id.as_ref(), "visible");
+    }
+
+    #[test]
+    fn render_world_rebuilds_when_resident_mask_source_becomes_drawable() {
+        let mut mask_source = drawable(
+            "mask-source",
+            1,
+            Some(ClippingInfo {
+                drawable_ids: vec![DrawableId::from("mask")],
+                inverted: false,
+            }),
+        );
+        mask_source.opacity = 0.0;
+        let snapshot_masked = drawable(
+            "masked",
+            2,
+            Some(ClippingInfo {
+                drawable_ids: vec![DrawableId::from("mask"), DrawableId::from("mask-source")],
+                inverted: false,
+            }),
+        );
+        let mut mask = drawable("mask", 0, None);
+        mask.visible = false;
+        let mut snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![mask, mask_source, snapshot_masked],
+        };
+        let mut world = RenderWorld::new();
+
+        assert_eq!(world.build(&snapshot).draws.len(), 1);
+
+        snapshot.drawables[1].opacity = 1.0;
+        let plan = world.build(&snapshot);
+
+        assert_eq!(plan, RenderPlanner::new().build(&snapshot));
+        assert_eq!(plan.draws.len(), 2);
+        assert_eq!(plan.masks.len(), 2);
     }
 
     #[test]
@@ -1082,6 +1345,7 @@ mod tests {
                 uv: [0.0, 0.0],
             }],
             indices: vec![0],
+            visible: true,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             clipping,
@@ -1105,6 +1369,7 @@ mod tests {
                 })
                 .collect(),
             indices: (0..index_count).map(|index| index as u16).collect(),
+            visible: true,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             clipping: None,

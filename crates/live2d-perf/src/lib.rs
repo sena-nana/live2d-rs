@@ -324,6 +324,7 @@ pub fn synthetic_snapshot(config: &SyntheticConfig, frame: usize) -> ModelSnapsh
                     config.indices_per_drawable,
                     config.vertices_per_drawable,
                 ),
+                visible: true,
                 opacity: 1.0,
                 blend_mode: match index % 11 {
                     0 => BlendMode::Additive,

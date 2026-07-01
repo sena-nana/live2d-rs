@@ -467,15 +467,15 @@ enum MaskDrawLookup<'a> {
 impl<'a> MaskDrawLookup<'a> {
     fn new(render_plan: &'a RenderPlan) -> Self {
         let potential_comparisons = render_plan
-            .draws
+            .mask_draws
             .len()
-            .saturating_mul(mask_draw_call_count(render_plan));
+            .saturating_mul(raw_mask_drawable_count(render_plan));
         if potential_comparisons <= MASK_DRAW_LOOKUP_INDEX_THRESHOLD {
-            return Self::Linear(&render_plan.draws);
+            return Self::Linear(&render_plan.mask_draws);
         }
 
         let lookup = render_plan
-            .draws
+            .mask_draws
             .iter()
             .map(|draw| (draw.drawable_id.as_ref(), draw))
             .collect();
@@ -2207,6 +2207,20 @@ fn mask_uniform_slots(render_plan: &RenderPlan) -> usize {
 }
 
 fn mask_draw_call_count(render_plan: &RenderPlan) -> usize {
+    let draw_lookup = MaskDrawLookup::new(render_plan);
+    render_plan
+        .masks
+        .iter()
+        .map(|mask| {
+            mask.drawable_ids
+                .iter()
+                .filter(|drawable_id| draw_lookup.get(drawable_id.as_ref()).is_some())
+                .count()
+        })
+        .sum()
+}
+
+fn raw_mask_drawable_count(render_plan: &RenderPlan) -> usize {
     render_plan
         .masks
         .iter()
@@ -2215,7 +2229,7 @@ fn mask_draw_call_count(render_plan: &RenderPlan) -> usize {
 }
 
 fn mask_writer_uniform(
-    draw: &DrawCommand,
+    _draw: &DrawCommand,
     canvas: &CanvasInfo,
     view: &WgpuLive2DView,
     layout: MaskAtlasLayout,
@@ -2229,7 +2243,7 @@ fn mask_writer_uniform(
         ],
         view_transform: view.transform,
         canvas: live2d_canvas_uniform(canvas),
-        effect: [1.0, 1.0, 1.0, draw.opacity.clamp(0.0, 1.0)],
+        effect: [1.0, 1.0, 1.0, 1.0],
         mask: [0.0, 0.0, 0.0, 0.0],
     }
 }
@@ -2422,7 +2436,6 @@ fn mask_atlas_static_signature(
             mix_u64(&mut signature, draw.vertex_range.end as u64);
             mix_u64(&mut signature, draw.index_range.start as u64);
             mix_u64(&mut signature, draw.index_range.end as u64);
-            mix_u64(&mut signature, draw.opacity.to_bits() as u64);
         }
     }
 
@@ -3017,6 +3030,7 @@ mod tests {
                 uv: [0.0, 0.0],
             }],
             indices: vec![0],
+            visible: true,
             opacity: 1.0,
             blend_mode: BlendMode::Normal,
             clipping: None,
@@ -3035,9 +3049,9 @@ mod tests {
     }
 
     #[test]
-    fn mask_writer_uniform_upload_bytes_pack_mask_draw_opacity() {
+    fn mask_writer_uniform_upload_bytes_ignore_mask_draw_opacity() {
         let mut snapshot = masked_snapshot();
-        snapshot.drawables[0].opacity = 0.35;
+        snapshot.drawables[0].opacity = 0.0;
         let render_plan = RenderPlanner::new().build(&snapshot);
         let draw_lookup = MaskDrawLookup::new(&render_plan);
         let layout = mask_atlas_layout(160, 120, render_plan.masks.len(), 512);
@@ -3064,14 +3078,14 @@ mod tests {
         assert_eq!(bytes.len(), stride as usize);
         assert_eq!(uniform.viewport, [160.0, 120.0, 160.0 / 120.0, 0.0]);
         assert_eq!(uniform.view_transform, view.transform);
-        assert_eq!(uniform.effect, [1.0, 1.0, 1.0, 0.35]);
+        assert_eq!(uniform.effect, [1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
-    fn mask_atlas_signature_changes_when_mask_draw_opacity_changes() {
+    fn mask_atlas_signature_ignores_mask_draw_opacity() {
         let base = masked_snapshot();
         let mut changed = base.clone();
-        changed.drawables[0].opacity = 0.5;
+        changed.drawables[0].opacity = 0.0;
         let base_plan = RenderPlanner::new().build(&base);
         let changed_plan = RenderPlanner::new().build(&changed);
         let view = WgpuLive2DView {
@@ -3085,7 +3099,7 @@ mod tests {
         let base_lookup = MaskDrawLookup::new(&base_plan);
         let changed_lookup = MaskDrawLookup::new(&changed_plan);
 
-        assert_ne!(
+        assert_eq!(
             mask_atlas_static_signature(
                 &base_plan,
                 &base_lookup,
@@ -3283,6 +3297,7 @@ mod tests {
                     })
                     .collect(),
                 indices: (0..index_count).map(|index| index as u16).collect(),
+                visible: true,
                 opacity: 1.0,
                 blend_mode: BlendMode::Normal,
                 clipping: None,
@@ -3315,6 +3330,7 @@ mod tests {
                         })
                         .collect(),
                     indices: (0..*index_count).map(|index| index as u16).collect(),
+                    visible: true,
                     opacity: 1.0,
                     blend_mode: BlendMode::Normal,
                     clipping: None,
@@ -3343,6 +3359,7 @@ mod tests {
                         uv: [0.0, 0.0],
                     }],
                     indices: vec![0],
+                    visible: true,
                     opacity: 1.0,
                     blend_mode: BlendMode::Normal,
                     clipping: None,
@@ -3356,6 +3373,7 @@ mod tests {
                         uv: [0.0, 0.0],
                     }],
                     indices: vec![0],
+                    visible: true,
                     opacity: 1.0,
                     blend_mode: BlendMode::Normal,
                     clipping: Some(ClippingInfo {
