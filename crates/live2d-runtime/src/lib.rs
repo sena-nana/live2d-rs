@@ -14,7 +14,7 @@ use std::{
 };
 
 mod motion;
-pub use motion::{Live2DMotion, MotionEvaluation};
+pub use motion::{Live2DMotion, MotionEvaluation, MotionPlaybackState, MotionPlayer};
 
 #[cfg(not(feature = "live2d-cubism"))]
 const RUNTIME_UNAVAILABLE: &str = "live2d_runtime_unavailable";
@@ -55,7 +55,22 @@ pub struct ModelFiles {
     pub model_root: PathBuf,
     pub moc_path: PathBuf,
     pub texture_paths: Vec<PathBuf>,
+    pub motion_groups: Vec<ModelMotionGroup>,
     pub missing_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelMotionGroup {
+    pub name: String,
+    pub motions: Vec<ModelMotionFile>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelMotionFile {
+    pub path: PathBuf,
+    pub relative_path: String,
+    pub fade_in_seconds: Option<f32>,
+    pub fade_out_seconds: Option<f32>,
 }
 
 pub trait AssetResolver {
@@ -91,6 +106,7 @@ impl AssetResolver for FsAssetResolver {
 pub struct Live2DInstance {
     snapshot: ModelSnapshot,
     elapsed_seconds: f32,
+    motion_player: MotionPlayer,
     #[cfg(feature = "live2d-cubism")]
     model: runtime::CubismLive2DModel,
 }
@@ -104,8 +120,13 @@ impl Live2DInstance {
         runtime::load_instance(model_json_path.as_ref())
     }
 
-    pub fn update(&mut self, dt: f32) {
-        self.elapsed_seconds += dt.max(0.0);
+    pub fn update(&mut self, dt: f32) -> Result<(), String> {
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        self.elapsed_seconds += dt;
+        if let Some(evaluation) = self.motion_player.advance(dt) {
+            self.apply_evaluation(evaluation)?;
+        }
+        Ok(())
     }
 
     pub fn elapsed_seconds(&self) -> f32 {
@@ -114,6 +135,52 @@ impl Live2DInstance {
 
     pub fn snapshot(&self) -> &ModelSnapshot {
         &self.snapshot
+    }
+
+    pub fn play_motion(&mut self, motion: Live2DMotion, loop_playback: bool) -> Result<(), String> {
+        self.motion_player.play(motion, loop_playback);
+        if let Err(error) = self.apply_current_motion_frame() {
+            self.motion_player.stop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn pause_motion(&mut self) {
+        self.motion_player.pause();
+    }
+
+    pub fn resume_motion(&mut self) {
+        self.motion_player.resume();
+    }
+
+    pub fn stop_motion(&mut self) {
+        self.motion_player.stop();
+    }
+
+    pub fn seek_motion(&mut self, elapsed_seconds: f32) -> Result<(), String> {
+        self.motion_player.seek(elapsed_seconds);
+        self.apply_current_motion_frame()
+    }
+
+    pub fn set_motion_loop(&mut self, loop_playback: bool) {
+        self.motion_player.set_loop(loop_playback);
+    }
+
+    pub fn set_motion_speed(&mut self, speed: f32) {
+        self.motion_player.set_speed(speed);
+    }
+
+    pub fn motion_state(&self) -> MotionPlaybackState {
+        self.motion_player.state()
+    }
+
+    pub fn motion_elapsed_seconds(&self) -> f32 {
+        self.motion_player.elapsed_seconds()
+    }
+
+    pub fn motion_player(&self) -> &MotionPlayer {
+        &self.motion_player
     }
 
     pub fn parameters(&self) -> Result<Vec<ParameterInfo>, String> {
@@ -222,6 +289,13 @@ impl Live2DInstance {
         }
     }
 
+    fn apply_current_motion_frame(&mut self) -> Result<(), String> {
+        if let Some(evaluation) = self.motion_player.evaluate() {
+            self.apply_evaluation(evaluation)?;
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "probe")]
     fn apply_evaluation_with_probe<P>(
         &mut self,
@@ -262,44 +336,7 @@ pub fn resolve_model_files(model_json_path: impl AsRef<Path>) -> Result<ModelFil
 
     let raw = fs::read_to_string(model_json_path).map_err(|_| "live2d_model_unreadable")?;
     let json: Value = serde_json::from_str(&raw).map_err(|_| "invalid_model3_json")?;
-    let model_root = model_json_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    let file_refs = json.get("FileReferences").unwrap_or(&Value::Null);
-    let moc = file_refs
-        .get("Moc")
-        .and_then(Value::as_str)
-        .filter(|path| !path.trim().is_empty())
-        .ok_or_else(|| "live2d_moc_not_declared".to_string())?;
-
-    let mut missing_files = Vec::new();
-    let moc_path = model_root.join(moc);
-    if !moc_path.exists() {
-        missing_files.push(normalize_relative_path(moc));
-    }
-
-    let mut texture_paths = Vec::new();
-    if let Some(textures) = file_refs.get("Textures").and_then(Value::as_array) {
-        for texture in textures.iter().filter_map(Value::as_str) {
-            let path = model_root.join(texture);
-            if !path.exists() {
-                missing_files.push(normalize_relative_path(texture));
-            }
-            texture_paths.push(path);
-        }
-    }
-
-    missing_files.sort();
-    missing_files.dedup();
-
-    Ok(ModelFiles {
-        model_json_path: model_json_path.to_path_buf(),
-        model_root,
-        moc_path,
-        texture_paths,
-        missing_files,
-    })
+    parse_model_files(model_json_path, &json)
 }
 
 #[cfg(feature = "probe")]
@@ -332,58 +369,34 @@ where
         let json: Value = measure(probe, Stage::RuntimeModel3Parse, Vec::new(), || {
             serde_json::from_str(&raw).map_err(|_| "invalid_model3_json")
         })?;
-        let model_root = model_json_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf();
-        let file_refs = json.get("FileReferences").unwrap_or(&Value::Null);
-        let moc = file_refs
-            .get("Moc")
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty())
-            .ok_or_else(|| "live2d_moc_not_declared".to_string())?;
-
-        let mut missing_files = Vec::new();
-        let moc_path = model_root.join(moc);
-        if !moc_path.exists() {
-            missing_files.push(normalize_relative_path(moc));
-        }
-
-        let mut texture_paths = Vec::new();
-        if let Some(textures) = file_refs.get("Textures").and_then(Value::as_array) {
-            for texture in textures.iter().filter_map(Value::as_str) {
-                let path = model_root.join(texture);
-                if !path.exists() {
-                    missing_files.push(normalize_relative_path(texture));
-                }
-                texture_paths.push(path);
-            }
-        }
-
-        missing_files.sort();
-        missing_files.dedup();
+        let files = parse_model_files(model_json_path, &json)?;
         counter(
             probe,
             Stage::RuntimeAssetResolve,
             "texture_refs",
-            texture_paths.len() as u64,
+            files.texture_paths.len() as u64,
             Vec::new(),
         );
         counter(
             probe,
             Stage::RuntimeAssetResolve,
             "missing_files",
-            missing_files.len() as u64,
+            files.missing_files.len() as u64,
+            Vec::new(),
+        );
+        counter(
+            probe,
+            Stage::RuntimeAssetResolve,
+            "motion_refs",
+            files
+                .motion_groups
+                .iter()
+                .map(|group| group.motions.len() as u64)
+                .sum(),
             Vec::new(),
         );
 
-        Ok(ModelFiles {
-            model_json_path: model_json_path.to_path_buf(),
-            model_root,
-            moc_path,
-            texture_paths,
-            missing_files,
-        })
+        Ok(files)
     })
 }
 
@@ -427,6 +440,113 @@ fn normalize_relative_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+fn parse_model_files(model_json_path: &Path, json: &Value) -> Result<ModelFiles, String> {
+    let model_root = model_json_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let file_refs = json.get("FileReferences").unwrap_or(&Value::Null);
+    let moc = file_refs
+        .get("Moc")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| "live2d_moc_not_declared".to_string())?;
+
+    let mut missing_files = Vec::new();
+    let moc_path = model_root.join(moc);
+    if !moc_path.exists() {
+        missing_files.push(normalize_relative_path(moc));
+    }
+
+    let texture_paths = parse_texture_paths(file_refs, &model_root, &mut missing_files);
+    let motion_groups = parse_motion_groups(file_refs, &model_root, &mut missing_files);
+    missing_files.sort();
+    missing_files.dedup();
+
+    Ok(ModelFiles {
+        model_json_path: model_json_path.to_path_buf(),
+        model_root,
+        moc_path,
+        texture_paths,
+        motion_groups,
+        missing_files,
+    })
+}
+
+fn parse_texture_paths(
+    file_refs: &Value,
+    model_root: &Path,
+    missing_files: &mut Vec<String>,
+) -> Vec<PathBuf> {
+    file_refs
+        .get("Textures")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|texture| {
+            let path = model_root.join(texture);
+            if !path.exists() {
+                missing_files.push(normalize_relative_path(texture));
+            }
+            path
+        })
+        .collect()
+}
+
+fn parse_motion_groups(
+    file_refs: &Value,
+    model_root: &Path,
+    missing_files: &mut Vec<String>,
+) -> Vec<ModelMotionGroup> {
+    let Some(motions) = file_refs.get("Motions").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut groups = motions
+        .iter()
+        .filter_map(|(name, value)| {
+            let motion_files = value
+                .as_array()?
+                .iter()
+                .filter_map(|motion| parse_motion_file(motion, model_root, missing_files))
+                .collect::<Vec<_>>();
+            Some(ModelMotionGroup {
+                name: name.clone(),
+                motions: motion_files,
+            })
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| left.name.cmp(&right.name));
+    groups
+}
+
+fn parse_motion_file(
+    value: &Value,
+    model_root: &Path,
+    missing_files: &mut Vec<String>,
+) -> Option<ModelMotionFile> {
+    let file = value
+        .get("File")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    let path = model_root.join(file);
+    let relative_path = normalize_relative_path(file);
+    if !path.exists() {
+        missing_files.push(relative_path.clone());
+    }
+    Some(ModelMotionFile {
+        path,
+        relative_path,
+        fade_in_seconds: read_f32(value.get("FadeInTime")),
+        fade_out_seconds: read_f32(value.get("FadeOutTime")),
+    })
+}
+
+fn read_f32(value: Option<&Value>) -> Option<f32> {
+    value.and_then(Value::as_f64).map(|value| value as f32)
+}
+
 #[cfg(not(feature = "live2d-cubism"))]
 mod runtime {
     use super::*;
@@ -460,6 +580,7 @@ mod runtime {
         Ok(Live2DInstance {
             snapshot,
             elapsed_seconds: 0.0,
+            motion_player: MotionPlayer::new(),
         })
     }
 
@@ -944,6 +1065,7 @@ mod runtime {
         Ok(Live2DInstance {
             snapshot,
             elapsed_seconds: 0.0,
+            motion_player: MotionPlayer::new(),
             model,
         })
     }
@@ -1560,11 +1682,26 @@ mod tests {
     fn resolves_model_files_and_reports_missing_assets() {
         let root = unique_temp_dir("live2d-runtime-files");
         fs::create_dir_all(root.join("textures")).unwrap();
+        fs::create_dir_all(root.join("motions")).unwrap();
         fs::write(root.join("texture_ok.png"), "").unwrap();
+        fs::write(root.join("motions/idle.motion3.json"), "{}").unwrap();
         let model = root.join("sample.model3.json");
         fs::write(
             &model,
-            r#"{"FileReferences":{"Moc":"sample.moc3","Textures":["texture_ok.png","textures/missing.png"]}}"#,
+            r#"{
+                "FileReferences": {
+                    "Moc": "sample.moc3",
+                    "Textures": ["texture_ok.png", "textures/missing.png"],
+                    "Motions": {
+                        "TapBody": [
+                            { "File": "motions/tap.motion3.json", "FadeInTime": 0.25, "FadeOutTime": 0.5 }
+                        ],
+                        "Idle": [
+                            { "File": "motions/idle.motion3.json", "FadeInTime": 0.75 }
+                        ]
+                    }
+                }
+            }"#,
         )
         .unwrap();
 
@@ -1572,12 +1709,66 @@ mod tests {
 
         assert_eq!(files.moc_path, root.join("sample.moc3"));
         assert_eq!(files.texture_paths.len(), 2);
+        assert_eq!(files.motion_groups.len(), 2);
+        let idle = files
+            .motion_groups
+            .iter()
+            .find(|group| group.name == "Idle")
+            .unwrap();
+        assert_eq!(idle.motions[0].path, root.join("motions/idle.motion3.json"));
+        assert_eq!(idle.motions[0].relative_path, "motions/idle.motion3.json");
+        assert_eq!(idle.motions[0].fade_in_seconds, Some(0.75));
+        assert_eq!(idle.motions[0].fade_out_seconds, None);
+        let tap = files
+            .motion_groups
+            .iter()
+            .find(|group| group.name == "TapBody")
+            .unwrap();
+        assert_eq!(tap.motions[0].fade_in_seconds, Some(0.25));
+        assert_eq!(tap.motions[0].fade_out_seconds, Some(0.5));
         assert_eq!(
             files.missing_files,
-            vec!["sample.moc3", "textures/missing.png"]
+            vec![
+                "motions/tap.motion3.json",
+                "sample.moc3",
+                "textures/missing.png"
+            ]
         );
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(feature = "live2d-cubism"))]
+    fn instance_update_advances_active_motion_without_faking_runtime() {
+        let mut instance = Live2DInstance {
+            snapshot: empty_snapshot(),
+            elapsed_seconds: 0.0,
+            motion_player: MotionPlayer::new(),
+        };
+        instance.motion_player.play(test_motion(), false);
+
+        let result = instance.update(0.5);
+
+        assert_eq!(result.unwrap_err(), RUNTIME_UNAVAILABLE);
+        assert_eq!(instance.motion_state(), MotionPlaybackState::Playing);
+        assert!((instance.motion_elapsed_seconds() - 0.5).abs() < 0.001);
+
+        instance.pause_motion();
+        instance.update(0.5).unwrap();
+        assert_eq!(instance.motion_state(), MotionPlaybackState::Paused);
+        assert!((instance.motion_elapsed_seconds() - 0.5).abs() < 0.001);
+
+        instance.resume_motion();
+        let result = instance.update(2.0);
+        assert_eq!(result.unwrap_err(), RUNTIME_UNAVAILABLE);
+        assert_eq!(instance.motion_state(), MotionPlaybackState::Finished);
+        assert!((instance.motion_elapsed_seconds() - 2.0).abs() < 0.001);
+
+        instance.stop_motion();
+        assert_eq!(instance.motion_state(), MotionPlaybackState::Stopped);
+        instance.update(1.0).unwrap();
+        assert_eq!(instance.motion_state(), MotionPlaybackState::Stopped);
     }
 
     #[test]
@@ -1699,5 +1890,29 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{stamp}"))
+    }
+
+    #[cfg(not(feature = "live2d-cubism"))]
+    fn empty_snapshot() -> ModelSnapshot {
+        ModelSnapshot {
+            model_key: "test".into(),
+            canvas: live2d_core::CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            drawables: Vec::new(),
+            textures: Vec::new(),
+        }
+    }
+
+    #[cfg(not(feature = "live2d-cubism"))]
+    fn test_motion() -> Live2DMotion {
+        Live2DMotion::from_json_str(
+            r#"{
+                "Meta": { "Duration": 2.0, "Loop": false },
+                "Curves": [
+                    { "Target": "Parameter", "Id": "ParamAngleX", "Segments": [0, 0, 0, 2, 10] }
+                ]
+            }"#,
+        )
+        .unwrap()
     }
 }

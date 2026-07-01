@@ -14,6 +14,23 @@ pub struct MotionEvaluation {
     pub parameters: Vec<(String, f32)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionPlaybackState {
+    Stopped,
+    Playing,
+    Paused,
+    Finished,
+}
+
+#[derive(Debug, Clone)]
+pub struct MotionPlayer {
+    motion: Option<Live2DMotion>,
+    elapsed_seconds: f32,
+    loop_playback: bool,
+    speed: f32,
+    state: MotionPlaybackState,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct MotionCurve {
     target: MotionTarget,
@@ -120,6 +137,118 @@ impl Live2DMotion {
 
     fn should_loop(&self, loop_playback: bool) -> bool {
         loop_playback || self.looped
+    }
+}
+
+impl Default for MotionPlayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MotionPlayer {
+    pub fn new() -> Self {
+        Self {
+            motion: None,
+            elapsed_seconds: 0.0,
+            loop_playback: false,
+            speed: 1.0,
+            state: MotionPlaybackState::Stopped,
+        }
+    }
+
+    pub fn play(&mut self, motion: Live2DMotion, loop_playback: bool) {
+        self.motion = Some(motion);
+        self.elapsed_seconds = 0.0;
+        self.loop_playback = loop_playback;
+        self.state = MotionPlaybackState::Playing;
+    }
+
+    pub fn pause(&mut self) {
+        if self.state == MotionPlaybackState::Playing {
+            self.state = MotionPlaybackState::Paused;
+        }
+    }
+
+    pub fn resume(&mut self) {
+        if self.state == MotionPlaybackState::Paused {
+            self.state = MotionPlaybackState::Playing;
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.motion = None;
+        self.elapsed_seconds = 0.0;
+        self.loop_playback = false;
+        self.state = MotionPlaybackState::Stopped;
+    }
+
+    pub fn seek(&mut self, elapsed_seconds: f32) {
+        let was_finished = self.state == MotionPlaybackState::Finished;
+        self.elapsed_seconds = self.clamp_elapsed(elapsed_seconds.max(0.0));
+        if self.motion.is_none() {
+            return;
+        }
+        self.update_finished_state();
+        if was_finished && self.state != MotionPlaybackState::Finished {
+            self.state = MotionPlaybackState::Paused;
+        }
+    }
+
+    pub fn set_loop(&mut self, loop_playback: bool) {
+        self.loop_playback = loop_playback;
+    }
+
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = if speed.is_finite() {
+            speed.max(0.0)
+        } else {
+            1.0
+        };
+    }
+
+    pub fn state(&self) -> MotionPlaybackState {
+        self.state
+    }
+
+    pub fn elapsed_seconds(&self) -> f32 {
+        self.elapsed_seconds
+    }
+
+    pub fn evaluate(&self) -> Option<MotionEvaluation> {
+        self.motion
+            .as_ref()
+            .map(|motion| motion.sample(self.elapsed_seconds, self.loop_playback))
+    }
+
+    pub fn advance(&mut self, dt: f32) -> Option<MotionEvaluation> {
+        if self.state != MotionPlaybackState::Playing {
+            return None;
+        }
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        self.elapsed_seconds = self.clamp_elapsed(self.elapsed_seconds + dt * self.speed);
+        self.update_finished_state();
+        self.evaluate()
+    }
+
+    fn clamp_elapsed(&self, elapsed_seconds: f32) -> f32 {
+        let Some(motion) = &self.motion else {
+            return 0.0;
+        };
+        if motion.should_loop(self.loop_playback) || motion.duration <= 0.0 {
+            elapsed_seconds
+        } else {
+            elapsed_seconds.min(motion.duration)
+        }
+    }
+
+    fn update_finished_state(&mut self) {
+        let Some(motion) = &self.motion else {
+            return;
+        };
+        if motion.is_finished(self.elapsed_seconds, self.loop_playback) {
+            self.state = MotionPlaybackState::Finished;
+        }
     }
 }
 
@@ -335,6 +464,42 @@ mod tests {
         assert!(motion.is_finished(5.0, false));
     }
 
+    #[test]
+    fn player_controls_playback_state_and_timing() {
+        let motion = simple_motion(2.0, false);
+        let mut player = MotionPlayer::new();
+
+        player.play(motion.clone(), false);
+        assert_eq!(player.state(), MotionPlaybackState::Playing);
+        player.advance(0.5);
+        assert_close(player.elapsed_seconds(), 0.5);
+
+        player.pause();
+        assert_eq!(player.state(), MotionPlaybackState::Paused);
+        assert!(player.advance(1.0).is_none());
+        assert_close(player.elapsed_seconds(), 0.5);
+
+        player.resume();
+        player.set_speed(2.0);
+        player.advance(0.5);
+        assert_close(player.elapsed_seconds(), 1.5);
+
+        player.seek(3.0);
+        assert_close(player.elapsed_seconds(), 2.0);
+        assert_eq!(player.state(), MotionPlaybackState::Finished);
+        player.advance(0.1);
+        assert_eq!(player.state(), MotionPlaybackState::Finished);
+
+        player.play(motion, true);
+        player.advance(2.5);
+        assert_eq!(player.state(), MotionPlaybackState::Playing);
+        assert_close(value_for(&player.evaluate().unwrap(), "ParamAngleX"), 5.0);
+
+        player.stop();
+        assert_eq!(player.state(), MotionPlaybackState::Stopped);
+        assert!(player.evaluate().is_none());
+    }
+
     fn value_for(evaluation: &MotionEvaluation, id: &str) -> f32 {
         evaluation
             .parameters
@@ -348,5 +513,17 @@ mod tests {
             (actual - expected).abs() < 0.001,
             "expected {expected}, got {actual}"
         );
+    }
+
+    fn simple_motion(duration: f32, looped: bool) -> Live2DMotion {
+        Live2DMotion::from_json_str(&format!(
+            r#"{{
+                "Meta": {{ "Duration": {duration}, "Loop": {looped} }},
+                "Curves": [
+                    {{ "Target": "Parameter", "Id": "ParamAngleX", "Segments": [0, 0, 0, {duration}, 10] }}
+                ]
+            }}"#
+        ))
+        .unwrap()
     }
 }
