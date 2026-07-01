@@ -1,7 +1,8 @@
 use live2d_perf::{
-    compare_reports, run_dispatch_null_backend, run_motion_update, run_real_model_load,
-    run_real_model_motion, run_render_plan, run_render_world_switch, CompareSummary,
-    SyntheticBlendProfile, SyntheticConfig,
+    compare_reports, run_dispatch_null_backend, run_layered_motion, run_motion_update,
+    run_real_model_load, run_real_model_motion, run_real_model_render, run_render_plan,
+    run_render_world_switch, CompareSummary, RealModelRenderConfig, SyntheticBlendProfile,
+    SyntheticConfig,
 };
 use live2d_probe::{RunReport, Stage, StageStats};
 use serde::Serialize;
@@ -65,6 +66,7 @@ fn run() -> Result<(), String> {
             report
         }
         "motion-update" => run_motion_update(&config),
+        "layered-motion" => run_layered_motion(&config),
         "real-model-load" => {
             let model = value_arg(&args, "--model")
                 .ok_or_else(|| "real-model-load requires --model <path>".to_owned())?;
@@ -76,6 +78,22 @@ fn run() -> Result<(), String> {
             let motion_group = value_arg(&args, "--motion-group");
             run_real_model_motion(Path::new(&model), config.frames, motion_group.as_deref())
         }
+        "real-model-render" => {
+            let model = value_arg(&args, "--model")
+                .ok_or_else(|| "real-model-render requires --model <path>".to_owned())?;
+            let motion_group = value_arg(&args, "--motion-group");
+            let warmup_frames = usize_arg(&args, "--warmup-frames", 0)?;
+            let width = u32_arg(&args, "--width", 1024)?;
+            let height = u32_arg(&args, "--height", 1024)?;
+            let render_config = RealModelRenderConfig::new(
+                config.frames,
+                warmup_frames,
+                width,
+                height,
+                motion_group,
+            );
+            run_real_model_render(Path::new(&model), &render_config)
+        }
         #[cfg(feature = "wgpu")]
         "wgpu-cold" | "wgpu-warm" | "wgpu-mask" | "wgpu-resize" | "wgpu-model-switch"
         | "wgpu-postprocess" => live2d_perf::wgpu_scenarios::run_wgpu_scenario(&scenario, &config)?,
@@ -86,7 +104,7 @@ fn run() -> Result<(), String> {
         }
         _ => {
             return Err(format!(
-                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, real-model-load, real-model-motion, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, or wgpu-postprocess"
+                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, real-model-load, real-model-motion, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, or wgpu-postprocess"
             ));
         }
     };
@@ -102,8 +120,8 @@ fn run() -> Result<(), String> {
 }
 
 fn print_help() {
-    println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--blend-profile <name>] [--model <path>] [--motion-group <name>]");
-    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, real-model-load, real-model-motion, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, wgpu-postprocess, compare-revs");
+    println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--blend-profile <name>] [--model <path>] [--motion-group <name>] [--warmup-frames <n>] [--width <px>] [--height <px>]");
+    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, real-model-load, real-model-motion, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, wgpu-postprocess, compare-revs");
     println!("profiles: small, medium, large, mask-heavy, static-mask-heavy, texture-heavy, target-filter");
     println!(
         "blend profiles: classic-mix, advanced-colors, advanced-alphas, advanced-matrix, all-modes"
@@ -118,6 +136,7 @@ fn uses_synthetic_config(scenario: &str) -> bool {
             | "render-world-switch"
             | "dispatch-null-backend"
             | "motion-update"
+            | "layered-motion"
             | "wgpu-cold"
             | "wgpu-warm"
             | "wgpu-mask"
@@ -135,6 +154,37 @@ fn report_label(scenario: &str, profile: &str, report: &RunReport) -> String {
             }
         }
         return format!("{scenario}-{profile}");
+    }
+    if scenario == "real-model-render" {
+        return report
+            .config
+            .get("model")
+            .and_then(|model| Path::new(model).file_stem())
+            .and_then(|stem| stem.to_str())
+            .map(|stem| {
+                let frames = report
+                    .config
+                    .get("frames")
+                    .map(String::as_str)
+                    .unwrap_or("1");
+                let warmup = report
+                    .config
+                    .get("warmup_frames")
+                    .map(String::as_str)
+                    .unwrap_or("0");
+                let width = report
+                    .config
+                    .get("width")
+                    .map(String::as_str)
+                    .unwrap_or("0");
+                let height = report
+                    .config
+                    .get("height")
+                    .map(String::as_str)
+                    .unwrap_or("0");
+                format!("{scenario}-{stem}-frames-{frames}-warmup-{warmup}-{width}x{height}")
+            })
+            .unwrap_or_else(|| scenario.to_owned());
     }
     report
         .config
@@ -838,6 +888,27 @@ fn value_arg(args: &[String], name: &str) -> Option<String> {
         .map(|window| window[1].clone())
 }
 
+fn usize_arg(args: &[String], name: &str, default: usize) -> Result<usize, String> {
+    value_arg(args, name)
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("{name} must be a positive integer"))
+        })
+        .unwrap_or(Ok(default))
+}
+
+fn u32_arg(args: &[String], name: &str, default: u32) -> Result<u32, String> {
+    value_arg(args, name)
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map(|parsed| parsed.max(1))
+                .map_err(|_| format!("{name} must be a positive integer"))
+        })
+        .unwrap_or(Ok(default.max(1)))
+}
+
 fn write_report(label: &str, report: &RunReport) -> Result<PathBuf, String> {
     let dir = PathBuf::from("target").join("live2d-perf");
     fs::create_dir_all(&dir).map_err(|err| format!("failed to create report dir: {err}"))?;
@@ -883,5 +954,8 @@ fn print_summary(report: &RunReport) {
             stats.cache_misses,
             stats.resource_rebuilds
         );
+        for (name, value) in &stats.counters {
+            println!("{stage:?}.{name}={value}");
+        }
     }
 }

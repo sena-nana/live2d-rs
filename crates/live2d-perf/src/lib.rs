@@ -7,10 +7,52 @@ use live2d_render::{
     DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlanner, RenderWorld,
 };
 use live2d_runtime::{
-    Live2DMotion, MotionEvaluation, MotionPlayOptions, MotionPlayer, MotionPriority,
+    Live2DMotion, MotionBlendMode, MotionEvaluation, MotionLayerOptions, MotionMixer,
+    MotionPlayOptions, MotionPlayer, MotionPriority, MotionStartResult,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealModelRenderConfig {
+    pub frames: usize,
+    pub warmup_frames: usize,
+    pub width: u32,
+    pub height: u32,
+    pub motion_group: Option<String>,
+}
+
+impl RealModelRenderConfig {
+    pub fn new(
+        frames: usize,
+        warmup_frames: usize,
+        width: u32,
+        height: u32,
+        motion_group: Option<String>,
+    ) -> Self {
+        Self {
+            frames: frames.max(1),
+            warmup_frames,
+            width: width.max(1),
+            height: height.max(1),
+            motion_group,
+        }
+    }
+
+    fn as_report_config(&self, model_path: &Path) -> BTreeMap<String, String> {
+        let mut config = BTreeMap::from([
+            ("model".into(), model_path.display().to_string()),
+            ("frames".into(), self.frames.to_string()),
+            ("warmup_frames".into(), self.warmup_frames.to_string()),
+            ("width".into(), self.width.to_string()),
+            ("height".into(), self.height.to_string()),
+        ]);
+        if let Some(group) = &self.motion_group {
+            config.insert("motion_group".into(), group.clone());
+        }
+        config
+    }
+}
 
 #[cfg(feature = "wgpu")]
 pub mod wgpu_scenarios {
@@ -725,6 +767,222 @@ pub fn run_motion_update(config: &SyntheticConfig) -> RunReport {
     recorder.report("motion-update", report_config, Vec::new())
 }
 
+pub fn run_layered_motion(config: &SyntheticConfig) -> RunReport {
+    const BREATH_LAYER_WEIGHT: f32 = 0.35;
+    const ACTION_INTERVAL_FRAMES: usize = 60;
+    const ACTION_TARGET_STRIDE: usize = 8;
+
+    let recorder = ProbeRecorder::new();
+    let instance_count = config.drawables.max(1);
+    let frames = config.frames.max(1);
+    let idle_motion = motion_for("ParamAngleX", -5.0, 5.0, true);
+    let breath_motion = motion_for("ParamBreath", -0.5, 0.5, true);
+    let action_motion = motion_for("ParamAngleY", 0.0, 30.0, false);
+    let mut mixers = (0..instance_count)
+        .map(|_| {
+            let mut mixer = MotionMixer::new();
+            mixer.primary_mut().set_idle_motion(
+                idle_motion.clone(),
+                MotionPlayOptions {
+                    loop_playback: true,
+                    fade_in_seconds: 0.1,
+                    fade_out_seconds: 0.1,
+                    priority: MotionPriority::IDLE,
+                    ..MotionPlayOptions::default()
+                },
+            );
+            mixer.set_layer(
+                "breath",
+                breath_motion.clone(),
+                MotionPlayOptions {
+                    loop_playback: true,
+                    fade_in_seconds: 0.2,
+                    fade_out_seconds: 0.2,
+                    priority: MotionPriority::NORMAL,
+                    ..MotionPlayOptions::default()
+                },
+                MotionLayerOptions {
+                    weight: BREATH_LAYER_WEIGHT,
+                    enabled: true,
+                    blend: MotionBlendMode::Additive,
+                },
+            );
+            mixer
+        })
+        .collect::<Vec<_>>();
+    let mut evaluations = vec![MotionEvaluation::default(); instance_count];
+    let mut changed_indices = Vec::with_capacity(instance_count);
+    let mut total_action_requests = 0usize;
+    let mut total_action_started = 0usize;
+    let mut total_action_queued = 0usize;
+    let mut total_events = 0usize;
+    let mut total_parameter_values = 0usize;
+    let mut total_part_opacity_values = 0usize;
+    let mixer_layers = mixers.iter().map(MotionMixer::layer_count).sum::<usize>();
+
+    for frame in 0..frames {
+        changed_indices.clear();
+        let frame_stats = measure(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            vec![ProbeAttr::new("frame", frame as u64)],
+            || {
+                let mut action_requests = 0usize;
+                let mut action_started = 0usize;
+                let mut action_queued = 0usize;
+                if frame > 0 && frame % ACTION_INTERVAL_FRAMES == 0 {
+                    for mixer in mixers.iter_mut().step_by(ACTION_TARGET_STRIDE) {
+                        action_requests += 1;
+                        match mixer.primary_mut().request_motion(
+                            action_motion.clone(),
+                            MotionPlayOptions {
+                                fade_in_seconds: 0.05,
+                                fade_out_seconds: 0.1,
+                                priority: MotionPriority::FORCE,
+                                ..MotionPlayOptions::default()
+                            },
+                        ) {
+                            MotionStartResult::Started => action_started += 1,
+                            MotionStartResult::Queued => action_queued += 1,
+                        }
+                    }
+                }
+
+                let mut events = 0usize;
+                let mut parameter_values = 0usize;
+                let mut part_opacity_values = 0usize;
+                for (index, (mixer, evaluation)) in
+                    mixers.iter_mut().zip(evaluations.iter_mut()).enumerate()
+                {
+                    if mixer.advance_into(1.0 / 60.0, evaluation) {
+                        changed_indices.push(index);
+                    }
+                    events += evaluation.events.len();
+                    parameter_values += evaluation.parameters.len();
+                    part_opacity_values += evaluation.part_opacities.len();
+                }
+
+                (
+                    action_requests,
+                    action_started,
+                    action_queued,
+                    events,
+                    parameter_values,
+                    part_opacity_values,
+                )
+            },
+        );
+        let (
+            action_requests,
+            action_started,
+            action_queued,
+            events,
+            parameter_values,
+            part_opacity_values,
+        ) = frame_stats;
+        total_action_requests += action_requests;
+        total_action_started += action_started;
+        total_action_queued += action_queued;
+        total_events += events;
+        total_parameter_values += parameter_values;
+        total_part_opacity_values += part_opacity_values;
+        counter(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            "motion_changed_instances",
+            changed_indices.len() as u64,
+            Vec::new(),
+        );
+        counter(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            "motion_events",
+            events as u64,
+            Vec::new(),
+        );
+        counter(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            "motion_parameter_values",
+            parameter_values as u64,
+            Vec::new(),
+        );
+        counter(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            "motion_part_opacity_values",
+            part_opacity_values as u64,
+            Vec::new(),
+        );
+        counter(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            "action_requests",
+            action_requests as u64,
+            Vec::new(),
+        );
+        counter(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            "action_started",
+            action_started as u64,
+            Vec::new(),
+        );
+        counter(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            "action_queued",
+            action_queued as u64,
+            Vec::new(),
+        );
+    }
+    counter(
+        &recorder,
+        Stage::RuntimeMotionUpdate,
+        "mixer_layers",
+        mixer_layers as u64,
+        Vec::new(),
+    );
+
+    let mut report_config = config.as_report_config();
+    report_config.insert("motion_instances".into(), instance_count.to_string());
+    report_config.insert("motion_layers".into(), mixer_layers.to_string());
+    report_config.insert(
+        "breath_layer_weight".into(),
+        BREATH_LAYER_WEIGHT.to_string(),
+    );
+    report_config.insert(
+        "action_interval_frames".into(),
+        ACTION_INTERVAL_FRAMES.to_string(),
+    );
+    report_config.insert(
+        "action_target_stride".into(),
+        ACTION_TARGET_STRIDE.to_string(),
+    );
+    report_config.insert("motion_total_events".into(), total_events.to_string());
+    report_config.insert(
+        "motion_total_parameter_values".into(),
+        total_parameter_values.to_string(),
+    );
+    report_config.insert(
+        "motion_total_part_opacity_values".into(),
+        total_part_opacity_values.to_string(),
+    );
+    report_config.insert(
+        "action_total_requests".into(),
+        total_action_requests.to_string(),
+    );
+    report_config.insert(
+        "action_total_started".into(),
+        total_action_started.to_string(),
+    );
+    report_config.insert(
+        "action_total_queued".into(),
+        total_action_queued.to_string(),
+    );
+    recorder.report("layered-motion", report_config, Vec::new())
+}
+
 fn motion_for(parameter_id: &str, start: f32, end: f32, looped: bool) -> Live2DMotion {
     Live2DMotion::from_json_str(&format!(
         r#"{{
@@ -800,12 +1058,230 @@ pub fn run_real_model_motion(
     )
 }
 
+#[cfg(all(feature = "live2d-cubism", feature = "wgpu"))]
+pub fn run_real_model_render(model_path: &Path, config: &RealModelRenderConfig) -> RunReport {
+    let recorder = ProbeRecorder::new();
+    let mut report_config = config.as_report_config(model_path);
+    let warnings = pollster::block_on(run_real_model_render_inner(
+        model_path,
+        config,
+        &recorder,
+        &mut report_config,
+    ))
+    .unwrap_or_else(|err| vec![format!("real model render failed: {err}")]);
+    recorder.report("real-model-render", report_config, warnings)
+}
+
+#[cfg(not(all(feature = "live2d-cubism", feature = "wgpu")))]
+pub fn run_real_model_render(model_path: &Path, config: &RealModelRenderConfig) -> RunReport {
+    ProbeRecorder::new().report(
+        "real-model-render",
+        config.as_report_config(model_path),
+        vec!["real-model-render requires `--features live2d-cubism,wgpu`".to_owned()],
+    )
+}
+
 #[cfg(feature = "live2d-cubism")]
 struct RealModelMotionMetadata {
     group: String,
     motion: String,
     changed_frames: usize,
     motion_events: usize,
+}
+
+#[cfg(all(feature = "live2d-cubism", feature = "wgpu"))]
+async fn run_real_model_render_inner(
+    model_path: &Path,
+    config: &RealModelRenderConfig,
+    recorder: &ProbeRecorder,
+    report_config: &mut BTreeMap<String, String>,
+) -> Result<Vec<String>, String> {
+    use std::time::Instant;
+
+    let files = live2d_runtime::resolve_model_files(model_path)?;
+    if !files.missing_files.is_empty() {
+        return Err(format!(
+            "model assets missing: {}",
+            files.missing_files.join(", ")
+        ));
+    }
+    let selected_motion = match select_motion_file(&files, config.motion_group.as_deref()) {
+        Ok((group_name, motion_file)) => Some((group_name, motion_file)),
+        Err(err) if config.motion_group.is_some() => return Err(err),
+        Err(_) => None,
+    };
+
+    let mut instance = live2d_runtime::Live2DInstance::load_file(model_path)?;
+    if let Some((group_name, motion_file)) = selected_motion {
+        instance.request_motion_file(motion_file, true)?;
+        report_config.insert("motion_group".into(), group_name);
+        report_config.insert("motion".into(), motion_file.relative_path.clone());
+        report_config.insert("motion_loop".into(), "true".into());
+    }
+
+    let snapshot = instance.snapshot();
+    report_config.insert("drawables".into(), snapshot.drawables.len().to_string());
+    report_config.insert("textures".into(), snapshot.textures.len().to_string());
+    report_config.insert(
+        "texture_bytes".into(),
+        snapshot
+            .textures
+            .iter()
+            .map(|texture| texture.rgba.len() as u64)
+            .sum::<u64>()
+            .to_string(),
+    );
+    report_config.insert(
+        "canvas_size".into(),
+        format!("{},{}", snapshot.canvas.size[0], snapshot.canvas.size[1]),
+    );
+
+    let instance_wgpu = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = instance_wgpu
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })
+        .await
+        .map_err(|err| format!("wgpu adapter unavailable: {err}"))?;
+    let adapter_features = adapter.features();
+    let features = adapter_features & wgpu::Features::TIMESTAMP_QUERY;
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("Live2D Real Model Perf Device"),
+            required_features: features,
+            required_limits: wgpu::Limits::default(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        })
+        .await
+        .map_err(|err| format!("wgpu device unavailable: {err}"))?;
+    let mut warnings = if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        Vec::new()
+    } else {
+        vec![
+            "gpu timestamp queries are unsupported; report uses CPU encode and submit-to-complete timing"
+                .to_owned(),
+        ]
+    };
+    let mut renderer = live2d_wgpu::WgpuLive2DRenderer::new_with_probe(
+        &device,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        recorder,
+    );
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Live2D Real Model Perf Target"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    for _ in 0..config.warmup_frames {
+        instance.update_motion(1.0 / 60.0)?;
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Live2D Real Model Perf Warmup Encoder"),
+        });
+        renderer.render_to_view(
+            &device,
+            &queue,
+            &mut encoder,
+            live2d_wgpu::WgpuLive2DTarget::clear(&target, &target_view, wgpu::Color::TRANSPARENT),
+            instance.snapshot(),
+            real_model_render_view(config),
+        );
+        queue.submit([encoder.finish()]);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    let mut changed_frames = 0usize;
+    let mut motion_events = 0usize;
+    for frame in 0..config.frames {
+        let changed = measure(
+            recorder,
+            Stage::RuntimeMotionUpdate,
+            vec![ProbeAttr::new("frame", frame as u64)],
+            || instance.update_motion(1.0 / 60.0),
+        )?;
+        if changed {
+            changed_frames += 1;
+        }
+        motion_events += instance.motion_events().len();
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Live2D Real Model Perf Encoder"),
+        });
+        renderer.render_to_view_with_probe(
+            &device,
+            &queue,
+            &mut encoder,
+            live2d_wgpu::WgpuLive2DTarget::clear(&target, &target_view, wgpu::Color::TRANSPARENT),
+            instance.snapshot(),
+            real_model_render_view(config),
+            recorder,
+        );
+        let command_buffer = encoder.finish();
+        let started = Instant::now();
+        measure(recorder, Stage::WgpuQueueSubmit, Vec::new(), || {
+            queue.submit([command_buffer]);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        });
+        renderer.collect_gpu_timestamps_with_probe(&device, &queue, recorder)?;
+        counter(
+            recorder,
+            Stage::WgpuQueueSubmit,
+            "submit_to_complete_nanos",
+            started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Vec::new(),
+        );
+    }
+    counter(
+        recorder,
+        Stage::RuntimeMotionUpdate,
+        "motion_changed_frames",
+        changed_frames as u64,
+        Vec::new(),
+    );
+    counter(
+        recorder,
+        Stage::RuntimeMotionUpdate,
+        "motion_events",
+        motion_events as u64,
+        Vec::new(),
+    );
+    report_config.insert("changed_frames".into(), changed_frames.to_string());
+    report_config.insert("motion_events".into(), motion_events.to_string());
+
+    if config.warmup_frames > 0 {
+        warnings.push(format!(
+            "{} warmup frame(s) rendered before measured frames",
+            config.warmup_frames
+        ));
+    }
+    Ok(warnings)
+}
+
+#[cfg(all(feature = "live2d-cubism", feature = "wgpu"))]
+fn real_model_render_view(config: &RealModelRenderConfig) -> live2d_wgpu::WgpuLive2DView {
+    live2d_wgpu::WgpuLive2DView {
+        transform: [1.0, 0.0, 0.0, 1.0],
+        width: config.width,
+        height: config.height,
+        effect: [1.0, 1.0, 1.0, 1.0],
+        target_drawable_ids: Vec::new(),
+    }
 }
 
 #[cfg(feature = "live2d-cubism")]
@@ -1251,6 +1727,30 @@ mod tests {
         assert_eq!(report.config.get("motion_instances").unwrap(), "8");
         assert!(stage.counters["motion_changed_instances"] > 0);
         assert!(stage.counters["motion_events"] > 0);
+    }
+
+    #[test]
+    fn layered_motion_reports_layered_runtime_work() {
+        let config = SyntheticConfig {
+            drawables: 8,
+            frames: 120,
+            ..SyntheticConfig::small()
+        };
+
+        let report = run_layered_motion(&config);
+        let stage = report
+            .analysis
+            .stages
+            .get(&Stage::RuntimeMotionUpdate)
+            .unwrap();
+
+        assert_eq!(stage.calls, 120);
+        assert_eq!(report.config.get("motion_instances").unwrap(), "8");
+        assert_eq!(report.config.get("motion_layers").unwrap(), "8");
+        assert_eq!(stage.counters["mixer_layers"], 8);
+        assert!(stage.counters["action_requests"] > 0);
+        assert!(stage.counters["motion_changed_instances"] > 0);
+        assert!(stage.counters["motion_parameter_values"] > 0);
     }
 
     #[test]
