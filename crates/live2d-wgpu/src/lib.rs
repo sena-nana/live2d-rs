@@ -6,7 +6,7 @@ use live2d_render::{
     DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, PostProcessParams, PostProcessPlan,
     PostProcessShaderId, RenderPlan, RenderWorld, POST_PROCESS_PARAM_VEC4S,
 };
-use std::collections::{HashMap, HashSet};
+use std::{cell::RefCell, collections::HashMap};
 
 const MASK_ATLAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const MASK_DRAW_LOOKUP_INDEX_THRESHOLD: usize = 8 * 1024;
@@ -387,6 +387,7 @@ pub struct WgpuLive2DRenderer {
     uniform_bind_group: wgpu::BindGroup,
     uniform_stride: u64,
     uniform_capacity: usize,
+    uniform_staging: RefCell<Vec<u8>>,
     active_scene_key: Option<String>,
     scene_topologies: HashMap<String, SceneTopology>,
     texture_caches: HashMap<String, TextureCache>,
@@ -540,9 +541,7 @@ struct PositionUpload {
     byte_offset: u64,
 }
 
-#[derive(Debug, Clone, PartialEq)]
 struct GpuUploadPlan {
-    positions: Vec<GpuPosition>,
     uploads: Vec<PositionUpload>,
 }
 
@@ -1101,14 +1100,7 @@ impl WgpuPostProcessChain {
 }
 
 type TextureTopology = Vec<(u32, u32, usize)>;
-type SceneTopology = Vec<DrawableTopology>;
-
-#[derive(Debug, Clone, PartialEq)]
-struct DrawableTopology {
-    drawable_id: String,
-    uvs: Vec<[f32; 2]>,
-    indices: Vec<u16>,
-}
+type SceneTopology = u64;
 
 impl WgpuLive2DRenderer {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -1196,6 +1188,7 @@ impl WgpuLive2DRenderer {
             uniform_bind_group,
             uniform_stride,
             uniform_capacity: 1,
+            uniform_staging: RefCell::new(Vec::new()),
             active_scene_key: None,
             scene_topologies: HashMap::new(),
             texture_caches: HashMap::new(),
@@ -1754,16 +1747,20 @@ impl WgpuLive2DRenderer {
         let mask_bind_group = active_mask_atlas
             .map(|atlas| &atlas.bind_group)
             .unwrap_or(&self.fallback_mask_bind_group);
-        upload_main_uniforms(
-            queue,
-            &self.uniform_buffer,
-            self.uniform_stride,
-            first_uniform_slot,
-            render_plan,
-            canvas,
-            &view,
-            active_mask_atlas,
-        );
+        {
+            let mut uniform_staging = self.uniform_staging.borrow_mut();
+            upload_main_uniforms(
+                queue,
+                &self.uniform_buffer,
+                self.uniform_stride,
+                first_uniform_slot,
+                render_plan,
+                canvas,
+                &view,
+                active_mask_atlas,
+                &mut uniform_staging,
+            );
+        }
         let mut backend = WgpuRenderBackend {
             pass,
             pipelines: &self.pipelines,
@@ -1804,16 +1801,20 @@ impl WgpuLive2DRenderer {
         let mask_bind_group = active_mask_atlas
             .map(|atlas| &atlas.bind_group)
             .unwrap_or(&self.fallback_mask_bind_group);
-        let uniform_upload = upload_main_uniforms(
-            queue,
-            &self.uniform_buffer,
-            self.uniform_stride,
-            first_uniform_slot,
-            render_plan,
-            canvas,
-            &view,
-            active_mask_atlas,
-        );
+        let uniform_upload = {
+            let mut uniform_staging = self.uniform_staging.borrow_mut();
+            upload_main_uniforms(
+                queue,
+                &self.uniform_buffer,
+                self.uniform_stride,
+                first_uniform_slot,
+                render_plan,
+                canvas,
+                &view,
+                active_mask_atlas,
+                &mut uniform_staging,
+            )
+        };
         let mut backend = WgpuRenderBackend {
             pass,
             pipelines: &self.pipelines,
@@ -1937,17 +1938,23 @@ impl WgpuLive2DRenderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        let uniform_bytes = mask_uniform_upload_bytes(
-            render_plan,
-            &draw_lookup,
-            canvas,
-            view,
-            layout,
-            self.uniform_stride,
-        );
-        if !uniform_bytes.is_empty() {
-            queue.write_buffer(&self.uniform_buffer, 0, &uniform_bytes);
-        }
+        let wrote_uniforms = {
+            let mut uniform_staging = self.uniform_staging.borrow_mut();
+            fill_mask_uniform_upload_bytes(
+                render_plan,
+                &draw_lookup,
+                canvas,
+                view,
+                layout,
+                self.uniform_stride,
+                &mut uniform_staging,
+            );
+            let wrote_uniforms = !uniform_staging.is_empty();
+            if wrote_uniforms {
+                queue.write_buffer(&self.uniform_buffer, 0, &uniform_staging);
+            }
+            wrote_uniforms
+        };
         pass.push_debug_group("live2d mask atlas");
         let mut backend = WgpuMaskRenderBackend {
             pass: &mut pass,
@@ -1973,7 +1980,7 @@ impl WgpuLive2DRenderer {
         MaskAtlasUpdate {
             encoded: true,
             draw_calls,
-            uniform_writes: usize::from(!uniform_bytes.is_empty()),
+            uniform_writes: usize::from(wrote_uniforms),
         }
     }
 
@@ -2529,7 +2536,8 @@ impl WgpuLive2DRenderer {
             if gpu_scene.vertex_count != render_plan.model.vertex_count {
                 return;
             }
-            let upload_plan = gpu_position_upload_plan(&gpu_scene.positions, snapshot, render_plan);
+            let upload_plan =
+                gpu_position_upload_plan(&mut gpu_scene.positions, snapshot, render_plan);
             let mask_dirty = position_uploads_touch_masks(&upload_plan.uploads, render_plan);
             apply_gpu_upload_plan(queue, gpu_scene, upload_plan);
             mask_dirty
@@ -2560,7 +2568,8 @@ impl WgpuLive2DRenderer {
             let Some(gpu_scene) = self.active_gpu_scene_mut() else {
                 return;
             };
-            let upload_plan = gpu_position_upload_plan(&gpu_scene.positions, snapshot, render_plan);
+            let upload_plan =
+                gpu_position_upload_plan(&mut gpu_scene.positions, snapshot, render_plan);
             uploads = upload_plan.uploads.len();
             bytes = upload_plan.upload_bytes();
             mask_dirty = position_uploads_touch_masks(&upload_plan.uploads, render_plan);
@@ -2977,18 +2986,19 @@ fn mask_writer_uniform(
     }
 }
 
-fn mask_uniform_upload_bytes(
+fn fill_mask_uniform_upload_bytes(
     render_plan: &RenderPlan,
     draw_lookup: &MaskDrawLookup<'_>,
     canvas: &CanvasInfo,
     view: &WgpuLive2DView,
     layout: MaskAtlasLayout,
     uniform_stride: u64,
-) -> Vec<u8> {
+    bytes: &mut Vec<u8>,
+) {
     let uniform_stride = uniform_stride as usize;
     let uniform_size = std::mem::size_of::<Live2dUniform>();
     debug_assert!(uniform_stride >= uniform_size);
-    let mut bytes = Vec::new();
+    bytes.clear();
 
     for mask in &render_plan.masks {
         if mask.id.0 >= layout.slots {
@@ -3004,8 +3014,6 @@ fn mask_uniform_upload_bytes(
             bytes[offset..offset + uniform_size].copy_from_slice(bytemuck::bytes_of(&uniform));
         }
     }
-
-    bytes
 }
 
 fn create_empty_mask_bind_group(
@@ -3195,6 +3203,13 @@ fn mix_f32_slice(signature: &mut u64, values: &[f32]) {
     }
 }
 
+fn mix_str(signature: &mut u64, value: &str) {
+    mix_u64(signature, value.len() as u64);
+    for byte in value.as_bytes() {
+        mix_u64(signature, *byte as u64);
+    }
+}
+
 fn mix_u64(signature: &mut u64, value: u64) {
     *signature ^= value
         .wrapping_add(0x9e37_79b9_7f4a_7c15)
@@ -3304,8 +3319,9 @@ fn upload_main_uniforms(
     canvas: &CanvasInfo,
     view: &WgpuLive2DView,
     mask_atlas: Option<&MaskAtlas>,
+    bytes: &mut Vec<u8>,
 ) -> UniformUploadStats {
-    let bytes = main_uniform_upload_bytes(render_plan, canvas, view, mask_atlas, uniform_stride);
+    fill_main_uniform_upload_bytes(render_plan, canvas, view, mask_atlas, uniform_stride, bytes);
     if bytes.is_empty() {
         return UniformUploadStats::default();
     }
@@ -3321,26 +3337,23 @@ fn upload_main_uniforms(
     }
 }
 
-fn main_uniform_upload_bytes(
+fn fill_main_uniform_upload_bytes(
     render_plan: &RenderPlan,
     canvas: &CanvasInfo,
     view: &WgpuLive2DView,
     mask_atlas: Option<&MaskAtlas>,
     uniform_stride: u64,
-) -> Vec<u8> {
+    bytes: &mut Vec<u8>,
+) {
+    bytes.clear();
     if render_plan.draws.is_empty() {
-        return Vec::new();
+        return;
     }
 
     let uniform_stride = uniform_stride as usize;
     let uniform_size = std::mem::size_of::<Live2dUniform>();
     debug_assert!(uniform_stride >= uniform_size);
-    let mut bytes = vec![0; uniform_stride * render_plan.draws.len()];
-    let target_ids = view
-        .target_drawable_ids
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
+    bytes.resize(uniform_stride * render_plan.draws.len(), 0);
     let canvas = live2d_canvas_uniform(canvas);
     let viewport = [
         view.width.max(1) as f32,
@@ -3350,7 +3363,12 @@ fn main_uniform_upload_bytes(
     ];
 
     for (index, draw) in render_plan.draws.iter().enumerate() {
-        let effect = if target_ids.is_empty() || target_ids.contains(draw.drawable_id.as_ref()) {
+        let effect = if view.target_drawable_ids.is_empty()
+            || view
+                .target_drawable_ids
+                .iter()
+                .any(|target_id| target_id == draw.drawable_id.as_ref())
+        {
             [
                 view.effect[0],
                 view.effect[1],
@@ -3370,8 +3388,6 @@ fn main_uniform_upload_bytes(
         let offset = index * uniform_stride;
         bytes[offset..offset + uniform_size].copy_from_slice(bytemuck::bytes_of(&uniform));
     }
-
-    bytes
 }
 
 fn create_live2d_pipeline(
@@ -3479,13 +3495,20 @@ fn live2d_blend_state(blend_mode: BlendMode) -> wgpu::BlendState {
 }
 
 fn scene_topology(snapshot: &ModelSnapshot) -> SceneTopology {
-    renderable_drawables(snapshot)
-        .map(|drawable| DrawableTopology {
-            drawable_id: drawable.id.as_ref().to_owned(),
-            uvs: drawable.vertices.iter().map(|vertex| vertex.uv).collect(),
-            indices: drawable.indices.clone(),
-        })
-        .collect()
+    let mut signature = 0xcbf2_9ce4_8422_2325;
+    for drawable in renderable_drawables(snapshot) {
+        mix_u64(&mut signature, 1);
+        mix_str(&mut signature, drawable.id.as_ref());
+        mix_u64(&mut signature, drawable.vertices.len() as u64);
+        for vertex in &drawable.vertices {
+            mix_f32_slice(&mut signature, &vertex.uv);
+        }
+        mix_u64(&mut signature, drawable.indices.len() as u64);
+        for index in &drawable.indices {
+            mix_u64(&mut signature, *index as u64);
+        }
+    }
+    signature
 }
 
 fn texture_topology(snapshot: &ModelSnapshot) -> TextureTopology {
@@ -3507,31 +3530,39 @@ fn gpu_scene_positions(snapshot: &ModelSnapshot, render_plan: &RenderPlan) -> Ve
 }
 
 fn gpu_position_upload_plan(
-    previous: &[GpuPosition],
+    positions: &mut Vec<GpuPosition>,
     snapshot: &ModelSnapshot,
     render_plan: &RenderPlan,
 ) -> GpuUploadPlan {
-    if previous.len() != render_plan.model.vertex_count as usize {
-        let positions = gpu_scene_positions(snapshot, render_plan);
-        let uploads = full_position_upload(&positions);
-        return GpuUploadPlan { positions, uploads };
+    if positions.len() != render_plan.model.vertex_count as usize {
+        let expected = render_plan.model.vertex_count as usize;
+        positions.clear();
+        positions.reserve(expected);
+        for drawable in renderable_drawables(snapshot) {
+            positions.extend(drawable.vertices.iter().map(|vertex| GpuPosition {
+                position: vertex.position,
+            }));
+        }
+        let uploads = full_position_upload(positions);
+        return GpuUploadPlan { uploads };
     }
 
-    let mut positions = Vec::with_capacity(render_plan.model.vertex_count as usize);
     let mut uploads = Vec::new();
     let mut dirty_start = None;
+    let mut index = 0;
 
     for drawable in renderable_drawables(snapshot) {
         for vertex in &drawable.vertices {
             let position = GpuPosition {
                 position: vertex.position,
             };
-            let index = positions.len();
-            let Some(previous_position) = previous.get(index) else {
-                positions.push(position);
-                continue;
+            let Some(previous_position) = positions.get_mut(index) else {
+                break;
             };
             let is_dirty = *previous_position != position;
+            if is_dirty {
+                *previous_position = position;
+            }
             match (dirty_start, is_dirty) {
                 (None, true) => dirty_start = Some(index),
                 (Some(start), false) => {
@@ -3543,13 +3574,14 @@ fn gpu_position_upload_plan(
                 }
                 _ => {}
             }
-            positions.push(position);
+            index += 1;
         }
     }
 
-    if positions.len() != previous.len() {
-        let uploads = full_position_upload(&positions);
-        return GpuUploadPlan { positions, uploads };
+    if index != positions.len() {
+        positions.truncate(index);
+        let uploads = full_position_upload(positions);
+        return GpuUploadPlan { uploads };
     }
 
     if let Some(start) = dirty_start {
@@ -3559,7 +3591,7 @@ fn gpu_position_upload_plan(
         });
     }
 
-    GpuUploadPlan { positions, uploads }
+    GpuUploadPlan { uploads }
 }
 
 fn full_position_upload(positions: &[GpuPosition]) -> Vec<PositionUpload> {
@@ -3587,10 +3619,9 @@ fn apply_gpu_upload_plan(
         queue.write_buffer(
             &gpu_scene.position_buffer,
             upload.byte_offset,
-            bytemuck::cast_slice(&upload_plan.positions[range]),
+            bytemuck::cast_slice(&gpu_scene.positions[range]),
         );
     }
-    gpu_scene.positions = upload_plan.positions;
 }
 
 fn gpu_scene_uvs(snapshot: &ModelSnapshot, render_plan: &RenderPlan) -> Vec<GpuUv> {
@@ -3876,13 +3907,15 @@ mod tests {
             target_drawable_ids: Vec::new(),
         };
 
-        let bytes = mask_uniform_upload_bytes(
+        let mut bytes = Vec::new();
+        fill_mask_uniform_upload_bytes(
             &render_plan,
             &draw_lookup,
             &CanvasInfo::default(),
             &view,
             layout,
             stride,
+            &mut bytes,
         );
         let uniform =
             bytemuck::from_bytes::<Live2dUniform>(&bytes[..std::mem::size_of::<Live2dUniform>()]);
@@ -3967,7 +4000,8 @@ mod tests {
             origin: [0.0, 0.0],
             pixels_per_unit: 1.0,
         };
-        let bytes = main_uniform_upload_bytes(&render_plan, &canvas, &view, None, stride);
+        let mut bytes = Vec::new();
+        fill_main_uniform_upload_bytes(&render_plan, &canvas, &view, None, stride, &mut bytes);
         let first =
             bytemuck::from_bytes::<Live2dUniform>(&bytes[..std::mem::size_of::<Live2dUniform>()]);
         let second_offset = stride as usize;
@@ -4051,8 +4085,8 @@ mod tests {
         next.drawables[0].vertices[1].position = [10.0, 11.0];
         next.drawables[1].vertices[0].position = [20.0, 21.0];
         let plan = RenderPlanner::new().build(&base);
-        let previous = gpu_scene_positions(&base, &plan);
-        let upload_plan = gpu_position_upload_plan(&previous, &next, &plan);
+        let mut positions = gpu_scene_positions(&base, &plan);
+        let upload_plan = gpu_position_upload_plan(&mut positions, &next, &plan);
 
         assert_eq!(
             upload_plan.uploads,
@@ -4061,7 +4095,7 @@ mod tests {
                 byte_offset: std::mem::size_of::<GpuPosition>() as u64,
             }]
         );
-        assert_eq!(upload_plan.positions, gpu_scene_positions(&next, &plan));
+        assert_eq!(positions, gpu_scene_positions(&next, &plan));
     }
 
     #[test]
@@ -4070,8 +4104,8 @@ mod tests {
         let next = snapshot_with_drawables(&[("a", 0, 3, 3)]);
         let base_plan = RenderPlanner::new().build(&base);
         let next_plan = RenderPlanner::new().build(&next);
-        let previous = gpu_scene_positions(&base, &base_plan);
-        let upload_plan = gpu_position_upload_plan(&previous, &next, &next_plan);
+        let mut positions = gpu_scene_positions(&base, &base_plan);
+        let upload_plan = gpu_position_upload_plan(&mut positions, &next, &next_plan);
 
         assert_eq!(
             upload_plan.uploads,
@@ -4080,10 +4114,7 @@ mod tests {
                 byte_offset: 0,
             }]
         );
-        assert_eq!(
-            upload_plan.positions,
-            gpu_scene_positions(&next, &next_plan)
-        );
+        assert_eq!(positions, gpu_scene_positions(&next, &next_plan));
     }
 
     fn snapshot_with_drawable(
