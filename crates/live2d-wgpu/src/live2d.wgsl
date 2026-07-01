@@ -30,12 +30,16 @@ fn vs_main(input: VertexIn) -> VertexOut {
     uv.y = 1.0 - uv.y;
     uv = (uv - vec2<f32>(0.5, 0.5)) * max(u.view_transform.z, 0.0001) + vec2<f32>(0.5, 0.5) + u.view_transform.xy;
 
-    let aspect = max(u.viewport.x, 1.0) / max(u.viewport.y, 1.0);
-    let clip = vec2<f32>((uv.x - 0.5) / max(aspect, 0.0001) * 2.0, (0.5 - uv.y) * 2.0);
+    let viewport_aspect = max(u.viewport.x, 1.0) / max(u.viewport.y, 1.0);
+    let geometry_aspect = max(u.viewport.z, 0.0001);
+    let clip = vec2<f32>(
+        (uv.x - 0.5) * geometry_aspect / max(viewport_aspect, 0.0001) * 2.0,
+        (0.5 - uv.y) * 2.0,
+    );
 
     var out: VertexOut;
     out.pos = vec4<f32>(clip, 0.0, 1.0);
-    out.uv = input.uv;
+    out.uv = vec2<f32>(input.uv.x, 1.0 - input.uv.y);
     out.screen_uv = uv;
     return out;
 }

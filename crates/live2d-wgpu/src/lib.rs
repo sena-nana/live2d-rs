@@ -2224,7 +2224,7 @@ fn mask_writer_uniform(
         viewport: [
             layout.slot_width as f32,
             layout.slot_height as f32,
-            0.0,
+            layout.slot_width as f32 / layout.slot_height as f32,
             0.0,
         ],
         view_transform: view.transform,
@@ -2599,13 +2599,13 @@ fn main_uniform_upload_bytes(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    let canvas = live2d_canvas_uniform(canvas);
     let viewport = [
         view.width.max(1) as f32,
         view.height.max(1) as f32,
-        0.0,
+        canvas[0] / canvas[1],
         0.0,
     ];
-    let canvas = live2d_canvas_uniform(canvas);
 
     for (index, draw) in render_plan.draws.iter().enumerate() {
         let effect = if target_ids.is_empty() || target_ids.contains(draw.drawable_id.as_ref()) {
@@ -3062,7 +3062,7 @@ mod tests {
             bytemuck::from_bytes::<Live2dUniform>(&bytes[..std::mem::size_of::<Live2dUniform>()]);
 
         assert_eq!(bytes.len(), stride as usize);
-        assert_eq!(uniform.viewport, [160.0, 120.0, 0.0, 0.0]);
+        assert_eq!(uniform.viewport, [160.0, 120.0, 160.0 / 120.0, 0.0]);
         assert_eq!(uniform.view_transform, view.transform);
         assert_eq!(uniform.effect, [1.0, 1.0, 1.0, 0.35]);
     }
@@ -3136,8 +3136,12 @@ mod tests {
             target_drawable_ids: vec!["masked".to_owned()],
         };
 
-        let bytes =
-            main_uniform_upload_bytes(&render_plan, &CanvasInfo::default(), &view, None, stride);
+        let canvas = CanvasInfo {
+            size: [4.0, 2.0],
+            origin: [0.0, 0.0],
+            pixels_per_unit: 1.0,
+        };
+        let bytes = main_uniform_upload_bytes(&render_plan, &canvas, &view, None, stride);
         let first =
             bytemuck::from_bytes::<Live2dUniform>(&bytes[..std::mem::size_of::<Live2dUniform>()]);
         let second_offset = stride as usize;
@@ -3148,7 +3152,7 @@ mod tests {
         assert_eq!(bytes.len(), stride as usize * render_plan.draws.len());
         assert_eq!(first.effect, [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(second.effect, [0.4, 0.5, 0.6, 0.7]);
-        assert_eq!(second.viewport, [320.0, 240.0, 0.0, 0.0]);
+        assert_eq!(second.viewport, [320.0, 240.0, 2.0, 0.0]);
         assert_eq!(second.view_transform, view.transform);
     }
 
