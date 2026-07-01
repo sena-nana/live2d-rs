@@ -43,6 +43,8 @@ extern "C" {
     pub fn csmUpdateModel(model: *mut CsmModel);
     pub fn csmGetParameterCount(model: *const CsmModel) -> c_int;
     pub fn csmGetParameterIds(model: *const CsmModel) -> *const *const c_char;
+    pub fn csmGetParameterMinimumValues(model: *const CsmModel) -> *const f32;
+    pub fn csmGetParameterMaximumValues(model: *const CsmModel) -> *const f32;
     pub fn csmGetParameterDefaultValues(model: *const CsmModel) -> *const f32;
     pub fn csmGetParameterValues(model: *mut CsmModel) -> *mut f32;
     pub fn csmReadCanvasInfo(

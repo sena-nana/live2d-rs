@@ -19,6 +19,36 @@ pub use motion::{Live2DMotion, MotionEvaluation};
 #[cfg(not(feature = "live2d-cubism"))]
 const RUNTIME_UNAVAILABLE: &str = "live2d_runtime_unavailable";
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ParameterId(pub String);
+
+impl From<String> for ParameterId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ParameterId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl AsRef<str> for ParameterId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParameterInfo {
+    pub id: ParameterId,
+    pub minimum: f32,
+    pub maximum: f32,
+    pub default: f32,
+    pub value: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelFiles {
     pub model_json_path: PathBuf,
@@ -86,6 +116,51 @@ impl Live2DInstance {
         &self.snapshot
     }
 
+    pub fn parameters(&self) -> Result<Vec<ParameterInfo>, String> {
+        #[cfg(feature = "live2d-cubism")]
+        {
+            return self.model.parameters();
+        }
+        #[cfg(not(feature = "live2d-cubism"))]
+        {
+            Err(RUNTIME_UNAVAILABLE.into())
+        }
+    }
+
+    pub fn parameter(&self, id: impl AsRef<str>) -> Result<Option<ParameterInfo>, String> {
+        let id = id.as_ref();
+        Ok(self
+            .parameters()?
+            .into_iter()
+            .find(|parameter| parameter.id.as_ref() == id))
+    }
+
+    pub fn set_parameter(&mut self, id: impl AsRef<str>, value: f32) -> Result<(), String> {
+        self.set_parameters(std::iter::once((id, value)))
+    }
+
+    pub fn set_parameters<I, S>(&mut self, parameters: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = (S, f32)>,
+        S: AsRef<str>,
+    {
+        #[cfg(feature = "live2d-cubism")]
+        {
+            let parameters = parameters
+                .into_iter()
+                .map(|(id, value)| (id.as_ref().to_owned(), value))
+                .collect::<Vec<_>>();
+            self.model.set_parameters(&parameters)?;
+            self.model.update_snapshot(&mut self.snapshot, 1.0)?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "live2d-cubism"))]
+        {
+            let _ = parameters.into_iter();
+            Err(RUNTIME_UNAVAILABLE.into())
+        }
+    }
+
     pub fn apply_motion(
         &mut self,
         motion: &Live2DMotion,
@@ -116,6 +191,19 @@ impl Live2DInstance {
             model_opacity: Some(1.0),
             parameters: Vec::new(),
         })
+    }
+
+    pub fn reset_parameters(&mut self) -> Result<(), String> {
+        #[cfg(feature = "live2d-cubism")]
+        {
+            self.model.reset_parameters()?;
+            self.model.update_snapshot(&mut self.snapshot, 1.0)?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "live2d-cubism"))]
+        {
+            Err(RUNTIME_UNAVAILABLE.into())
+        }
     }
 
     fn apply_evaluation(&mut self, evaluation: MotionEvaluation) -> Result<(), String> {
@@ -400,8 +488,7 @@ mod runtime {
         _moc_bytes: Vec<u8>,
         _model_bytes: Vec<u8>,
         model: *mut live2d_sys::CsmModel,
-        parameter_ids: Vec<String>,
-        parameter_defaults: Vec<f32>,
+        parameters: Vec<ParameterInfo>,
         canvas: CanvasInfo,
         art_meshes: Vec<ArtMeshInfo>,
         drawable_metas: Vec<DrawableStaticMeta>,
@@ -462,26 +549,62 @@ mod runtime {
                 return Err("live2d_model_initialization_failed".into());
             }
             unsafe { live2d_sys::csmUpdateModel(model) };
-            let (parameter_ids, parameter_defaults) = unsafe { read_parameters(model)? };
+            let parameters = unsafe { read_parameters(model)? };
             let (canvas, drawable_metas, art_meshes) = unsafe { read_static_model(model)? };
             Ok(Self {
                 _moc_bytes: moc_bytes,
                 _model_bytes: model_bytes,
                 model,
-                parameter_ids,
-                parameter_defaults,
+                parameters,
                 canvas,
                 art_meshes,
                 drawable_metas,
             })
         }
 
-        pub(crate) fn reset_parameters(&mut self) -> Result<(), String> {
-            let values = unsafe { parameter_values_mut(self.model, self.parameter_ids.len())? };
-            if values.len() != self.parameter_defaults.len() {
+        pub(crate) fn parameters(&self) -> Result<Vec<ParameterInfo>, String> {
+            let values = unsafe { parameter_values(self.model, self.parameters.len())? };
+            if values.len() != self.parameters.len() {
                 return Err("live2d_parameter_table_changed".into());
             }
-            values.copy_from_slice(&self.parameter_defaults);
+            Ok(self
+                .parameters
+                .iter()
+                .zip(values.iter())
+                .map(|(parameter, value)| {
+                    let mut parameter = parameter.clone();
+                    parameter.value = *value;
+                    parameter
+                })
+                .collect())
+        }
+
+        pub(crate) fn reset_parameters(&mut self) -> Result<(), String> {
+            let values = unsafe { parameter_values_mut(self.model, self.parameters.len())? };
+            if values.len() != self.parameters.len() {
+                return Err("live2d_parameter_table_changed".into());
+            }
+            for (value, parameter) in values.iter_mut().zip(self.parameters.iter()) {
+                *value = parameter.default;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn set_parameters(
+            &mut self,
+            parameters: &[(String, f32)],
+        ) -> Result<(), String> {
+            if parameters.is_empty() {
+                return Ok(());
+            }
+            let writes = self.checked_parameter_writes(parameters)?;
+            let values = unsafe { parameter_values_mut(self.model, self.parameters.len())? };
+            if values.len() != self.parameters.len() {
+                return Err("live2d_parameter_table_changed".into());
+            }
+            for (index, value) in writes {
+                values[index] = value;
+            }
             Ok(())
         }
 
@@ -495,17 +618,36 @@ mod runtime {
             let writes = parameters
                 .iter()
                 .filter_map(|(id, value)| {
-                    self.parameter_ids
+                    self.parameters
                         .iter()
-                        .position(|candidate| candidate == id)
+                        .position(|candidate| candidate.id.as_ref() == id)
                         .map(|index| (index, *value))
                 })
                 .collect::<Vec<_>>();
-            let values = unsafe { parameter_values_mut(self.model, self.parameter_ids.len())? };
+            let values = unsafe { parameter_values_mut(self.model, self.parameters.len())? };
             for (index, value) in writes {
                 values[index] = value;
             }
             Ok(())
+        }
+
+        fn checked_parameter_writes(
+            &self,
+            parameters: &[(String, f32)],
+        ) -> Result<Vec<(usize, f32)>, String> {
+            let mut writes = Vec::with_capacity(parameters.len());
+            for (id, value) in parameters {
+                let Some(index) = self
+                    .parameters
+                    .iter()
+                    .position(|parameter| parameter.id.as_ref() == id)
+                else {
+                    return Err("live2d_parameter_not_found".into());
+                };
+                let parameter = &self.parameters[index];
+                writes.push((index, value.max(parameter.minimum).min(parameter.maximum)));
+            }
+            Ok(writes)
         }
 
         pub(crate) fn snapshot(
@@ -530,9 +672,10 @@ mod runtime {
             &mut self,
             snapshot: &mut ModelSnapshot,
             model_opacity: f32,
-        ) -> Result<SnapshotCopyStats, String> {
+        ) -> Result<(), String> {
             unsafe { live2d_sys::csmUpdateModel(self.model) };
-            self.refresh_snapshot_drawables(snapshot, model_opacity)
+            self.refresh_snapshot_drawables(snapshot, model_opacity)?;
+            Ok(())
         }
 
         #[cfg(feature = "probe")]
@@ -541,7 +684,7 @@ mod runtime {
             snapshot: &mut ModelSnapshot,
             model_opacity: f32,
             probe: &P,
-        ) -> Result<SnapshotCopyStats, String>
+        ) -> Result<(), String>
         where
             P: ProbeSink,
         {
@@ -579,7 +722,7 @@ mod runtime {
                 stats.bytes as u64,
                 Vec::new(),
             );
-            Ok(stats)
+            Ok(())
         }
 
         fn empty_drawables(&self) -> Vec<Drawable> {
@@ -862,27 +1005,61 @@ mod runtime {
 
     unsafe fn read_parameters(
         model: *mut live2d_sys::CsmModel,
-    ) -> Result<(Vec<String>, Vec<f32>), String> {
+    ) -> Result<Vec<ParameterInfo>, String> {
         let count = live2d_sys::csmGetParameterCount(model).max(0) as usize;
         if count == 0 {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Vec::new());
         }
         let ids = live2d_sys::csmGetParameterIds(model);
+        let minimums = live2d_sys::csmGetParameterMinimumValues(model);
+        let maximums = live2d_sys::csmGetParameterMaximumValues(model);
         let defaults = live2d_sys::csmGetParameterDefaultValues(model);
-        if ids.is_null() || defaults.is_null() {
+        let values = live2d_sys::csmGetParameterValues(model);
+        if ids.is_null()
+            || minimums.is_null()
+            || maximums.is_null()
+            || defaults.is_null()
+            || values.is_null()
+        {
             return Err("live2d_parameter_table_unavailable".into());
         }
         let id_slice = std::slice::from_raw_parts(ids, count);
+        let minimum_slice = std::slice::from_raw_parts(minimums, count);
+        let maximum_slice = std::slice::from_raw_parts(maximums, count);
         let default_slice = std::slice::from_raw_parts(defaults, count);
-        let mut parameter_ids = Vec::with_capacity(count);
-        for id in id_slice {
-            if id.is_null() {
-                parameter_ids.push(String::new());
+        let value_slice = std::slice::from_raw_parts(values, count);
+        let mut parameters = Vec::with_capacity(count);
+        for index in 0..count {
+            let id = if id_slice[index].is_null() {
+                String::new()
             } else {
-                parameter_ids.push(CStr::from_ptr(*id).to_string_lossy().into_owned());
-            }
+                CStr::from_ptr(id_slice[index])
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            parameters.push(ParameterInfo {
+                id: ParameterId(id),
+                minimum: minimum_slice[index],
+                maximum: maximum_slice[index],
+                default: default_slice[index],
+                value: value_slice[index],
+            });
         }
-        Ok((parameter_ids, default_slice.to_vec()))
+        Ok(parameters)
+    }
+
+    unsafe fn parameter_values(
+        model: *mut live2d_sys::CsmModel,
+        count: usize,
+    ) -> Result<&'static [f32], String> {
+        if count == 0 {
+            return Ok(&[]);
+        }
+        let values = live2d_sys::csmGetParameterValues(model);
+        if values.is_null() {
+            return Err("live2d_parameter_values_unavailable".into());
+        }
+        Ok(std::slice::from_raw_parts(values, count))
     }
 
     unsafe fn parameter_values_mut(
@@ -1042,6 +1219,7 @@ mod runtime {
         ))
     }
 
+    #[cfg(feature = "probe")]
     unsafe fn snapshot_model(
         model: *mut live2d_sys::CsmModel,
         model_opacity: f32,
@@ -1334,6 +1512,68 @@ mod tests {
         assert_eq!(result.unwrap_err(), "live2d_runtime_unavailable");
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "live2d-cubism")]
+    fn sdk_parameter_write_refreshes_snapshot_when_test_model_is_available() -> Result<(), String> {
+        let Ok(model_path) = std::env::var("LIVE2D_CUBISM_TEST_MODEL") else {
+            return Ok(());
+        };
+        let mut instance = Live2DInstance::load_file(model_path)?;
+        let initial_drawables = instance.snapshot().drawables.clone();
+        let parameters = instance.parameters()?;
+
+        for parameter in parameters.iter().filter(|parameter| {
+            parameter.minimum.is_finite()
+                && parameter.maximum.is_finite()
+                && parameter.minimum < parameter.maximum
+        }) {
+            let target = if (parameter.value - parameter.minimum).abs() > 0.001 {
+                parameter.minimum
+            } else {
+                parameter.maximum
+            };
+            instance.set_parameter(parameter.id.as_ref(), target)?;
+            let current = instance
+                .parameter(parameter.id.as_ref())?
+                .ok_or_else(|| "live2d_parameter_not_found".to_string())?
+                .value;
+            assert_close(current, target);
+
+            if snapshot_vertices_changed(&initial_drawables, &instance.snapshot().drawables) {
+                return Ok(());
+            }
+            instance.reset_parameters()?;
+        }
+
+        Err("live2d_parameter_snapshot_unchanged".into())
+    }
+
+    #[cfg(feature = "live2d-cubism")]
+    fn snapshot_vertices_changed(before: &[Drawable], after: &[Drawable]) -> bool {
+        before.iter().any(|before_drawable| {
+            let Some(after_drawable) = after
+                .iter()
+                .find(|after_drawable| after_drawable.id == before_drawable.id)
+            else {
+                return true;
+            };
+            before_drawable.vertices.len() != after_drawable.vertices.len()
+                || before_drawable
+                    .vertices
+                    .iter()
+                    .zip(after_drawable.vertices.iter())
+                    .any(|(before_vertex, after_vertex)| {
+                        (before_vertex.position[0] - after_vertex.position[0]).abs() > 0.001
+                            || (before_vertex.position[1] - after_vertex.position[1]).abs() > 0.001
+                    })
+        })
+    }
+
+    #[cfg(feature = "live2d-cubism")]
+    fn assert_close(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < 0.001);
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
