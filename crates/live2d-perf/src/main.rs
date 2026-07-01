@@ -108,7 +108,7 @@ fn print_help() {
     println!(
         "blend profiles: classic-mix, advanced-colors, advanced-alphas, advanced-matrix, all-modes"
     );
-    println!("compare: live2d-perf compare-revs --before faccc70 --after HEAD --threshold 15 --frames 300 [--samples 2]");
+    println!("compare: live2d-perf compare-revs --before faccc70 --after HEAD --threshold 15 --frames 300 [--samples 2] [--model <path>] [--motion-group <name>]");
 }
 
 fn uses_synthetic_config(scenario: &str) -> bool {
@@ -163,7 +163,8 @@ struct CompareRevsSummary {
 struct ScenarioCompareResult {
     scenario: String,
     classic: CompareSummary,
-    advanced: AdvancedCheck,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advanced: Option<AdvancedCheck>,
     reports: ScenarioReportPaths,
 }
 
@@ -171,7 +172,8 @@ struct ScenarioCompareResult {
 struct ScenarioReportPaths {
     before_classic: String,
     after_classic: String,
-    after_all_modes: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after_all_modes: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -190,6 +192,11 @@ fn run_compare_revs(args: &[String]) -> Result<(), String> {
     let before = value_arg(args, "--before").unwrap_or_else(|| "faccc70".to_owned());
     let after = value_arg(args, "--after").unwrap_or_else(|| "HEAD".to_owned());
     let profile = value_arg(args, "--profile").unwrap_or_else(|| "medium".to_owned());
+    let model = value_arg(args, "--model");
+    let motion_group = value_arg(args, "--motion-group");
+    if motion_group.is_some() && model.is_none() {
+        return Err("--motion-group requires --model <path> for compare-revs".to_owned());
+    }
     let frames = value_arg(args, "--frames")
         .unwrap_or_else(|| "300".to_owned())
         .parse::<usize>()
@@ -234,73 +241,87 @@ fn run_compare_revs(args: &[String]) -> Result<(), String> {
     let mut results = Vec::new();
     let mut warnings = Vec::new();
     let mut regressions = Vec::new();
-    for &scenario in compare_scenarios() {
-        let stages = stages_for_scenario(scenario);
+    let params = CompareRunParams {
+        profile: &profile,
+        frames,
+        model: model.as_deref(),
+        motion_group: motion_group.as_deref(),
+    };
+    for scenario in compare_scenarios(model.is_some()) {
+        let scenario_name = scenario.name;
         let before_copy = run_best_report_sample(
             before_worktree.path.as_path(),
             false,
             scenario,
-            &profile,
-            frames,
+            &params,
             None,
             samples,
             &out_dir,
-            &format!("{scenario}-before-classic"),
-            stages,
+            &format!("{scenario_name}-before-classic"),
         )?;
         let after_classic_copy = run_best_report_sample(
             after_dir,
             after_worktree.is_none(),
             scenario,
-            &profile,
-            frames,
-            Some("classic-mix"),
+            &params,
+            scenario.classic_blend_profile(),
             samples,
             &out_dir,
-            &format!("{scenario}-after-classic"),
-            stages,
+            &format!("{scenario_name}-after-classic"),
         )?;
-        let after_all_copy = run_best_report_sample(
+        let after_all_copy = run_advanced_report(
             after_dir,
             after_worktree.is_none(),
             scenario,
-            &profile,
-            frames,
-            Some("all-modes"),
-            1,
+            &params,
             &out_dir,
-            &format!("{scenario}-after-all-modes"),
-            stages,
         )?;
 
-        let before_report = read_report(&before_copy)?;
-        let after_classic_report = read_report(&after_classic_copy)?;
-        let after_all_report = read_report(&after_all_copy)?;
+        let before_report = read_report_with_warnings(
+            &before_copy,
+            &mut warnings,
+            &format!("{scenario_name}:before:{before}"),
+        )?;
+        let after_classic_name = scenario.after_classic_name(&after);
+        let after_classic_report =
+            read_report_with_warnings(&after_classic_copy, &mut warnings, &after_classic_name)?;
         let classic = compare_reports(
-            format!("{scenario}:before:{before}"),
+            format!("{scenario_name}:before:{before}"),
             &before_report,
-            format!("{scenario}:after:{after}:classic-mix"),
+            after_classic_name,
             &after_classic_report,
             threshold_percent,
-            stages,
+            scenario.stages,
         );
         warnings.extend(classic.warnings.iter().cloned());
         regressions.extend(classic.regressions.iter().cloned());
 
-        let advanced = advanced_check(scenario, &after_all_report);
-        warnings.extend(advanced.warnings.iter().cloned());
-        if !advanced.passed {
-            regressions.push(format!("{scenario} all-modes coverage/probe check failed"));
-        }
+        let advanced = if let Some(after_all_copy) = &after_all_copy {
+            let after_all_report = read_report_with_warnings(
+                after_all_copy,
+                &mut warnings,
+                &format!("{scenario_name}:after:{after}:all-modes"),
+            )?;
+            let advanced = advanced_check(scenario_name, &after_all_report);
+            warnings.extend(advanced.warnings.iter().cloned());
+            if !advanced.passed {
+                regressions.push(format!(
+                    "{scenario_name} all-modes coverage/probe check failed"
+                ));
+            }
+            Some(advanced)
+        } else {
+            None
+        };
 
         results.push(ScenarioCompareResult {
-            scenario: scenario.to_owned(),
+            scenario: scenario_name.to_owned(),
             classic,
             advanced,
             reports: ScenarioReportPaths {
                 before_classic: before_copy.display().to_string(),
                 after_classic: after_classic_copy.display().to_string(),
-                after_all_modes: after_all_copy.display().to_string(),
+                after_all_modes: after_all_copy.map(|path| path.display().to_string()),
             },
         });
     }
@@ -347,6 +368,58 @@ struct ChildReport {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct CompareScenario {
+    name: &'static str,
+    stages: &'static [Stage],
+    kind: CompareScenarioKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompareScenarioKind {
+    Synthetic,
+    #[cfg(feature = "wgpu")]
+    Wgpu,
+    RealModel,
+}
+
+impl CompareScenario {
+    fn classic_blend_profile(self) -> Option<&'static str> {
+        self.run_advanced_check().then_some("classic-mix")
+    }
+
+    fn after_classic_name(self, after: &str) -> String {
+        match self.classic_blend_profile() {
+            Some(blend_profile) => format!("{}:after:{after}:{blend_profile}", self.name),
+            None => format!("{}:after:{after}", self.name),
+        }
+    }
+
+    fn cargo_feature(self) -> Option<&'static str> {
+        match self.kind {
+            CompareScenarioKind::Synthetic => None,
+            #[cfg(feature = "wgpu")]
+            CompareScenarioKind::Wgpu => Some("wgpu"),
+            CompareScenarioKind::RealModel => Some("live2d-cubism"),
+        }
+    }
+
+    fn uses_real_model(self) -> bool {
+        self.kind == CompareScenarioKind::RealModel
+    }
+
+    fn run_advanced_check(self) -> bool {
+        self.kind != CompareScenarioKind::RealModel
+    }
+}
+
+struct CompareRunParams<'a> {
+    profile: &'a str,
+    frames: usize,
+    model: Option<&'a str>,
+    motion_group: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum PerfCommandMode {
     Cargo,
     CurrentExe,
@@ -355,17 +428,16 @@ enum PerfCommandMode {
 fn run_perf_child(
     cwd: &Path,
     mode: PerfCommandMode,
-    scenario: &str,
-    profile: &str,
-    frames: usize,
+    scenario: CompareScenario,
+    params: &CompareRunParams<'_>,
     blend_profile: Option<&str>,
 ) -> Result<ChildReport, String> {
     let mut command = match mode {
         PerfCommandMode::Cargo => {
             let mut command = Command::new("cargo");
             command.arg("run").arg("-p").arg("live2d-perf");
-            if scenario.starts_with("wgpu-") {
-                command.arg("--features").arg("wgpu");
+            if let Some(feature) = scenario.cargo_feature() {
+                command.arg("--features").arg(feature);
             }
             command.arg("--");
             command
@@ -374,34 +446,44 @@ fn run_perf_child(
             env::current_exe().map_err(|err| format!("failed to locate current exe: {err}"))?,
         ),
     };
-    command.current_dir(cwd).arg(scenario);
-    command.arg("--profile").arg(profile);
-    command.arg("--frames").arg(frames.to_string());
+    command.current_dir(cwd).arg(scenario.name);
+    command.arg("--profile").arg(params.profile);
+    command.arg("--frames").arg(params.frames.to_string());
     if let Some(blend_profile) = blend_profile {
         command.arg("--blend-profile").arg(blend_profile);
     }
-    let output = command
-        .output()
-        .map_err(|err| format!("failed to run live2d-perf {mode:?} for {scenario}: {err}"))?;
+    if scenario.uses_real_model() {
+        let model = params
+            .model
+            .ok_or_else(|| format!("{} requires --model <path>", scenario.name))?;
+        command.arg("--model").arg(model);
+        if let Some(motion_group) = params.motion_group {
+            command.arg("--motion-group").arg(motion_group);
+        }
+    }
+    let output = command.output().map_err(|err| {
+        format!(
+            "failed to run live2d-perf {mode:?} for {}: {err}",
+            scenario.name
+        )
+    })?;
     if !output.status.success() {
         return Err(format_command_failure("live2d-perf child run", &output));
     }
     Ok(ChildReport {
-        report_path: child_report_path(cwd, scenario, &output)?,
+        report_path: child_report_path(cwd, scenario.name, &output)?,
     })
 }
 
 fn run_best_report_sample(
     cwd: &Path,
     use_current_exe: bool,
-    scenario: &str,
-    profile: &str,
-    frames: usize,
+    scenario: CompareScenario,
+    params: &CompareRunParams<'_>,
     blend_profile: Option<&str>,
     samples: usize,
     out_dir: &Path,
     label: &str,
-    stages: &[Stage],
 ) -> Result<PathBuf, String> {
     let mut best: Option<(u128, PathBuf)> = None;
     let mode = if use_current_exe {
@@ -410,14 +492,14 @@ fn run_best_report_sample(
         PerfCommandMode::Cargo
     };
     for sample in 0..samples.max(1) {
-        let child = run_perf_child(cwd, mode, scenario, profile, frames, blend_profile)?;
+        let child = run_perf_child(cwd, mode, scenario, params, blend_profile)?;
         let sample_path = copy_report(
             &child.report_path,
             out_dir,
             &format!("{label}-sample-{}.json", sample + 1),
         )?;
         let report = read_report(&sample_path)?;
-        let score = report_score(&report, stages);
+        let score = report_score(&report, scenario.stages);
         if best
             .as_ref()
             .map(|(best_score, _)| score < *best_score)
@@ -428,6 +510,29 @@ fn run_best_report_sample(
     }
     best.map(|(_, path)| path)
         .ok_or_else(|| format!("{label} did not produce any report samples"))
+}
+
+fn run_advanced_report(
+    cwd: &Path,
+    use_current_exe: bool,
+    scenario: CompareScenario,
+    params: &CompareRunParams<'_>,
+    out_dir: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if !scenario.run_advanced_check() {
+        return Ok(None);
+    }
+    run_best_report_sample(
+        cwd,
+        use_current_exe,
+        scenario,
+        params,
+        Some("all-modes"),
+        1,
+        out_dir,
+        &format!("{}-after-all-modes", scenario.name),
+    )
+    .map(Some)
 }
 
 fn child_report_path(cwd: &Path, scenario: &str, output: &Output) -> Result<PathBuf, String> {
@@ -467,6 +572,16 @@ fn read_report(path: &Path) -> Result<RunReport, String> {
         .map_err(|err| format!("failed to parse report {}: {err}", path.display()))
 }
 
+fn read_report_with_warnings(
+    path: &Path,
+    warnings: &mut Vec<String>,
+    label: &str,
+) -> Result<RunReport, String> {
+    let report = read_report(path)?;
+    collect_report_warnings(warnings, label, &report);
+    Ok(report)
+}
+
 fn copy_report(src: &Path, out_dir: &Path, file_name: &str) -> Result<PathBuf, String> {
     let dst = out_dir.join(sanitize_filename(file_name));
     fs::copy(src, &dst).map_err(|err| {
@@ -479,41 +594,59 @@ fn copy_report(src: &Path, out_dir: &Path, file_name: &str) -> Result<PathBuf, S
     Ok(dst)
 }
 
-fn stages_for_scenario(scenario: &str) -> &'static [Stage] {
-    match scenario {
-        "synthetic-render-plan" => &[
-            Stage::RenderPlanTotal,
-            Stage::RenderMaskDedup,
-            Stage::RenderDrawCommandBuild,
-        ],
-        "dispatch-null-backend" => &[Stage::RenderPlanTotal, Stage::RenderDispatchTotal],
-        "motion-update" => &[Stage::RuntimeMotionUpdate],
-        "wgpu-warm" => &[
-            Stage::WgpuPrepareRender,
-            Stage::WgpuMainPassEncode,
-            Stage::WgpuQueueSubmit,
-        ],
-        _ => &[Stage::RenderPlanTotal],
+fn collect_report_warnings(warnings: &mut Vec<String>, label: &str, report: &RunReport) {
+    for warning in &report.warnings {
+        warnings.push(format!("{label}: {warning}"));
     }
 }
 
 #[cfg(feature = "wgpu")]
-fn compare_scenarios() -> &'static [&'static str] {
-    &[
-        "synthetic-render-plan",
-        "dispatch-null-backend",
-        "motion-update",
-        "wgpu-warm",
-    ]
+fn append_wgpu_compare_scenarios(scenarios: &mut Vec<CompareScenario>) {
+    scenarios.push(CompareScenario {
+        name: "wgpu-warm",
+        stages: &[
+            Stage::WgpuPrepareRender,
+            Stage::WgpuMainPassEncode,
+            Stage::WgpuQueueSubmit,
+        ],
+        kind: CompareScenarioKind::Wgpu,
+    });
 }
 
 #[cfg(not(feature = "wgpu"))]
-fn compare_scenarios() -> &'static [&'static str] {
-    &[
-        "synthetic-render-plan",
-        "dispatch-null-backend",
-        "motion-update",
-    ]
+fn append_wgpu_compare_scenarios(_scenarios: &mut Vec<CompareScenario>) {}
+
+fn compare_scenarios(include_real_model_motion: bool) -> Vec<CompareScenario> {
+    let mut scenarios = vec![
+        CompareScenario {
+            name: "synthetic-render-plan",
+            stages: &[
+                Stage::RenderPlanTotal,
+                Stage::RenderMaskDedup,
+                Stage::RenderDrawCommandBuild,
+            ],
+            kind: CompareScenarioKind::Synthetic,
+        },
+        CompareScenario {
+            name: "dispatch-null-backend",
+            stages: &[Stage::RenderPlanTotal, Stage::RenderDispatchTotal],
+            kind: CompareScenarioKind::Synthetic,
+        },
+        CompareScenario {
+            name: "motion-update",
+            stages: &[Stage::RuntimeMotionUpdate],
+            kind: CompareScenarioKind::Synthetic,
+        },
+    ];
+    append_wgpu_compare_scenarios(&mut scenarios);
+    if include_real_model_motion {
+        scenarios.push(CompareScenario {
+            name: "real-model-motion",
+            stages: &[Stage::RuntimeMotionUpdate],
+            kind: CompareScenarioKind::RealModel,
+        });
+    }
+    scenarios
 }
 
 fn advanced_check(scenario: &str, report: &RunReport) -> AdvancedCheck {
@@ -620,16 +753,18 @@ fn compare_markdown(summary: &CompareRevsSummary) -> String {
             ));
         }
         output.push('\n');
-        output.push_str(&format!(
-            "Advanced coverage: colors={}/16, alphas={}/5, advanced_draws={}, wgpu_draws={}, wgpu_copies={}, wgpu_pipelines={}, passed={}\n\n",
-            result.advanced.color_modes,
-            result.advanced.alpha_modes,
-            result.advanced.advanced_draws,
-            result.advanced.wgpu_advanced_draw_calls,
-            result.advanced.wgpu_advanced_copy_operations,
-            result.advanced.wgpu_pipeline_count,
-            result.advanced.passed
-        ));
+        if let Some(advanced) = &result.advanced {
+            output.push_str(&format!(
+                "Advanced coverage: colors={}/16, alphas={}/5, advanced_draws={}, wgpu_draws={}, wgpu_copies={}, wgpu_pipelines={}, passed={}\n\n",
+                advanced.color_modes,
+                advanced.alpha_modes,
+                advanced.advanced_draws,
+                advanced.wgpu_advanced_draw_calls,
+                advanced.wgpu_advanced_copy_operations,
+                advanced.wgpu_pipeline_count,
+                advanced.passed
+            ));
+        }
     }
     if !summary.warnings.is_empty() {
         output.push_str("## Warnings\n\n");
