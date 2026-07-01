@@ -3,7 +3,7 @@ use crate::probe::{read_timestamp_values, record_gpu_pass_nanos, GpuTimestampFra
 use crate::{
     api::{WgpuLive2DTarget, WgpuLive2DView, WgpuTextureSampling},
     mask::{create_empty_mask_bind_group, mask_uniform_slots},
-    pipeline::PipelineCache,
+    pipeline::{OffscreenCompositePipelines, PipelineCache},
     post_process::{WgpuPostProcessChain, WgpuPostProcessError},
     resources::{
         create_empty_sampled_texture_bind_group, BlendCopyTarget, GpuScene, MaskAtlas,
@@ -24,12 +24,13 @@ pub struct WgpuLive2DRenderer {
     pub(crate) pipelines: PipelineCache,
     pub(crate) uniform_layout: wgpu::BindGroupLayout,
     pub(crate) texture_layout: wgpu::BindGroupLayout,
+    pub(crate) offscreen_uniform_layout: wgpu::BindGroupLayout,
     pub(crate) sampler: wgpu::Sampler,
     pub(crate) nearest_sampler: wgpu::Sampler,
     pub(crate) texture_sampling: WgpuTextureSampling,
     pub(crate) fallback_mask_bind_group: wgpu::BindGroup,
     pub(crate) fallback_blend_bind_group: wgpu::BindGroup,
-    pub(crate) offscreen_composite_pipeline: wgpu::RenderPipeline,
+    pub(crate) offscreen_composite_pipelines: OffscreenCompositePipelines,
     pub(crate) uniform_buffer: wgpu::Buffer,
     pub(crate) uniform_bind_group: wgpu::BindGroup,
     pub(crate) uniform_stride: u64,
@@ -112,52 +113,19 @@ impl WgpuLive2DRenderer {
                 },
             ],
         });
-        let offscreen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Live2D Offscreen Composite Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("offscreen.wgsl").into()),
-        });
-        let offscreen_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Live2D Offscreen Composite Pipeline Layout"),
-                bind_group_layouts: &[Some(&texture_layout)],
-                immediate_size: 0,
-            });
-        let offscreen_composite_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Live2D Offscreen Composite Pipeline"),
-                layout: Some(&offscreen_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &offscreen_shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[],
-                },
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &offscreen_shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
+        let offscreen_uniform_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Live2D Offscreen Composite Uniform Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
             });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Live2D Sampler"),
@@ -186,6 +154,22 @@ impl WgpuLive2DRenderer {
             immediate_size: 0,
         });
         let pipelines = PipelineCache::new(device, &pipeline_layout, &shader, format);
+        let offscreen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Live2D Offscreen Composite Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("offscreen.wgsl").into()),
+        });
+        let offscreen_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Live2D Offscreen Composite Pipeline Layout"),
+                bind_group_layouts: &[Some(&texture_layout), Some(&offscreen_uniform_layout)],
+                immediate_size: 0,
+            });
+        let offscreen_composite_pipelines = OffscreenCompositePipelines::new(
+            device,
+            &offscreen_pipeline_layout,
+            &offscreen_shader,
+            format,
+        );
         let fallback_mask_bind_group =
             create_empty_mask_bind_group(device, &texture_layout, &sampler);
         let fallback_blend_bind_group =
@@ -195,12 +179,13 @@ impl WgpuLive2DRenderer {
             pipelines,
             uniform_layout: bind_group_layout,
             texture_layout,
+            offscreen_uniform_layout,
             sampler,
             nearest_sampler,
             texture_sampling: WgpuTextureSampling::default(),
             fallback_mask_bind_group,
             fallback_blend_bind_group,
-            offscreen_composite_pipeline,
+            offscreen_composite_pipelines,
             uniform_buffer,
             uniform_bind_group,
             uniform_stride,

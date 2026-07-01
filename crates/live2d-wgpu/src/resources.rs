@@ -47,6 +47,8 @@ pub(crate) struct OffscreenTarget {
     pub(crate) texture: wgpu::Texture,
     pub(crate) view: wgpu::TextureView,
     pub(crate) bind_group: wgpu::BindGroup,
+    pub(crate) composite_uniform_buffer: wgpu::Buffer,
+    pub(crate) composite_uniform_bind_group: wgpu::BindGroup,
 }
 
 pub(crate) struct BlendCopyTarget {
@@ -77,6 +79,7 @@ impl WgpuLive2DRenderer {
                     create_offscreen_target(
                         device,
                         &self.texture_layout,
+                        &self.offscreen_uniform_layout,
                         &self.sampler,
                         self.pipelines.target_format,
                         width,
@@ -104,6 +107,7 @@ impl WgpuLive2DRenderer {
             self.offscreen_target = Some(create_offscreen_target(
                 device,
                 &self.texture_layout,
+                &self.offscreen_uniform_layout,
                 &self.sampler,
                 self.pipelines.target_format,
                 width,
@@ -205,7 +209,8 @@ pub(crate) fn create_empty_sampled_texture_bind_group(
 
 pub(crate) fn create_offscreen_target(
     device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
+    texture_layout: &wgpu::BindGroupLayout,
+    uniform_layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     format: wgpu::TextureFormat,
     width: u32,
@@ -229,13 +234,29 @@ pub(crate) fn create_offscreen_target(
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind_group = create_sampled_texture_bind_group(device, layout, sampler, &view);
+    let bind_group = create_sampled_texture_bind_group(device, texture_layout, sampler, &view);
+    let composite_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Live2D Offscreen Composite Uniform"),
+        size: std::mem::size_of::<[f32; 4]>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let composite_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Live2D Offscreen Composite Uniform Bind Group"),
+        layout: uniform_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: composite_uniform_buffer.as_entire_binding(),
+        }],
+    });
     OffscreenTarget {
         width,
         height,
         texture,
         view,
         bind_group,
+        composite_uniform_buffer,
+        composite_uniform_bind_group,
     }
 }
 

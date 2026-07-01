@@ -10,6 +10,13 @@ pub(crate) struct PipelineCache {
     pub(crate) pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
 }
 
+pub(crate) struct OffscreenCompositePipelines {
+    normal: wgpu::RenderPipeline,
+    additive: wgpu::RenderPipeline,
+    multiplicative: wgpu::RenderPipeline,
+    advanced: wgpu::RenderPipeline,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PipelineKey {
     pub(crate) target_format: wgpu::TextureFormat,
@@ -125,6 +132,56 @@ impl PipelineCache {
             .expect("Live2D mask writer pipeline is prebuilt")
     }
 }
+
+impl OffscreenCompositePipelines {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            normal: create_offscreen_composite_pipeline(
+                device,
+                layout,
+                shader,
+                target_format,
+                PipelineBlendMode::Normal,
+            ),
+            additive: create_offscreen_composite_pipeline(
+                device,
+                layout,
+                shader,
+                target_format,
+                PipelineBlendMode::Additive,
+            ),
+            multiplicative: create_offscreen_composite_pipeline(
+                device,
+                layout,
+                shader,
+                target_format,
+                PipelineBlendMode::Multiplicative,
+            ),
+            advanced: create_offscreen_composite_pipeline(
+                device,
+                layout,
+                shader,
+                target_format,
+                PipelineBlendMode::Advanced,
+            ),
+        }
+    }
+
+    pub(crate) fn pipeline(&self, blend_mode: BlendMode) -> &wgpu::RenderPipeline {
+        match pipeline_blend_mode(blend_mode) {
+            PipelineBlendMode::Normal => &self.normal,
+            PipelineBlendMode::Additive => &self.additive,
+            PipelineBlendMode::Multiplicative => &self.multiplicative,
+            PipelineBlendMode::Advanced => &self.advanced,
+        }
+    }
+}
+
 pub(crate) fn blend_uniform(blend_mode: BlendMode) -> [u32; 4] {
     match blend_mode {
         BlendMode::Advanced { color, alpha } => {
@@ -214,6 +271,41 @@ pub(crate) fn create_live2d_pipeline(
             targets: &[Some(wgpu::ColorTargetState {
                 format: key.target_format,
                 blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn create_offscreen_composite_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    target_format: wgpu::TextureFormat,
+    blend_mode: PipelineBlendMode,
+) -> wgpu::RenderPipeline {
+    let label = format!("Live2D Offscreen Composite {:?} Pipeline", blend_mode);
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(&label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(live2d_blend_state(blend_mode)),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),

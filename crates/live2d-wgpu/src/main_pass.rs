@@ -423,28 +423,45 @@ impl WgpuLive2DRenderer {
                     let Some(offscreen) = self.model_offscreen_targets.get(&offscreen_index) else {
                         continue;
                     };
+                    let Some(offscreen_plan) = render_plan.offscreens.get(offscreen_index) else {
+                        continue;
+                    };
+                    if offscreen_plan.opacity <= 1e-6 {
+                        continue;
+                    }
+                    let composite_pipeline = self
+                        .offscreen_composite_pipelines
+                        .pipeline(offscreen_plan.blend_mode);
                     if let Some(parent_index) = active_offscreens.last().copied() {
                         if let Some(parent) = self.model_offscreen_targets.get(&parent_index) {
                             encode_offscreen_composite(
+                                queue,
                                 encoder,
                                 &parent.view,
                                 None,
                                 wgpu::LoadOp::Load,
                                 wgpu::StoreOp::Store,
-                                &self.offscreen_composite_pipeline,
+                                composite_pipeline,
                                 &offscreen.bind_group,
+                                &offscreen.composite_uniform_buffer,
+                                &offscreen.composite_uniform_bind_group,
+                                offscreen_plan.opacity,
                             );
                         }
                     } else {
                         let load_op = root_load_op(first_load_op, &mut root_loaded);
                         encode_offscreen_composite(
+                            queue,
                             encoder,
                             target_view,
                             resolve_target,
                             load_op,
                             store_op,
-                            &self.offscreen_composite_pipeline,
+                            composite_pipeline,
                             &offscreen.bind_group,
+                            &offscreen.composite_uniform_buffer,
+                            &offscreen.composite_uniform_bind_group,
+                            offscreen_plan.opacity,
                         );
                     }
                 }
@@ -652,6 +669,7 @@ fn encode_draw_run(
 }
 
 fn encode_offscreen_composite(
+    queue: &wgpu::Queue,
     encoder: &mut wgpu::CommandEncoder,
     target_view: &wgpu::TextureView,
     resolve_target: Option<&wgpu::TextureView>,
@@ -659,7 +677,15 @@ fn encode_offscreen_composite(
     store_op: wgpu::StoreOp,
     pipeline: &wgpu::RenderPipeline,
     bind_group: &wgpu::BindGroup,
+    uniform_buffer: &wgpu::Buffer,
+    uniform_bind_group: &wgpu::BindGroup,
+    opacity: f32,
 ) {
+    queue.write_buffer(
+        uniform_buffer,
+        0,
+        bytemuck::cast_slice(&[opacity.clamp(0.0, 1.0), 0.0, 0.0, 0.0]),
+    );
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("Live2D Offscreen Composite Pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -678,6 +704,7 @@ fn encode_offscreen_composite(
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
+    pass.set_bind_group(1, uniform_bind_group, &[]);
     pass.draw(0..3, 0..1);
 }
 

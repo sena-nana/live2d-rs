@@ -1407,6 +1407,65 @@ mod tests {
     }
 
     #[test]
+    fn render_world_refreshes_offscreen_commands_when_object_order_changes() {
+        let mut arm = drawable("arm", 2, None);
+        arm.parent_part_index = Some(0);
+        let snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![drawable("body", 0, None), arm, drawable("outside", 3, None)],
+            offscreens: vec![Offscreen {
+                index: 0,
+                render_order: 1,
+                owner_part_index: Some(0),
+                opacity: 1.0,
+                blend_mode: BlendMode::Normal,
+                clipping: None,
+            }],
+            render_objects: vec![
+                RenderObject::Drawable(DrawableId::from("body")),
+                RenderObject::Offscreen(0),
+                RenderObject::Drawable(DrawableId::from("arm")),
+                RenderObject::Drawable(DrawableId::from("outside")),
+            ],
+            part_parent_indices: vec![None],
+        };
+        let mut world = RenderWorld::new();
+
+        assert_eq!(
+            world.build(&snapshot).commands,
+            vec![
+                RenderCommand::Draw { draw_index: 0 },
+                RenderCommand::BeginOffscreen { offscreen_index: 0 },
+                RenderCommand::Draw { draw_index: 1 },
+                RenderCommand::CompositeOffscreen { offscreen_index: 0 },
+                RenderCommand::Draw { draw_index: 2 },
+            ]
+        );
+
+        let mut moved = snapshot;
+        moved.render_objects = vec![
+            RenderObject::Drawable(DrawableId::from("body")),
+            RenderObject::Drawable(DrawableId::from("outside")),
+            RenderObject::Offscreen(0),
+            RenderObject::Drawable(DrawableId::from("arm")),
+        ];
+
+        assert_eq!(
+            world.build(&moved).commands,
+            vec![
+                RenderCommand::Draw { draw_index: 0 },
+                RenderCommand::Draw { draw_index: 2 },
+                RenderCommand::BeginOffscreen { offscreen_index: 0 },
+                RenderCommand::Draw { draw_index: 1 },
+                RenderCommand::CompositeOffscreen { offscreen_index: 0 },
+            ]
+        );
+    }
+
+    #[test]
     fn render_world_rebuilds_when_opacity_crosses_draw_threshold() {
         let mut snapshot = ModelSnapshot {
             model_key: "sample".into(),
