@@ -1,8 +1,8 @@
 use live2d_perf::{
     compare_reports, run_dispatch_null_backend, run_layered_motion, run_motion_update,
-    run_real_model_load, run_real_model_motion, run_real_model_render, run_render_plan,
-    run_render_world_switch, CompareSummary, RealModelRenderConfig, SyntheticBlendProfile,
-    SyntheticConfig,
+    run_real_model_load, run_real_model_motion, run_real_model_motion_diff, run_real_model_render,
+    run_render_plan, run_render_world_switch, CompareSummary, RealModelRenderConfig,
+    SyntheticBlendProfile, SyntheticConfig,
 };
 use live2d_probe::{RunReport, Stage, StageStats};
 use serde::Serialize;
@@ -78,6 +78,21 @@ fn run() -> Result<(), String> {
             let motion_group = value_arg(&args, "--motion-group");
             run_real_model_motion(Path::new(&model), config.frames, motion_group.as_deref())
         }
+        "real-model-motion-diff" => {
+            let model = value_arg(&args, "--model")
+                .ok_or_else(|| "real-model-motion-diff requires --model <path>".to_owned())?;
+            let motion = value_arg(&args, "--motion");
+            let expression = value_arg(&args, "--expression");
+            let frame = usize_arg(&args, "--frame", 0)?;
+            let dt = f32_arg(&args, "--dt", 1.0 / 60.0)?;
+            run_real_model_motion_diff(
+                Path::new(&model),
+                motion.as_deref().map(Path::new),
+                expression.as_deref().map(Path::new),
+                frame,
+                dt,
+            )
+        }
         "real-model-render" => {
             let model = value_arg(&args, "--model")
                 .ok_or_else(|| "real-model-render requires --model <path>".to_owned())?;
@@ -104,7 +119,7 @@ fn run() -> Result<(), String> {
         }
         _ => {
             return Err(format!(
-                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, real-model-load, real-model-motion, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, or wgpu-postprocess"
+                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, real-model-load, real-model-motion, real-model-motion-diff, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, or wgpu-postprocess"
             ));
         }
     };
@@ -120,8 +135,8 @@ fn run() -> Result<(), String> {
 }
 
 fn print_help() {
-    println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--blend-profile <name>] [--model <path>] [--motion-group <name>] [--warmup-frames <n>] [--width <px>] [--height <px>]");
-    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, real-model-load, real-model-motion, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, wgpu-postprocess, compare-revs");
+    println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--blend-profile <name>] [--model <path>] [--motion-group <name>] [--motion <path>] [--expression <path>] [--frame <n>] [--dt <seconds>] [--warmup-frames <n>] [--width <px>] [--height <px>]");
+    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, real-model-load, real-model-motion, real-model-motion-diff, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, wgpu-postprocess, compare-revs");
     println!("profiles: small, medium, large, mask-heavy, static-mask-heavy, texture-heavy, target-filter");
     println!(
         "blend profiles: classic-mix, advanced-colors, advanced-alphas, advanced-matrix, all-modes"
@@ -907,6 +922,23 @@ fn u32_arg(args: &[String], name: &str, default: u32) -> Result<u32, String> {
                 .map_err(|_| format!("{name} must be a positive integer"))
         })
         .unwrap_or(Ok(default.max(1)))
+}
+
+fn f32_arg(args: &[String], name: &str, default: f32) -> Result<f32, String> {
+    value_arg(args, name)
+        .map(|value| {
+            value
+                .parse::<f32>()
+                .map(|parsed| {
+                    if parsed.is_finite() {
+                        parsed.max(0.0)
+                    } else {
+                        default
+                    }
+                })
+                .map_err(|_| format!("{name} must be a finite number"))
+        })
+        .unwrap_or(Ok(default))
 }
 
 fn write_report(label: &str, report: &RunReport) -> Result<PathBuf, String> {

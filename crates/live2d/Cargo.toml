@@ -15,6 +15,7 @@ live2d-wgpu = { workspace = true, optional = true }
 [features]
 default = []
 wgpu = ["dep:live2d-wgpu"]
+exp3 = ["live2d-runtime/exp3"]
 live2d-cubism = ["live2d-runtime/live2d-cubism"]
 probe = [
     "dep:live2d-probe",

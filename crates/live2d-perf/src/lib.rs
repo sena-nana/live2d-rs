@@ -6,6 +6,8 @@ use live2d_probe::{counter, measure, ProbeAttr, ProbeRecorder, RunReport, Stage,
 use live2d_render::{
     DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlanner, RenderWorld,
 };
+#[cfg(all(feature = "exp3", feature = "live2d-cubism"))]
+use live2d_runtime::Live2DExpression;
 use live2d_runtime::{
     Live2DMotion, MotionBlendMode, MotionEvaluation, MotionLayerOptions, MotionMixer,
     MotionPlayOptions, MotionPlayer, MotionPriority, MotionStartResult,
@@ -1038,6 +1040,92 @@ pub fn run_real_model_motion(
     recorder.report("real-model-motion", config, warnings)
 }
 
+pub fn run_real_model_motion_diff(
+    model_path: &Path,
+    motion_path: Option<&Path>,
+    expression_path: Option<&Path>,
+    frame: usize,
+    dt: f32,
+) -> RunReport {
+    let recorder = ProbeRecorder::new();
+    let mut config = motion_diff_config(model_path, motion_path, expression_path, frame, dt);
+    let warnings = run_real_model_motion_diff_report(
+        model_path,
+        motion_path,
+        expression_path,
+        frame,
+        dt,
+        &recorder,
+        &mut config,
+    );
+    recorder.report("real-model-motion-diff", config, warnings)
+}
+
+#[cfg(feature = "live2d-cubism")]
+fn run_real_model_motion_diff_report(
+    model_path: &Path,
+    motion_path: Option<&Path>,
+    expression_path: Option<&Path>,
+    frame: usize,
+    dt: f32,
+    recorder: &ProbeRecorder,
+    config: &mut BTreeMap<String, String>,
+) -> Vec<String> {
+    run_real_model_motion_diff_inner(
+        model_path,
+        motion_path,
+        expression_path,
+        frame,
+        dt,
+        recorder,
+        config,
+    )
+    .unwrap_or_else(|err| vec![format!("real model motion diff failed: {err}")])
+}
+
+#[cfg(not(feature = "live2d-cubism"))]
+fn run_real_model_motion_diff_report(
+    model_path: &Path,
+    motion_path: Option<&Path>,
+    expression_path: Option<&Path>,
+    frame: usize,
+    dt: f32,
+    recorder: &ProbeRecorder,
+    config: &mut BTreeMap<String, String>,
+) -> Vec<String> {
+    let _ = (
+        model_path,
+        motion_path,
+        expression_path,
+        frame,
+        dt,
+        recorder,
+        config,
+    );
+    vec!["real-model-motion-diff requires `--features live2d-cubism`".to_owned()]
+}
+
+fn motion_diff_config(
+    model_path: &Path,
+    motion_path: Option<&Path>,
+    expression_path: Option<&Path>,
+    frame: usize,
+    dt: f32,
+) -> BTreeMap<String, String> {
+    let mut config = BTreeMap::from([
+        ("model".into(), model_path.display().to_string()),
+        ("frame".into(), frame.to_string()),
+        ("dt".into(), dt.to_string()),
+    ]);
+    if let Some(path) = motion_path {
+        config.insert("motion".into(), path.display().to_string());
+    }
+    if let Some(path) = expression_path {
+        config.insert("expression".into(), path.display().to_string());
+    }
+    config
+}
+
 #[cfg(not(feature = "live2d-cubism"))]
 pub fn run_real_model_motion(
     model_path: &Path,
@@ -1358,6 +1446,233 @@ fn run_real_model_motion_inner(
         changed_frames,
         motion_events,
     })
+}
+
+#[cfg(feature = "live2d-cubism")]
+fn run_real_model_motion_diff_inner(
+    model_path: &Path,
+    motion_path: Option<&Path>,
+    expression_path: Option<&Path>,
+    frame: usize,
+    dt: f32,
+    recorder: &ProbeRecorder,
+    config: &mut BTreeMap<String, String>,
+) -> Result<Vec<String>, String> {
+    let files = live2d_runtime::resolve_model_files(model_path)?;
+    if !files.missing_files.is_empty() {
+        return Err(format!(
+            "model assets missing: {}",
+            files.missing_files.join(", ")
+        ));
+    }
+    let resolved_motion_path = if let Some(path) = motion_path {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            files.model_root.join(path)
+        }
+    } else {
+        let (group, motion) = select_motion_file(&files, None)?;
+        config.insert("motion_group".into(), group);
+        config.insert("motion".into(), motion.relative_path.clone());
+        motion.path.clone()
+    };
+    let resolved_expression_path = expression_path.map(|path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            files.model_root.join(path)
+        }
+    });
+    if let Some(path) = &resolved_expression_path {
+        config.insert("expression".into(), path.display().to_string());
+    }
+
+    let motion = Live2DMotion::load_file(&resolved_motion_path)?;
+    let mut instance = live2d_runtime::Live2DInstance::load_file(model_path)?;
+    #[cfg(not(feature = "exp3"))]
+    if resolved_expression_path.is_some() {
+        return Err("real-model-motion-diff expression requires `--features exp3`".into());
+    }
+    #[cfg(feature = "exp3")]
+    if let Some(path) = &resolved_expression_path {
+        let expression = Live2DExpression::load_file(path)?;
+        instance.apply_expression(&expression)?;
+        config.insert(
+            "expression_parameters".into(),
+            expression.parameters().len().to_string(),
+        );
+    }
+    let elapsed = frame as f32 * if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+    let evaluation = motion.sample(elapsed, false);
+    let model_parameters = instance.parameters()?;
+    let model_parts = instance.parts()?;
+    let missing_parameter_ids = missing_ids(
+        &evaluation.parameters,
+        model_parameters
+            .iter()
+            .map(|parameter| parameter.id.as_ref()),
+    );
+    let missing_part_ids = missing_ids(
+        &evaluation.part_opacities,
+        model_parts.iter().map(|part| part.id.as_ref()),
+    );
+    let missing_parameters = missing_parameter_ids.len();
+    let missing_parts = missing_part_ids.len();
+
+    let base = instance.snapshot().clone();
+    measure(
+        recorder,
+        Stage::RuntimeMotionUpdate,
+        vec![ProbeAttr::new("phase", "apply_motion_diff")],
+        || instance.apply_motion(&motion, elapsed, false),
+    )?;
+    let diff = snapshot_diff(&base, instance.snapshot());
+    let plan = RenderPlanner::new().build(instance.snapshot());
+
+    for (name, value) in [
+        ("motion_parameter_values", evaluation.parameters.len()),
+        (
+            "motion_part_opacity_values",
+            evaluation.part_opacities.len(),
+        ),
+        ("motion_missing_parameters", missing_parameters),
+        ("motion_missing_parts", missing_parts),
+        ("snapshot_changed_drawables", diff.changed_drawables),
+        ("snapshot_changed_vertices", diff.changed_vertices),
+    ] {
+        counter(
+            recorder,
+            Stage::RuntimeMotionUpdate,
+            name,
+            value as u64,
+            Vec::new(),
+        );
+    }
+
+    for (key, value) in [
+        ("motion", resolved_motion_path.display().to_string()),
+        ("elapsed_seconds", elapsed.to_string()),
+        ("motion_parameters", evaluation.parameters.len().to_string()),
+        (
+            "motion_part_opacities",
+            evaluation.part_opacities.len().to_string(),
+        ),
+        ("missing_parameters", missing_parameters.to_string()),
+        ("missing_parts", missing_parts.to_string()),
+        ("changed_drawables", diff.changed_drawables.to_string()),
+        ("changed_vertices", diff.changed_vertices.to_string()),
+        ("max_vertex_delta", diff.max_delta.to_string()),
+        ("render_draws", plan.draws.len().to_string()),
+        ("render_vertices", plan.model.vertex_count.to_string()),
+    ] {
+        config.insert(key.into(), value);
+    }
+    config.insert(
+        "missing_parameter_ids".into(),
+        missing_parameter_ids
+            .iter()
+            .take(24)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    config.insert(
+        "missing_part_ids".into(),
+        missing_part_ids
+            .iter()
+            .take(24)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    config.insert(
+        "changed_drawable_ids".into(),
+        diff.changed_ids
+            .iter()
+            .take(24)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+
+    let mut warnings = Vec::new();
+    if missing_parameters > 0 {
+        warnings.push(format!(
+            "{missing_parameters} sampled motion parameter(s) are not present in the model"
+        ));
+    }
+    if missing_parts > 0 {
+        warnings.push(format!(
+            "{missing_parts} sampled motion part opacity target(s) are not present in the model"
+        ));
+    }
+    if diff.changed_vertices == 0 {
+        warnings.push("sampled motion did not change snapshot vertex positions".to_owned());
+    }
+    Ok(warnings)
+}
+
+#[cfg(feature = "live2d-cubism")]
+#[derive(Debug, Default)]
+struct SnapshotDiff {
+    changed_drawables: usize,
+    changed_vertices: usize,
+    max_delta: f32,
+    changed_ids: Vec<String>,
+}
+
+#[cfg(feature = "live2d-cubism")]
+fn missing_ids<'a, I>(values: &[(String, f32)], known_ids: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let known = known_ids
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    values
+        .iter()
+        .filter_map(|(id, _)| (!known.contains(id.as_str())).then(|| id.clone()))
+        .collect()
+}
+
+#[cfg(feature = "live2d-cubism")]
+fn snapshot_diff(before: &ModelSnapshot, after: &ModelSnapshot) -> SnapshotDiff {
+    let mut diff = SnapshotDiff::default();
+    for after_drawable in &after.drawables {
+        let Some(before_drawable) = before
+            .drawables
+            .iter()
+            .find(|candidate| candidate.id == after_drawable.id)
+        else {
+            if !after_drawable.vertices.is_empty() {
+                diff.changed_drawables += 1;
+                diff.changed_vertices += after_drawable.vertices.len();
+                diff.changed_ids.push(after_drawable.id.as_ref().to_owned());
+            }
+            continue;
+        };
+        let mut drawable_changed = before_drawable.vertices.len() != after_drawable.vertices.len();
+        for (before_vertex, after_vertex) in before_drawable
+            .vertices
+            .iter()
+            .zip(after_drawable.vertices.iter())
+        {
+            let dx = after_vertex.position[0] - before_vertex.position[0];
+            let dy = after_vertex.position[1] - before_vertex.position[1];
+            let delta = (dx * dx + dy * dy).sqrt();
+            if delta > 1e-6 {
+                drawable_changed = true;
+                diff.changed_vertices += 1;
+                diff.max_delta = diff.max_delta.max(delta);
+            }
+        }
+        if drawable_changed {
+            diff.changed_drawables += 1;
+            diff.changed_ids.push(after_drawable.id.as_ref().to_owned());
+        }
+    }
+    diff
 }
 
 #[cfg(feature = "live2d-cubism")]

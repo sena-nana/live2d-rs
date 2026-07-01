@@ -13,5 +13,8 @@ pub use live2d_runtime::{
     ParameterId, ParameterInfo, PartId, PartInfo,
 };
 
+#[cfg(feature = "exp3")]
+pub use live2d_runtime::{ExpressionBlendMode, ExpressionParameter, Live2DExpression};
+
 #[cfg(feature = "probe")]
 pub use live2d_probe as probe;

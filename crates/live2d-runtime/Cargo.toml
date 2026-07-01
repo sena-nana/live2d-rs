@@ -14,5 +14,6 @@ serde_json.workspace = true
 
 [features]
 default = []
+exp3 = []
 live2d-cubism = ["dep:image", "dep:live2d-sys", "live2d-sys/cubism-core"]
 probe = ["dep:live2d-probe"]

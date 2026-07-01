@@ -122,6 +122,53 @@ impl ModelMotionFile {
     }
 }
 
+#[cfg(feature = "exp3")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpressionBlendMode {
+    Add,
+    Multiply,
+    Overwrite,
+}
+
+#[cfg(feature = "exp3")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpressionParameter {
+    pub id: ParameterId,
+    pub value: f32,
+    pub blend: ExpressionBlendMode,
+}
+
+#[cfg(feature = "exp3")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Live2DExpression {
+    parameters: Vec<ExpressionParameter>,
+}
+
+#[cfg(feature = "exp3")]
+impl Live2DExpression {
+    pub fn load_file(path: impl AsRef<Path>) -> Result<Self, String> {
+        let raw = fs::read_to_string(path).map_err(|_| "expression_file_unreadable".to_string())?;
+        Self::from_json_str(&raw)
+    }
+
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        let root: Value =
+            serde_json::from_str(raw).map_err(|_| "invalid_expression_json".to_string())?;
+        let parameters = root
+            .get("Parameters")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "expression_parameters_missing".to_string())?
+            .iter()
+            .map(parse_expression_parameter)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { parameters })
+    }
+
+    pub fn parameters(&self) -> &[ExpressionParameter] {
+        &self.parameters
+    }
+}
+
 pub trait AssetResolver {
     fn read(&self, path: &str) -> Result<Vec<u8>, String>;
 }
@@ -157,6 +204,10 @@ pub struct Live2DInstance {
     elapsed_seconds: f32,
     motion_mixer: MotionMixer,
     motion_evaluation: MotionEvaluation,
+    #[cfg(feature = "live2d-cubism")]
+    base_parameters: Vec<(String, f32)>,
+    #[cfg(feature = "live2d-cubism")]
+    base_part_opacities: Vec<(String, f32)>,
     #[cfg(feature = "live2d-cubism")]
     model: runtime::CubismLive2DModel,
 }
@@ -445,7 +496,8 @@ impl Live2DInstance {
                 .map(|(id, value)| (id.as_ref().to_owned(), value))
                 .collect::<Vec<_>>();
             self.model.set_parameters(&parameters)?;
-            self.model.update_snapshot(&mut self.snapshot, 1.0)?;
+            merge_values(&mut self.base_parameters, &parameters);
+            self.apply_base_pose()?;
             return Ok(());
         }
         #[cfg(not(feature = "live2d-cubism"))]
@@ -471,7 +523,8 @@ impl Live2DInstance {
                 .map(|(id, opacity)| (id.as_ref().to_owned(), opacity))
                 .collect::<Vec<_>>();
             self.model.set_part_opacities(&parts)?;
-            self.model.update_snapshot(&mut self.snapshot, 1.0)?;
+            merge_values(&mut self.base_part_opacities, &parts);
+            self.apply_base_pose()?;
             return Ok(());
         }
         #[cfg(not(feature = "live2d-cubism"))]
@@ -489,6 +542,32 @@ impl Live2DInstance {
     ) -> Result<(), String> {
         let evaluation = motion.sample(elapsed_seconds, loop_playback);
         self.apply_evaluation(&evaluation)
+    }
+
+    #[cfg(all(feature = "exp3", feature = "live2d-cubism"))]
+    pub fn apply_expression(&mut self, expression: &Live2DExpression) -> Result<(), String> {
+        let current = self.model.parameters()?;
+        let mut writes = Vec::new();
+        for parameter in expression.parameters() {
+            let id = parameter.id.as_ref();
+            let Some(info) = current.iter().find(|candidate| candidate.id.as_ref() == id) else {
+                continue;
+            };
+            let value = match parameter.blend {
+                ExpressionBlendMode::Add => info.value + parameter.value,
+                ExpressionBlendMode::Multiply => info.value * parameter.value,
+                ExpressionBlendMode::Overwrite => parameter.value,
+            };
+            writes.push((id.to_owned(), value));
+        }
+        merge_values(&mut self.base_parameters, &writes);
+        self.apply_base_pose()
+    }
+
+    #[cfg(all(feature = "exp3", feature = "live2d-cubism"))]
+    pub fn apply_expression_file(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        let expression = Live2DExpression::load_file(path)?;
+        self.apply_expression(&expression)
     }
 
     #[cfg(feature = "probe")]
@@ -519,6 +598,8 @@ impl Live2DInstance {
     pub fn reset_parameters(&mut self) -> Result<(), String> {
         #[cfg(feature = "live2d-cubism")]
         {
+            self.base_parameters.clear();
+            self.base_part_opacities.clear();
             self.model.reset_parameters()?;
             self.model.reset_parts()?;
             self.model.update_snapshot(&mut self.snapshot, 1.0)?;
@@ -533,13 +614,7 @@ impl Live2DInstance {
     fn apply_evaluation(&mut self, evaluation: &MotionEvaluation) -> Result<(), String> {
         #[cfg(feature = "live2d-cubism")]
         {
-            self.model.reset_parameters()?;
-            self.model.reset_parts()?;
-            self.model.write_parameters(&evaluation.parameters)?;
-            self.model
-                .write_part_opacities(&evaluation.part_opacities)?;
-            self.model
-                .update_snapshot(&mut self.snapshot, evaluation.model_opacity.unwrap_or(1.0))?;
+            self.apply_pose_layers(evaluation, evaluation.model_opacity.unwrap_or(1.0))?;
             return Ok(());
         }
         #[cfg(not(feature = "live2d-cubism"))]
@@ -559,16 +634,8 @@ impl Live2DInstance {
     fn apply_buffered_motion_frame(&mut self) -> Result<(), String> {
         #[cfg(feature = "live2d-cubism")]
         {
-            self.model.reset_parameters()?;
-            self.model.reset_parts()?;
-            self.model
-                .write_parameters(&self.motion_evaluation.parameters)?;
-            self.model
-                .write_part_opacities(&self.motion_evaluation.part_opacities)?;
-            self.model.update_snapshot(
-                &mut self.snapshot,
-                self.motion_evaluation.model_opacity.unwrap_or(1.0),
-            )?;
+            let evaluation = self.motion_evaluation.clone();
+            self.apply_pose_layers(&evaluation, evaluation.model_opacity.unwrap_or(1.0))?;
             return Ok(());
         }
         #[cfg(not(feature = "live2d-cubism"))]
@@ -588,13 +655,8 @@ impl Live2DInstance {
     {
         #[cfg(feature = "live2d-cubism")]
         {
-            self.model.reset_parameters()?;
-            self.model.reset_parts()?;
-            self.model.write_parameters(&evaluation.parameters)?;
-            self.model
-                .write_part_opacities(&evaluation.part_opacities)?;
-            self.model.update_snapshot_with_probe(
-                &mut self.snapshot,
+            self.apply_pose_layers_with_probe(
+                &evaluation,
                 evaluation.model_opacity.unwrap_or(1.0),
                 probe,
             )?;
@@ -606,6 +668,52 @@ impl Live2DInstance {
             let _ = probe;
             Err(RUNTIME_UNAVAILABLE.into())
         }
+    }
+
+    #[cfg(feature = "live2d-cubism")]
+    fn apply_base_pose(&mut self) -> Result<(), String> {
+        let empty = MotionEvaluation::default();
+        self.apply_pose_layers(&empty, 1.0)
+    }
+
+    #[cfg(feature = "live2d-cubism")]
+    fn apply_pose_layers(
+        &mut self,
+        evaluation: &MotionEvaluation,
+        model_opacity: f32,
+    ) -> Result<(), String> {
+        self.write_pose_layers(evaluation)?;
+        self.model
+            .update_snapshot(&mut self.snapshot, model_opacity)?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "probe", feature = "live2d-cubism"))]
+    fn apply_pose_layers_with_probe<P>(
+        &mut self,
+        evaluation: &MotionEvaluation,
+        model_opacity: f32,
+        probe: &P,
+    ) -> Result<(), String>
+    where
+        P: ProbeSink,
+    {
+        self.write_pose_layers(evaluation)?;
+        self.model
+            .update_snapshot_with_probe(&mut self.snapshot, model_opacity, probe)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "live2d-cubism")]
+    fn write_pose_layers(&mut self, evaluation: &MotionEvaluation) -> Result<(), String> {
+        self.model.reset_parameters()?;
+        self.model.reset_parts()?;
+        self.model.write_parameters(&self.base_parameters)?;
+        self.model.write_part_opacities(&self.base_part_opacities)?;
+        self.model.write_parameters(&evaluation.parameters)?;
+        self.model
+            .write_part_opacities(&evaluation.part_opacities)?;
+        Ok(())
     }
 }
 
@@ -754,6 +862,45 @@ fn normalize_relative_path(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+#[cfg(feature = "exp3")]
+fn parse_expression_parameter(value: &Value) -> Result<ExpressionParameter, String> {
+    let id = value
+        .get("Id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "expression_parameter_id_missing".to_string())?;
+    let parameter_value = value
+        .get("Value")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| "expression_parameter_value_missing".to_string())?
+        as f32;
+    let blend = match value.get("Blend").and_then(Value::as_str).unwrap_or("Add") {
+        "Add" => ExpressionBlendMode::Add,
+        "Multiply" => ExpressionBlendMode::Multiply,
+        "Overwrite" => ExpressionBlendMode::Overwrite,
+        _ => return Err("unsupported_expression_blend".into()),
+    };
+    Ok(ExpressionParameter {
+        id: ParameterId::from(id),
+        value: parameter_value,
+        blend,
+    })
+}
+
+#[cfg(feature = "live2d-cubism")]
+fn merge_values(target: &mut Vec<(String, f32)>, updates: &[(String, f32)]) {
+    for (id, value) in updates {
+        if let Some((_, current)) = target
+            .iter_mut()
+            .find(|(candidate_id, _)| candidate_id == id)
+        {
+            *current = *value;
+        } else {
+            target.push((id.clone(), *value));
+        }
+    }
+}
+
 fn parse_model_files(model_json_path: &Path, json: &Value) -> Result<ModelFiles, String> {
     let model_root = model_json_path
         .parent()
@@ -896,6 +1043,10 @@ mod runtime {
             elapsed_seconds: 0.0,
             motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
+            #[cfg(feature = "live2d-cubism")]
+            base_parameters: Vec::new(),
+            #[cfg(feature = "live2d-cubism")]
+            base_part_opacities: Vec::new(),
         })
     }
 
@@ -1466,6 +1617,10 @@ mod runtime {
             elapsed_seconds: 0.0,
             motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
+            #[cfg(feature = "live2d-cubism")]
+            base_parameters: Vec::new(),
+            #[cfg(feature = "live2d-cubism")]
+            base_part_opacities: Vec::new(),
             model,
         })
     }
@@ -2216,6 +2371,49 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "exp3")]
+    fn parses_expression_parameters_and_blend_modes() {
+        let expression = Live2DExpression::from_json_str(
+            r#"{
+                "Type": "Live2D Expression",
+                "Parameters": [
+                    { "Id": "ParamAdd", "Value": 1.5, "Blend": "Add" },
+                    { "Id": "ParamMultiply", "Value": 0.5, "Blend": "Multiply" },
+                    { "Id": "ParamOverwrite", "Value": -1.0, "Blend": "Overwrite" },
+                    { "Id": "ParamDefault", "Value": 2.0 }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            expression.parameters(),
+            &[
+                ExpressionParameter {
+                    id: ParameterId::from("ParamAdd"),
+                    value: 1.5,
+                    blend: ExpressionBlendMode::Add,
+                },
+                ExpressionParameter {
+                    id: ParameterId::from("ParamMultiply"),
+                    value: 0.5,
+                    blend: ExpressionBlendMode::Multiply,
+                },
+                ExpressionParameter {
+                    id: ParameterId::from("ParamOverwrite"),
+                    value: -1.0,
+                    blend: ExpressionBlendMode::Overwrite,
+                },
+                ExpressionParameter {
+                    id: ParameterId::from("ParamDefault"),
+                    value: 2.0,
+                    blend: ExpressionBlendMode::Add,
+                },
+            ]
+        );
+    }
+
+    #[test]
     #[cfg(not(feature = "live2d-cubism"))]
     fn instance_update_advances_active_motion_without_faking_runtime() {
         let mut instance = Live2DInstance {
@@ -2223,6 +2421,10 @@ mod tests {
             elapsed_seconds: 0.0,
             motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
+            #[cfg(feature = "live2d-cubism")]
+            base_parameters: Vec::new(),
+            #[cfg(feature = "live2d-cubism")]
+            base_part_opacities: Vec::new(),
         };
         instance
             .motion_mixer
@@ -2422,6 +2624,10 @@ mod tests {
             elapsed_seconds: 0.0,
             motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
+            #[cfg(feature = "live2d-cubism")]
+            base_parameters: Vec::new(),
+            #[cfg(feature = "live2d-cubism")]
+            base_part_opacities: Vec::new(),
         }
     }
 
