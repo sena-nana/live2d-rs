@@ -1,7 +1,9 @@
 use super::*;
 use live2d_core::{
-    BlendMode, CanvasInfo, ClippingInfo, DrawableId, MaterialKey, TextureAsset, Vertex,
+    BlendMode, CanvasInfo, ClippingInfo, Drawable, DrawableId, MaterialKey, ModelSnapshot,
+    TextureAsset, Vertex,
 };
+use live2d_render::DrawCommand;
 
 pub(crate) fn snapshot_with_drawable(
     id: &str,

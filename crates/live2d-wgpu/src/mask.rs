@@ -1,4 +1,16 @@
-use crate::*;
+use crate::{
+    api::WgpuLive2DView,
+    pipeline::PipelineCache,
+    renderer::WgpuLive2DRenderer,
+    resources::{GpuScene, MaskAtlas, MaskAtlasUpdate},
+    upload::{live2d_canvas_uniform, mix_f32_slice, mix_u64, Live2dUniform, PositionUpload},
+    MASK_ATLAS_FORMAT, MASK_DRAW_LOOKUP_INDEX_THRESHOLD,
+};
+use live2d_core::CanvasInfo;
+#[cfg(feature = "probe")]
+use live2d_probe::{counter, measure, ProbeAttr, ProbeSink, Stage};
+use live2d_render::{DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlan};
+use std::collections::HashMap;
 
 impl MaskAtlas {
     fn layout(&self) -> MaskAtlasLayout {
@@ -720,10 +732,9 @@ pub(crate) fn mask_uniform_for_layout(
 mod tests {
     use super::*;
     use crate::tests::*;
-    use crate::*;
+    use crate::upload::{align_to, uniform_slots, GpuPosition};
     use live2d_core::{
-        AlphaBlendMode, BlendMode, CanvasInfo, ClippingInfo, ColorBlendMode, DrawableId, MaskRef,
-        MaterialKey, TextureAsset, Vertex,
+        BlendMode, CanvasInfo, ClippingInfo, Drawable, DrawableId, MaskRef, TextureAsset, Vertex,
     };
     use live2d_render::RenderPlanner;
 

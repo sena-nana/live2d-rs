@@ -1,4 +1,13 @@
-use crate::*;
+use crate::{
+    api::WgpuLive2DView,
+    mask::mask_uniform,
+    pipeline::{PipelineCache, PipelineKey},
+    renderer::WgpuLive2DRenderer,
+    resources::{GpuScene, MaskAtlas},
+    upload::upload_main_uniforms,
+};
+use live2d_core::{BlendMode, CanvasInfo};
+use live2d_render::{DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlan};
 
 pub(crate) struct WgpuRenderBackend<'a, 'pass> {
     pass: &'a mut wgpu::RenderPass<'pass>,
@@ -287,12 +296,9 @@ pub(crate) fn render_plan_has_advanced_blend(render_plan: &RenderPlan) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::{blend_uniform, pipeline_blend_mode, PipelineBlendMode};
     use crate::tests::*;
-    use crate::*;
-    use live2d_core::{
-        AlphaBlendMode, BlendMode, CanvasInfo, ClippingInfo, ColorBlendMode, DrawableId, MaskRef,
-        MaterialKey, TextureAsset, Vertex,
-    };
+    use live2d_core::{AlphaBlendMode, BlendMode, ColorBlendMode};
     use live2d_render::RenderPlanner;
 
     #[test]

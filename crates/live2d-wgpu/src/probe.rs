@@ -1,4 +1,4 @@
-use crate::*;
+use live2d_probe::{counter, ProbeAttr, ProbeSink, Stage};
 
 #[cfg(feature = "probe")]
 pub(crate) struct GpuTimestampFrame {

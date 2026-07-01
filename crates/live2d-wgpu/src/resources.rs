@@ -1,4 +1,9 @@
-use crate::*;
+use crate::{
+    renderer::{TextureTopology, WgpuLive2DRenderer},
+    upload::GpuPosition,
+};
+#[cfg(feature = "probe")]
+use live2d_probe::{counter, measure, ProbeAttr, ProbeSink, Stage};
 
 pub(crate) struct TextureCache {
     pub(crate) topology: TextureTopology,

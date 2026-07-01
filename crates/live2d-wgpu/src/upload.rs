@@ -1,5 +1,15 @@
-use crate::*;
+use crate::{
+    api::WgpuLive2DView,
+    mask::{mask_uniform, mask_uniform_slots, position_uploads_touch_masks},
+    pipeline::blend_uniform,
+    renderer::{SceneTopology, TextureTopology, WgpuLive2DRenderer},
+    resources::{GpuScene, MaskAtlas, TextureCache},
+};
 use bytemuck::{Pod, Zeroable};
+use live2d_core::{CanvasInfo, Drawable, ModelSnapshot, TextureAsset};
+#[cfg(feature = "probe")]
+use live2d_probe::{counter, measure, ProbeAttr, ProbeSink, Stage};
+use live2d_render::RenderPlan;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]

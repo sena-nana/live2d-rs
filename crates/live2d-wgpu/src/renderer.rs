@@ -1,4 +1,22 @@
-use crate::*;
+#[cfg(feature = "probe")]
+use crate::probe::{read_timestamp_values, record_gpu_pass_nanos, GpuTimestampFrame};
+use crate::{
+    api::{WgpuLive2DTarget, WgpuLive2DView},
+    mask::{create_empty_mask_bind_group, mask_uniform_slots},
+    pipeline::PipelineCache,
+    post_process::{WgpuPostProcessChain, WgpuPostProcessError},
+    resources::{
+        create_empty_sampled_texture_bind_group, BlendCopyTarget, GpuScene, MaskAtlas,
+        OffscreenTarget, TextureCache,
+    },
+    upload::{aligned_uniform_stride, uniform_binding, uniform_slots},
+    POST_PROCESS_CLEAR,
+};
+use live2d_core::{CanvasInfo, ModelSnapshot};
+#[cfg(feature = "probe")]
+use live2d_probe::{counter, gauge, measure, ProbeAttr, ProbeSink, Stage};
+use live2d_render::{RenderPlan, RenderWorld};
+use std::{cell::RefCell, collections::HashMap};
 
 pub struct WgpuLive2DRenderer {
     pub(crate) pipelines: PipelineCache,
