@@ -9,6 +9,7 @@ use std::ops::Range;
 
 const DRAW_LOOKUP_INDEX_THRESHOLD: usize = 8 * 1024;
 const DRAWABLE_OPACITY_EPSILON: f32 = 1e-6;
+pub const POST_PROCESS_PARAM_VEC4S: usize = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderPlan {
@@ -70,6 +71,187 @@ pub struct DrawCommand {
     pub mask: Option<MaskRef>,
     pub inverted_mask: bool,
     pub material: MaterialKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PostProcessShaderId(pub String);
+
+impl From<String> for PostProcessShaderId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for PostProcessShaderId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl AsRef<str> for PostProcessShaderId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostProcessInput {
+    Scene,
+    Pass(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostProcessOutput {
+    Temporary,
+    Final,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PostProcessParams {
+    pub values: [[f32; 4]; POST_PROCESS_PARAM_VEC4S],
+}
+
+impl Default for PostProcessParams {
+    fn default() -> Self {
+        Self {
+            values: [[0.0; 4]; POST_PROCESS_PARAM_VEC4S],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostProcessPass {
+    pub shader_id: PostProcessShaderId,
+    pub input: PostProcessInput,
+    pub output: PostProcessOutput,
+    pub params: PostProcessParams,
+}
+
+impl PostProcessPass {
+    pub fn new(
+        shader_id: impl Into<PostProcessShaderId>,
+        input: PostProcessInput,
+        output: PostProcessOutput,
+    ) -> Self {
+        Self {
+            shader_id: shader_id.into(),
+            input,
+            output,
+            params: PostProcessParams::default(),
+        }
+    }
+
+    pub fn with_params(mut self, params: PostProcessParams) -> Self {
+        self.params = params;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostProcessPlan {
+    passes: Vec<PostProcessPass>,
+}
+
+impl PostProcessPlan {
+    pub fn empty() -> Self {
+        Self { passes: Vec::new() }
+    }
+
+    pub fn linear<I, S>(shader_ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<PostProcessShaderId>,
+    {
+        let shader_ids = shader_ids.into_iter().map(Into::into).collect::<Vec<_>>();
+        let pass_count = shader_ids.len();
+        let passes = shader_ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, shader_id)| PostProcessPass {
+                shader_id,
+                input: if index == 0 {
+                    PostProcessInput::Scene
+                } else {
+                    PostProcessInput::Pass(index - 1)
+                },
+                output: if index + 1 == pass_count {
+                    PostProcessOutput::Final
+                } else {
+                    PostProcessOutput::Temporary
+                },
+                params: PostProcessParams::default(),
+            })
+            .collect();
+        Self { passes }
+    }
+
+    pub fn new(passes: Vec<PostProcessPass>) -> Result<Self, PostProcessPlanError> {
+        validate_post_process_passes(&passes)?;
+        Ok(Self { passes })
+    }
+
+    pub fn passes(&self) -> &[PostProcessPass] {
+        &self.passes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.passes.is_empty()
+    }
+}
+
+impl Default for PostProcessPlan {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostProcessPlanError {
+    EmptyShaderId {
+        pass: usize,
+    },
+    UnsupportedInput {
+        pass: usize,
+        input: PostProcessInput,
+    },
+    FinalOutputBeforeLast {
+        pass: usize,
+    },
+    MissingFinalOutput,
+}
+
+fn validate_post_process_passes(passes: &[PostProcessPass]) -> Result<(), PostProcessPlanError> {
+    if passes.is_empty() {
+        return Ok(());
+    }
+
+    for (index, pass) in passes.iter().enumerate() {
+        if pass.shader_id.as_ref().is_empty() {
+            return Err(PostProcessPlanError::EmptyShaderId { pass: index });
+        }
+
+        let expected_input = if index == 0 {
+            PostProcessInput::Scene
+        } else {
+            PostProcessInput::Pass(index - 1)
+        };
+        if pass.input != expected_input {
+            return Err(PostProcessPlanError::UnsupportedInput {
+                pass: index,
+                input: pass.input,
+            });
+        }
+
+        if pass.output == PostProcessOutput::Final && index + 1 != passes.len() {
+            return Err(PostProcessPlanError::FinalOutputBeforeLast { pass: index });
+        }
+    }
+
+    if passes.last().unwrap().output != PostProcessOutput::Final {
+        return Err(PostProcessPlanError::MissingFinalOutput);
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1160,6 +1342,69 @@ mod tests {
                 Event::EndModel,
             ]
         );
+    }
+
+    #[test]
+    fn post_process_plan_accepts_empty_chain() {
+        let plan = PostProcessPlan::new(Vec::new()).unwrap();
+
+        assert!(plan.is_empty());
+        assert!(PostProcessPlan::empty().is_empty());
+    }
+
+    #[test]
+    fn post_process_plan_builds_linear_chain() {
+        let plan = PostProcessPlan::linear(["tone", "blur", "composite"]);
+
+        assert_eq!(plan.passes().len(), 3);
+        assert_eq!(plan.passes()[0].input, PostProcessInput::Scene);
+        assert_eq!(plan.passes()[0].output, PostProcessOutput::Temporary);
+        assert_eq!(plan.passes()[1].input, PostProcessInput::Pass(0));
+        assert_eq!(plan.passes()[1].output, PostProcessOutput::Temporary);
+        assert_eq!(plan.passes()[2].input, PostProcessInput::Pass(1));
+        assert_eq!(plan.passes()[2].output, PostProcessOutput::Final);
+    }
+
+    #[test]
+    fn post_process_plan_rejects_non_linear_input() {
+        let result = PostProcessPlan::new(vec![
+            PostProcessPass::new("a", PostProcessInput::Scene, PostProcessOutput::Temporary),
+            PostProcessPass::new("b", PostProcessInput::Scene, PostProcessOutput::Final),
+        ]);
+
+        assert_eq!(
+            result,
+            Err(PostProcessPlanError::UnsupportedInput {
+                pass: 1,
+                input: PostProcessInput::Scene,
+            })
+        );
+    }
+
+    #[test]
+    fn post_process_plan_rejects_missing_final_output() {
+        let result = PostProcessPlan::new(vec![PostProcessPass::new(
+            "tone",
+            PostProcessInput::Scene,
+            PostProcessOutput::Temporary,
+        )]);
+
+        assert_eq!(result, Err(PostProcessPlanError::MissingFinalOutput));
+    }
+
+    #[test]
+    fn post_process_plan_preserves_pass_params() {
+        let mut params = PostProcessParams::default();
+        params.values[2] = [1.0, 2.0, 3.0, 4.0];
+        let plan = PostProcessPlan::new(vec![PostProcessPass::new(
+            "tone",
+            PostProcessInput::Scene,
+            PostProcessOutput::Final,
+        )
+        .with_params(params)])
+        .unwrap();
+
+        assert_eq!(plan.passes()[0].params.values[2], [1.0, 2.0, 3.0, 4.0]);
     }
 
     #[cfg(feature = "probe")]

@@ -44,6 +44,7 @@ pub enum Stage {
     WgpuMaskAtlasRebuild,
     WgpuMaskPassEncode,
     WgpuMainPassEncode,
+    WgpuPostProcessPassEncode,
     WgpuQueueSubmit,
     WgpuGpuTimestampSupport,
 }

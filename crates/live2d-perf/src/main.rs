@@ -56,16 +56,16 @@ fn run() -> Result<(), String> {
             run_real_model_load(Path::new(&model))
         }
         #[cfg(feature = "wgpu")]
-        "wgpu-cold" | "wgpu-warm" | "wgpu-mask" | "wgpu-resize" | "wgpu-model-switch" => {
-            live2d_perf::wgpu_scenarios::run_wgpu_scenario(&scenario, &config)?
-        }
+        "wgpu-cold" | "wgpu-warm" | "wgpu-mask" | "wgpu-resize" | "wgpu-model-switch"
+        | "wgpu-postprocess" => live2d_perf::wgpu_scenarios::run_wgpu_scenario(&scenario, &config)?,
         #[cfg(not(feature = "wgpu"))]
-        "wgpu-cold" | "wgpu-warm" | "wgpu-mask" | "wgpu-resize" | "wgpu-model-switch" => {
+        "wgpu-cold" | "wgpu-warm" | "wgpu-mask" | "wgpu-resize" | "wgpu-model-switch"
+        | "wgpu-postprocess" => {
             return Err("wgpu scenarios require `--features wgpu`".to_owned());
         }
         _ => {
             return Err(format!(
-                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, or wgpu-model-switch"
+                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, or wgpu-postprocess"
             ));
         }
     };
@@ -82,7 +82,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--model <path>]");
-    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch");
+    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, wgpu-postprocess");
     println!("profiles: small, medium, large, mask-heavy, static-mask-heavy, texture-heavy, target-filter");
 }
 
@@ -97,6 +97,7 @@ fn uses_synthetic_config(scenario: &str) -> bool {
             | "wgpu-mask"
             | "wgpu-resize"
             | "wgpu-model-switch"
+            | "wgpu-postprocess"
     )
 }
 

@@ -12,8 +12,31 @@ use std::{collections::BTreeMap, path::Path};
 pub mod wgpu_scenarios {
     use super::*;
     use live2d_probe::{counter, measure, ProbeRecorder, Stage};
-    use live2d_wgpu::{WgpuLive2DRenderer, WgpuLive2DView};
+    use live2d_render::{PostProcessPlan, PostProcessShaderId};
+    use live2d_wgpu::{
+        WgpuLive2DRenderer, WgpuLive2DView, WgpuPostProcessChain, WgpuPostProcessPlan,
+        WgpuPostProcessShaderSource,
+    };
     use std::time::Instant;
+
+    const TONE_POSTPROCESS_WGSL: &str = r#"
+fn pp_apply(fragment: PpFragment) -> vec4<f32> {
+    let color = pp_sample(fragment.uv);
+    let gain = 1.0 + pp_param(0u).x;
+    return vec4<f32>(color.rgb * gain, color.a);
+}
+"#;
+
+    const NEIGHBOR_POSTPROCESS_WGSL: &str = r#"
+fn pp_apply(fragment: PpFragment) -> vec4<f32> {
+    let c = pp_sample(fragment.uv);
+    let l = pp_sample(fragment.uv - vec2<f32>(fragment.texel.x, 0.0));
+    let r = pp_sample(fragment.uv + vec2<f32>(fragment.texel.x, 0.0));
+    let u = pp_sample(fragment.uv - vec2<f32>(0.0, fragment.texel.y));
+    let d = pp_sample(fragment.uv + vec2<f32>(0.0, fragment.texel.y));
+    return (c * 0.5) + ((l + r + u + d) * 0.125);
+}
+"#;
 
     pub fn run_wgpu_scenario(
         scenario: &str,
@@ -54,6 +77,30 @@ pub mod wgpu_scenarios {
             wgpu::TextureFormat::Rgba8UnormSrgb,
             &recorder,
         );
+        let mut postprocess = if scenario == "wgpu-postprocess" {
+            let plan = PostProcessPlan::linear(["tone", "neighbor"]);
+            let wgpu_plan = WgpuPostProcessPlan::from_render_plan(
+                &plan,
+                [
+                    (
+                        PostProcessShaderId::from("tone"),
+                        WgpuPostProcessShaderSource::Wgsl(TONE_POSTPROCESS_WGSL),
+                    ),
+                    (
+                        PostProcessShaderId::from("neighbor"),
+                        WgpuPostProcessShaderSource::Wgsl(NEIGHBOR_POSTPROCESS_WGSL),
+                    ),
+                ],
+            )
+            .map_err(|err| format!("failed to build postprocess plan: {err:?}"))?;
+            Some(WgpuPostProcessChain::new(
+                &device,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                &wgpu_plan,
+            ))
+        } else {
+            None
+        };
         let frames = match scenario {
             "wgpu-cold" => 1,
             "wgpu-resize" => config.frames.max(2).min(8),
@@ -120,6 +167,22 @@ pub mod wgpu_scenarios {
                     wgpu::Color::TRANSPARENT,
                     &recorder,
                 );
+            } else if let Some(postprocess) = postprocess.as_mut() {
+                renderer
+                    .render_with_postprocess_to_view_with_probe(
+                        &device,
+                        &queue,
+                        &mut encoder,
+                        live2d_wgpu::WgpuLive2DTarget::clear(
+                            &view_texture,
+                            wgpu::Color::TRANSPARENT,
+                        ),
+                        &snapshot,
+                        view,
+                        postprocess,
+                        &recorder,
+                    )
+                    .map_err(|err| format!("postprocess render failed: {err:?}"))?;
             } else {
                 renderer.render_to_view_with_probe(
                     &device,
