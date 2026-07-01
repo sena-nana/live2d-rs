@@ -7,7 +7,9 @@ use crate::{
     upload::upload_main_uniforms,
 };
 use live2d_core::{BlendMode, CanvasInfo};
-use live2d_render::{DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlan};
+use live2d_render::{
+    DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderCommand, RenderPlan,
+};
 
 pub(crate) struct WgpuRenderBackend<'a, 'pass> {
     pass: &'a mut wgpu::RenderPass<'pass>,
@@ -120,6 +122,27 @@ impl WgpuLive2DRenderer {
         view: WgpuLive2DView,
         first_uniform_slot: usize,
     ) {
+        if render_plan
+            .commands
+            .iter()
+            .any(|command| matches!(command, RenderCommand::BeginOffscreen { .. }))
+        {
+            self.encode_command_draws_to_target(
+                device,
+                queue,
+                encoder,
+                target_view,
+                resolve_target,
+                first_load_op,
+                store_op,
+                render_plan,
+                canvas,
+                view,
+                first_uniform_slot,
+            );
+            return;
+        }
+
         if render_plan.draws.is_empty() {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Live2D Empty Render Pass"),
@@ -285,6 +308,377 @@ impl WgpuLive2DRenderer {
             start = end;
         }
     }
+
+    fn encode_command_draws_to_target(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        resolve_target: Option<&wgpu::TextureView>,
+        first_load_op: wgpu::LoadOp<wgpu::Color>,
+        store_op: wgpu::StoreOp,
+        render_plan: &RenderPlan,
+        canvas: &CanvasInfo,
+        view: WgpuLive2DView,
+        first_uniform_slot: usize,
+    ) {
+        if render_plan.draws.is_empty() {
+            return;
+        }
+        self.ensure_model_offscreen_targets(
+            device,
+            view.width,
+            view.height,
+            render_plan.offscreens.len(),
+        );
+
+        let Some(gpu_scene) = self.active_gpu_scene() else {
+            return;
+        };
+        let active_mask_atlas = if render_plan.masks.is_empty() {
+            None
+        } else {
+            self.mask_atlas.as_ref()
+        };
+        let mask_bind_group = active_mask_atlas
+            .map(|atlas| &atlas.bind_group)
+            .unwrap_or(&self.fallback_mask_bind_group);
+        {
+            let mut uniform_staging = self.uniform_staging.borrow_mut();
+            upload_main_uniforms(
+                queue,
+                &self.uniform_buffer,
+                self.uniform_stride,
+                first_uniform_slot,
+                render_plan,
+                canvas,
+                &view,
+                self.texture_sampling,
+                active_mask_atlas,
+                &mut uniform_staging,
+            );
+        }
+
+        let mut active_offscreens = Vec::new();
+        let mut pending_draws = Vec::new();
+        let mut root_loaded = false;
+        for command in &render_plan.commands {
+            match *command {
+                RenderCommand::BeginOffscreen { offscreen_index } => {
+                    flush_command_draws(
+                        encoder,
+                        target_view,
+                        resolve_target,
+                        first_load_op,
+                        store_op,
+                        &mut root_loaded,
+                        active_offscreens.last().copied(),
+                        &self.model_offscreen_targets,
+                        &mut pending_draws,
+                        render_plan,
+                        first_uniform_slot,
+                        &self.pipelines,
+                        &self.uniform_bind_group,
+                        self.uniform_stride,
+                        mask_bind_group,
+                        &self.fallback_blend_bind_group,
+                        active_mask_atlas,
+                        gpu_scene,
+                    );
+                    if let Some(offscreen) = self.model_offscreen_targets.get(&offscreen_index) {
+                        clear_offscreen(encoder, &offscreen.view);
+                        active_offscreens.push(offscreen_index);
+                    }
+                }
+                RenderCommand::Draw { draw_index } => {
+                    if render_plan.draws.get(draw_index).is_some() {
+                        pending_draws.push(draw_index);
+                    }
+                }
+                RenderCommand::CompositeOffscreen { offscreen_index } => {
+                    flush_command_draws(
+                        encoder,
+                        target_view,
+                        resolve_target,
+                        first_load_op,
+                        store_op,
+                        &mut root_loaded,
+                        active_offscreens.last().copied(),
+                        &self.model_offscreen_targets,
+                        &mut pending_draws,
+                        render_plan,
+                        first_uniform_slot,
+                        &self.pipelines,
+                        &self.uniform_bind_group,
+                        self.uniform_stride,
+                        mask_bind_group,
+                        &self.fallback_blend_bind_group,
+                        active_mask_atlas,
+                        gpu_scene,
+                    );
+                    if active_offscreens.last().copied() == Some(offscreen_index) {
+                        active_offscreens.pop();
+                    }
+                    let Some(offscreen) = self.model_offscreen_targets.get(&offscreen_index) else {
+                        continue;
+                    };
+                    if let Some(parent_index) = active_offscreens.last().copied() {
+                        if let Some(parent) = self.model_offscreen_targets.get(&parent_index) {
+                            encode_offscreen_composite(
+                                encoder,
+                                &parent.view,
+                                None,
+                                wgpu::LoadOp::Load,
+                                wgpu::StoreOp::Store,
+                                &self.offscreen_composite_pipeline,
+                                &offscreen.bind_group,
+                            );
+                        }
+                    } else {
+                        let load_op = root_load_op(first_load_op, &mut root_loaded);
+                        encode_offscreen_composite(
+                            encoder,
+                            target_view,
+                            resolve_target,
+                            load_op,
+                            store_op,
+                            &self.offscreen_composite_pipeline,
+                            &offscreen.bind_group,
+                        );
+                    }
+                }
+            }
+        }
+        flush_command_draws(
+            encoder,
+            target_view,
+            resolve_target,
+            first_load_op,
+            store_op,
+            &mut root_loaded,
+            active_offscreens.last().copied(),
+            &self.model_offscreen_targets,
+            &mut pending_draws,
+            render_plan,
+            first_uniform_slot,
+            &self.pipelines,
+            &self.uniform_bind_group,
+            self.uniform_stride,
+            mask_bind_group,
+            &self.fallback_blend_bind_group,
+            active_mask_atlas,
+            gpu_scene,
+        );
+
+        if !root_loaded {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Live2D Empty Root Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: first_load_op,
+                        store: store_op,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+    }
+}
+
+fn clear_offscreen(encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("Live2D Offscreen Clear Pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flush_command_draws(
+    encoder: &mut wgpu::CommandEncoder,
+    root_target_view: &wgpu::TextureView,
+    root_resolve_target: Option<&wgpu::TextureView>,
+    first_load_op: wgpu::LoadOp<wgpu::Color>,
+    store_op: wgpu::StoreOp,
+    root_loaded: &mut bool,
+    active_offscreen: Option<usize>,
+    offscreen_targets: &std::collections::HashMap<usize, crate::resources::OffscreenTarget>,
+    pending_draws: &mut Vec<usize>,
+    render_plan: &RenderPlan,
+    first_uniform_slot: usize,
+    pipelines: &PipelineCache,
+    uniform_bind_group: &wgpu::BindGroup,
+    uniform_stride: u64,
+    mask_bind_group: &wgpu::BindGroup,
+    blend_bind_group: &wgpu::BindGroup,
+    mask_atlas: Option<&MaskAtlas>,
+    gpu_scene: &GpuScene,
+) {
+    if pending_draws.is_empty() {
+        return;
+    }
+    if let Some(offscreen_index) = active_offscreen {
+        if let Some(offscreen) = offscreen_targets.get(&offscreen_index) {
+            encode_draw_run(
+                encoder,
+                &offscreen.view,
+                None,
+                wgpu::LoadOp::Load,
+                wgpu::StoreOp::Store,
+                pending_draws,
+                render_plan,
+                first_uniform_slot,
+                pipelines,
+                uniform_bind_group,
+                uniform_stride,
+                mask_bind_group,
+                blend_bind_group,
+                mask_atlas,
+                gpu_scene,
+            );
+        }
+    } else {
+        let load_op = root_load_op(first_load_op, root_loaded);
+        encode_draw_run(
+            encoder,
+            root_target_view,
+            root_resolve_target,
+            load_op,
+            store_op,
+            pending_draws,
+            render_plan,
+            first_uniform_slot,
+            pipelines,
+            uniform_bind_group,
+            uniform_stride,
+            mask_bind_group,
+            blend_bind_group,
+            mask_atlas,
+            gpu_scene,
+        );
+    }
+    pending_draws.clear();
+}
+
+fn root_load_op(
+    first_load_op: wgpu::LoadOp<wgpu::Color>,
+    root_loaded: &mut bool,
+) -> wgpu::LoadOp<wgpu::Color> {
+    if *root_loaded {
+        wgpu::LoadOp::Load
+    } else {
+        *root_loaded = true;
+        first_load_op
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_draw_run(
+    encoder: &mut wgpu::CommandEncoder,
+    target_view: &wgpu::TextureView,
+    resolve_target: Option<&wgpu::TextureView>,
+    load_op: wgpu::LoadOp<wgpu::Color>,
+    store_op: wgpu::StoreOp,
+    draw_indices: &[usize],
+    render_plan: &RenderPlan,
+    first_uniform_slot: usize,
+    pipelines: &PipelineCache,
+    uniform_bind_group: &wgpu::BindGroup,
+    uniform_stride: u64,
+    mask_bind_group: &wgpu::BindGroup,
+    blend_bind_group: &wgpu::BindGroup,
+    mask_atlas: Option<&MaskAtlas>,
+    gpu_scene: &GpuScene,
+) {
+    if draw_indices.is_empty() {
+        return;
+    }
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("Live2D Command Draw Run Pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target_view,
+            depth_slice: None,
+            resolve_target,
+            ops: wgpu::Operations {
+                load: load_op,
+                store: store_op,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    let mut backend = WgpuRenderBackend {
+        pass: &mut pass,
+        pipelines,
+        uniform_bind_group,
+        uniform_stride,
+        uniform_index: first_uniform_slot,
+        mask_bind_group,
+        blend_bind_group,
+        mask_atlas,
+        gpu_scene,
+        last_pipeline_key: None,
+        last_texture_index: None,
+    };
+    backend.begin_model(&render_plan.model);
+    backend.begin_main_pass();
+    for draw_index in draw_indices {
+        if let Some(draw) = render_plan.draws.get(*draw_index) {
+            backend.uniform_index = first_uniform_slot + *draw_index;
+            backend.draw_drawable(draw);
+        }
+    }
+    backend.end_model();
+}
+
+fn encode_offscreen_composite(
+    encoder: &mut wgpu::CommandEncoder,
+    target_view: &wgpu::TextureView,
+    resolve_target: Option<&wgpu::TextureView>,
+    load_op: wgpu::LoadOp<wgpu::Color>,
+    store_op: wgpu::StoreOp,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("Live2D Offscreen Composite Pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target_view,
+            depth_slice: None,
+            resolve_target,
+            ops: wgpu::Operations {
+                load: load_op,
+                store: store_op,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..3, 0..1);
 }
 
 pub(crate) fn render_plan_has_advanced_blend(render_plan: &RenderPlan) -> bool {

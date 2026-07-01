@@ -590,6 +590,7 @@ pub fn synthetic_snapshot(config: &SyntheticConfig, frame: usize) -> ModelSnapsh
             Drawable {
                 id,
                 render_order: index as i32,
+                parent_part_index: None,
                 texture_index: index % texture_count,
                 vertices: synthetic_vertices(
                     config.vertices_per_drawable,
@@ -617,6 +618,9 @@ pub fn synthetic_snapshot(config: &SyntheticConfig, frame: usize) -> ModelSnapsh
         },
         art_meshes: Vec::new(),
         drawables,
+        offscreens: Vec::new(),
+        render_objects: Vec::new(),
+        part_parent_indices: Vec::new(),
         textures: synthetic_textures(texture_count, config.texture_size),
     }
 }

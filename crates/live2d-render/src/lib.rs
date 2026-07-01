@@ -1,6 +1,6 @@
 use live2d_core::{
     BlendMode, ClippingInfo, Drawable, DrawableId, DrawableRanges, MaskRef, MaterialKey,
-    ModelSnapshot,
+    ModelSnapshot, Offscreen, RenderObject,
 };
 #[cfg(feature = "probe")]
 use live2d_probe::{counter, measure, ProbeAttr, ProbeSink, Stage};
@@ -17,6 +17,8 @@ pub struct RenderPlan {
     pub masks: Vec<MaskPass>,
     pub mask_draws: Vec<DrawCommand>,
     pub draws: Vec<DrawCommand>,
+    pub offscreens: Vec<Offscreen>,
+    pub commands: Vec<RenderCommand>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +73,13 @@ pub struct DrawCommand {
     pub mask: Option<MaskRef>,
     pub inverted_mask: bool,
     pub material: MaterialKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenderCommand {
+    BeginOffscreen { offscreen_index: usize },
+    Draw { draw_index: usize },
+    CompositeOffscreen { offscreen_index: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -388,12 +397,15 @@ impl RenderPlanner {
 
         let mask_draws = mask_draw_commands_from_table(snapshot, &table, &mask_table);
         let draws = draw_commands_for_visible_rows(snapshot, &table, &ordered_rows, &mask_table);
+        let commands = render_commands(snapshot, &draws);
 
         RenderPlan {
             model,
             masks: mask_table.masks,
             mask_draws,
             draws,
+            offscreens: snapshot.offscreens.clone(),
+            commands,
         }
     }
 
@@ -435,6 +447,7 @@ impl RenderPlanner {
                     vec![ProbeAttr::new("candidate_drawables", ordered_rows.len())],
                     || draw_commands_for_visible_rows(snapshot, &table, &ordered_rows, &mask_table),
                 );
+                let commands = render_commands(snapshot, &draws);
 
                 counter(
                     probe,
@@ -455,6 +468,8 @@ impl RenderPlanner {
                     masks: mask_table.masks,
                     mask_draws,
                     draws,
+                    offscreens: snapshot.offscreens.clone(),
+                    commands,
                 }
             },
         )
@@ -564,6 +579,7 @@ impl RenderWorld {
                     )],
                     || draw_commands_from_cache(snapshot, cache),
                 );
+                let commands = render_commands(snapshot, &draws);
                 counter(
                     probe,
                     Stage::RenderPlanTotal,
@@ -583,6 +599,8 @@ impl RenderWorld {
                     masks: cache.mask_table.masks.clone(),
                     mask_draws,
                     draws,
+                    offscreens: snapshot.offscreens.clone(),
+                    commands,
                 }
             },
         )
@@ -792,11 +810,15 @@ fn draw_commands_from_cache(
 }
 
 fn render_plan_from_cache(snapshot: &ModelSnapshot, cache: &RenderWorldCache) -> RenderPlan {
+    let draws = draw_commands_from_cache(snapshot, cache);
+    let commands = render_commands(snapshot, &draws);
     RenderPlan {
         model: cache.model.clone(),
         masks: cache.mask_table.masks.clone(),
         mask_draws: mask_draw_commands_from_table(snapshot, &cache.table, &cache.mask_table),
-        draws: draw_commands_from_cache(snapshot, cache),
+        draws,
+        offscreens: snapshot.offscreens.clone(),
+        commands,
     }
 }
 
@@ -919,6 +941,118 @@ fn draw_command_for_row(
     }
 }
 
+fn render_commands(snapshot: &ModelSnapshot, draws: &[DrawCommand]) -> Vec<RenderCommand> {
+    if snapshot.offscreens.is_empty() {
+        return (0..draws.len())
+            .map(|draw_index| RenderCommand::Draw { draw_index })
+            .collect();
+    }
+
+    let draw_index_by_id = draws
+        .iter()
+        .enumerate()
+        .map(|(index, draw)| (&draw.drawable_id, index))
+        .collect::<HashMap<_, _>>();
+    let drawable_parent_by_id = snapshot
+        .drawables
+        .iter()
+        .map(|drawable| (&drawable.id, drawable.parent_part_index))
+        .collect::<HashMap<_, _>>();
+    let mut commands = Vec::new();
+    let mut active_offscreens: Vec<usize> = Vec::new();
+    let ordered_objects = if snapshot.render_objects.is_empty() {
+        draws
+            .iter()
+            .map(|draw| RenderObject::Drawable(draw.drawable_id.clone()))
+            .collect::<Vec<_>>()
+    } else {
+        snapshot.render_objects.clone()
+    };
+
+    for object in ordered_objects {
+        match object {
+            RenderObject::Drawable(drawable_id) => {
+                let Some(draw_index) = draw_index_by_id.get(&drawable_id).copied() else {
+                    continue;
+                };
+                let parent_part_index = drawable_parent_by_id.get(&drawable_id).copied().flatten();
+                close_completed_offscreens(
+                    snapshot,
+                    parent_part_index,
+                    &mut active_offscreens,
+                    &mut commands,
+                );
+                commands.push(RenderCommand::Draw { draw_index });
+            }
+            RenderObject::Offscreen(offscreen_index) => {
+                let Some(offscreen) = snapshot.offscreens.get(offscreen_index) else {
+                    continue;
+                };
+                let parent_part_index = offscreen
+                    .owner_part_index
+                    .and_then(|owner| part_parent_index(snapshot, owner));
+                close_completed_offscreens(
+                    snapshot,
+                    parent_part_index,
+                    &mut active_offscreens,
+                    &mut commands,
+                );
+                active_offscreens.push(offscreen_index);
+                commands.push(RenderCommand::BeginOffscreen { offscreen_index });
+            }
+        }
+    }
+
+    while let Some(offscreen_index) = active_offscreens.pop() {
+        commands.push(RenderCommand::CompositeOffscreen { offscreen_index });
+    }
+    commands
+}
+
+fn close_completed_offscreens(
+    snapshot: &ModelSnapshot,
+    target_parent_part_index: Option<usize>,
+    active_offscreens: &mut Vec<usize>,
+    commands: &mut Vec<RenderCommand>,
+) {
+    while let Some(offscreen_index) = active_offscreens.last().copied() {
+        let owner_part_index = snapshot
+            .offscreens
+            .get(offscreen_index)
+            .and_then(|offscreen| offscreen.owner_part_index);
+        if part_is_descendant_of(snapshot, target_parent_part_index, owner_part_index) {
+            break;
+        }
+        active_offscreens.pop();
+        commands.push(RenderCommand::CompositeOffscreen { offscreen_index });
+    }
+}
+
+fn part_parent_index(snapshot: &ModelSnapshot, part_index: usize) -> Option<usize> {
+    snapshot
+        .part_parent_indices
+        .get(part_index)
+        .copied()
+        .flatten()
+}
+
+fn part_is_descendant_of(
+    snapshot: &ModelSnapshot,
+    mut part_index: Option<usize>,
+    ancestor_index: Option<usize>,
+) -> bool {
+    let Some(ancestor_index) = ancestor_index else {
+        return false;
+    };
+    while let Some(current) = part_index {
+        if current == ancestor_index {
+            return true;
+        }
+        part_index = part_parent_index(snapshot, current);
+    }
+    false
+}
+
 enum DrawLookup<'a> {
     Linear(&'a [DrawCommand]),
     Indexed(HashMap<&'a DrawableId, &'a DrawCommand>),
@@ -958,7 +1092,9 @@ struct MaskKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use live2d_core::{CanvasInfo, ClippingInfo, Drawable, TextureAsset, Vertex};
+    use live2d_core::{
+        CanvasInfo, ClippingInfo, Drawable, Offscreen, RenderObject, TextureAsset, Vertex,
+    };
 
     #[test]
     fn builds_draws_in_render_order() {
@@ -972,6 +1108,9 @@ mod tests {
                 rgba: vec![255, 255, 255, 255],
             }],
             drawables: vec![drawable("b", 20, None), drawable("a", 10, None)],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
 
         let plan = RenderPlanner::new().build(&snapshot);
@@ -982,6 +1121,53 @@ mod tests {
             .map(|draw| draw.drawable_id.as_ref())
             .collect::<Vec<_>>();
         assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn render_commands_wrap_drawables_in_owner_offscreen_order() {
+        let body = drawable("body", 0, None);
+        let mut arm = drawable("arm", 2, None);
+        arm.parent_part_index = Some(0);
+        let mut sleeve = drawable("sleeve", 3, None);
+        sleeve.parent_part_index = Some(1);
+        let outside = drawable("outside", 4, None);
+        let snapshot = ModelSnapshot {
+            model_key: "sample".into(),
+            canvas: CanvasInfo::default(),
+            art_meshes: Vec::new(),
+            textures: Vec::new(),
+            drawables: vec![body, arm, sleeve, outside],
+            offscreens: vec![Offscreen {
+                index: 0,
+                render_order: 1,
+                owner_part_index: Some(0),
+                opacity: 1.0,
+                blend_mode: BlendMode::Normal,
+                clipping: None,
+            }],
+            render_objects: vec![
+                RenderObject::Drawable(DrawableId::from("body")),
+                RenderObject::Offscreen(0),
+                RenderObject::Drawable(DrawableId::from("arm")),
+                RenderObject::Drawable(DrawableId::from("sleeve")),
+                RenderObject::Drawable(DrawableId::from("outside")),
+            ],
+            part_parent_indices: vec![None, Some(0)],
+        };
+
+        let plan = RenderPlanner::new().build(&snapshot);
+
+        assert_eq!(
+            plan.commands,
+            vec![
+                RenderCommand::Draw { draw_index: 0 },
+                RenderCommand::BeginOffscreen { offscreen_index: 0 },
+                RenderCommand::Draw { draw_index: 1 },
+                RenderCommand::Draw { draw_index: 2 },
+                RenderCommand::CompositeOffscreen { offscreen_index: 0 },
+                RenderCommand::Draw { draw_index: 3 },
+            ]
+        );
     }
 
     #[test]
@@ -1002,6 +1188,9 @@ mod tests {
                     }),
                 ),
             ],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
 
         let plan = RenderPlanner::new().build(&snapshot);
@@ -1020,6 +1209,9 @@ mod tests {
             art_meshes: Vec::new(),
             textures: Vec::new(),
             drawables: vec![drawable("half", 0, None)],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
         snapshot.drawables[0].opacity = 0.35;
 
@@ -1043,6 +1235,9 @@ mod tests {
             art_meshes: Vec::new(),
             textures: Vec::new(),
             drawables: vec![hidden, zero_alpha, drawable("visible", 2, None)],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
 
         let plan = RenderPlanner::new().build(&snapshot);
@@ -1074,6 +1269,9 @@ mod tests {
                     }),
                 ),
             ],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
 
         let plan = RenderPlanner::new().build(&snapshot);
@@ -1126,6 +1324,9 @@ mod tests {
                     }),
                 ),
             ],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
 
         let plan = RenderPlanner::new().build(&snapshot);
@@ -1146,6 +1347,9 @@ mod tests {
                 drawable_with_shape("b", 20, 2, 3),
                 drawable_with_shape("a", 10, 3, 6),
             ],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
 
         let plan = RenderPlanner::new().build(&snapshot);
@@ -1179,6 +1383,9 @@ mod tests {
             art_meshes: Vec::new(),
             textures: Vec::new(),
             drawables: vec![drawable("b", 20, None), drawable("a", 10, None)],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
         let mut world = RenderWorld::new();
 
@@ -1207,6 +1414,9 @@ mod tests {
             art_meshes: Vec::new(),
             textures: Vec::new(),
             drawables: vec![drawable("fading", 0, None), drawable("visible", 1, None)],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
         let mut world = RenderWorld::new();
 
@@ -1247,6 +1457,9 @@ mod tests {
             art_meshes: Vec::new(),
             textures: Vec::new(),
             drawables: vec![mask, mask_source, snapshot_masked],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
         let mut world = RenderWorld::new();
 
@@ -1268,6 +1481,9 @@ mod tests {
             art_meshes: Vec::new(),
             textures: Vec::new(),
             drawables: vec![drawable("a", 0, None), drawable("b", 1, None)],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
         let model_b = ModelSnapshot {
             model_key: "model-b".into(),
@@ -1275,6 +1491,9 @@ mod tests {
             art_meshes: Vec::new(),
             textures: Vec::new(),
             drawables: vec![drawable("a", 0, None), drawable("b", 1, None)],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
         let mut world = RenderWorld::new();
 
@@ -1313,6 +1532,9 @@ mod tests {
                     }),
                 ),
             ],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
         let plan = RenderPlanner::new().build(&snapshot);
         let mut backend = RecordingBackend::default();
@@ -1430,6 +1652,9 @@ mod tests {
                     }),
                 ),
             ],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
         let planner = RenderPlanner::new();
         let recorder = live2d_probe::ProbeRecorder::new();
@@ -1471,6 +1696,9 @@ mod tests {
                     }),
                 ),
             ],
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
         };
         let plan = RenderPlanner::new().build(&snapshot);
         let recorder = live2d_probe::ProbeRecorder::new();
@@ -1584,6 +1812,7 @@ mod tests {
         Drawable {
             id: DrawableId::from(id),
             render_order,
+            parent_part_index: None,
             texture_index: 0,
             vertices: vec![Vertex {
                 position: [0.0, 0.0],
@@ -1606,6 +1835,7 @@ mod tests {
         Drawable {
             id: DrawableId::from(id),
             render_order,
+            parent_part_index: None,
             texture_index: 0,
             vertices: (0..vertex_count)
                 .map(|index| Vertex {

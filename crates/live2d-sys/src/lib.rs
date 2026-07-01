@@ -142,6 +142,7 @@ extern "C" {
     pub fn csmGetPartCount(model: *const CsmModel) -> c_int;
     pub fn csmGetPartIds(model: *const CsmModel) -> *const *const c_char;
     pub fn csmGetPartOpacities(model: *mut CsmModel) -> *mut f32;
+    pub fn csmGetPartParentPartIndices(model: *const CsmModel) -> *const c_int;
     pub fn csmReadCanvasInfo(
         model: *const CsmModel,
         out_size: *mut CsmVector2,
@@ -163,4 +164,12 @@ extern "C" {
     pub fn csmGetDrawableVertexUvs(model: *const CsmModel) -> *const *const CsmVector2;
     pub fn csmGetDrawableIndexCounts(model: *const CsmModel) -> *const c_int;
     pub fn csmGetDrawableIndices(model: *const CsmModel) -> *const *const u16;
+    pub fn csmGetDrawableParentPartIndices(model: *const CsmModel) -> *const c_int;
+    pub fn csmGetOffscreenCount(model: *const CsmModel) -> c_int;
+    pub fn csmGetOffscreenBlendModes(model: *const CsmModel) -> *const c_int;
+    pub fn csmGetOffscreenOpacities(model: *const CsmModel) -> *const f32;
+    pub fn csmGetOffscreenOwnerIndices(model: *const CsmModel) -> *const c_int;
+    pub fn csmGetOffscreenMaskCounts(model: *const CsmModel) -> *const c_int;
+    pub fn csmGetOffscreenMasks(model: *const CsmModel) -> *const *const c_int;
+    pub fn csmGetOffscreenConstantFlags(model: *const CsmModel) -> *const csmFlags;
 }

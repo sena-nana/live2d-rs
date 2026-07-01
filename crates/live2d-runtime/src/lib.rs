@@ -1,7 +1,8 @@
 use live2d_core::{ArtMeshInfo, ModelSnapshot};
 #[cfg(feature = "live2d-cubism")]
 use live2d_core::{
-    BlendMode, CanvasInfo, ClippingInfo, Drawable, DrawableId, TextureAsset, Vertex,
+    BlendMode, CanvasInfo, ClippingInfo, Drawable, DrawableId, Offscreen, RenderObject,
+    TextureAsset, Vertex,
 };
 #[cfg(all(feature = "probe", feature = "live2d-cubism"))]
 use live2d_probe::ProbeAttr;
@@ -1096,12 +1097,16 @@ mod runtime {
         canvas: CanvasInfo,
         art_meshes: Vec<ArtMeshInfo>,
         drawable_metas: Vec<DrawableStaticMeta>,
+        offscreens: Vec<Offscreen>,
+        part_parent_indices: Vec<Option<usize>>,
+        render_objects: Vec<RenderObject>,
     }
 
     #[derive(Debug, Clone)]
     struct DrawableStaticMeta {
         id: DrawableId,
         source_index: usize,
+        parent_part_index: Option<usize>,
         texture_index: usize,
         blend_mode: BlendMode,
         clipping: Option<ClippingInfo>,
@@ -1115,6 +1120,24 @@ mod runtime {
         render_order: i32,
         visible: bool,
         opacity: f32,
+    }
+
+    #[derive(Debug, Clone)]
+    struct StaticModelData {
+        canvas: CanvasInfo,
+        drawables: Vec<DrawableStaticMeta>,
+        offscreens: Vec<Offscreen>,
+        part_parent_indices: Vec<Option<usize>>,
+        render_objects: Vec<RenderObject>,
+        art_meshes: Vec<ArtMeshInfo>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct DynamicSnapshotState {
+        drawables: Vec<DrawableDynamicState>,
+        offscreens: Vec<Offscreen>,
+        render_objects: Vec<RenderObject>,
+        retained_indices: Vec<bool>,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -1143,6 +1166,9 @@ mod runtime {
                 canvas: CanvasInfo::default(),
                 art_meshes: Vec::new(),
                 drawable_metas: Vec::new(),
+                offscreens: Vec::new(),
+                part_parent_indices: Vec::new(),
+                render_objects: Vec::new(),
             })
         }
 
@@ -1153,7 +1179,7 @@ mod runtime {
             let parameter_indices = build_parameter_indices(&parameters);
             let parts = unsafe { read_parts(model)? };
             let part_indices = build_part_indices(&parts);
-            let (canvas, drawable_metas, art_meshes) = unsafe { read_static_model(model)? };
+            let static_model = unsafe { read_static_model(model)? };
             Ok(Self {
                 _moc_bytes: moc_bytes,
                 _model_bytes: model_bytes,
@@ -1162,9 +1188,12 @@ mod runtime {
                 parameter_indices,
                 parts,
                 part_indices,
-                canvas,
-                art_meshes,
-                drawable_metas,
+                canvas: static_model.canvas,
+                art_meshes: static_model.art_meshes,
+                drawable_metas: static_model.drawables,
+                offscreens: static_model.offscreens,
+                part_parent_indices: static_model.part_parent_indices,
+                render_objects: static_model.render_objects,
             })
         }
 
@@ -1340,6 +1369,9 @@ mod runtime {
                 canvas: self.canvas.clone(),
                 art_meshes: self.art_meshes.clone(),
                 drawables: self.empty_drawables(),
+                offscreens: self.offscreens.clone(),
+                render_objects: self.render_objects.clone(),
+                part_parent_indices: self.part_parent_indices.clone(),
                 textures,
             };
             self.refresh_snapshot_drawables(&mut snapshot, model_opacity)?;
@@ -1409,6 +1441,7 @@ mod runtime {
                 .map(|meta| Drawable {
                     id: meta.id.clone(),
                     render_order: 0,
+                    parent_part_index: meta.parent_part_index,
                     texture_index: meta.texture_index,
                     vertices: Vec::with_capacity(meta.uvs.len()),
                     indices: Vec::with_capacity(meta.indices.len()),
@@ -1425,10 +1458,13 @@ mod runtime {
             snapshot: &mut ModelSnapshot,
             model_opacity: f32,
         ) -> Result<SnapshotCopyStats, String> {
-            let (states, retained_indices) = unsafe { self.dynamic_snapshot_state(model_opacity)? };
+            let state = unsafe { self.dynamic_snapshot_state(model_opacity)? };
             if snapshot.drawables.len() != self.drawable_metas.len() {
                 snapshot.drawables = self.empty_drawables();
             }
+            snapshot.offscreens = state.offscreens.clone();
+            snapshot.render_objects = state.render_objects.clone();
+            snapshot.part_parent_indices = self.part_parent_indices.clone();
 
             let vertex_positions = unsafe { live2d_sys::csmGetDrawableVertexPositions(self.model) };
             if vertex_positions.is_null() && !self.drawable_metas.is_empty() {
@@ -1438,8 +1474,9 @@ mod runtime {
             let mut stats = SnapshotCopyStats::default();
             for index in 0..self.drawable_metas.len() {
                 let meta = &self.drawable_metas[index];
-                let state = states[index];
-                let retained = retained_indices
+                let drawable_state = state.drawables[index];
+                let retained = state
+                    .retained_indices
                     .get(meta.source_index)
                     .copied()
                     .unwrap_or(false);
@@ -1451,10 +1488,11 @@ mod runtime {
                     return Err("live2d_model_snapshot_failed".into());
                 };
 
-                drawable.render_order = state.render_order;
+                drawable.render_order = drawable_state.render_order;
+                drawable.parent_part_index = meta.parent_part_index;
                 drawable.texture_index = meta.texture_index;
-                drawable.visible = state.visible;
-                drawable.opacity = state.opacity;
+                drawable.visible = drawable_state.visible;
+                drawable.opacity = drawable_state.opacity;
                 drawable.blend_mode = meta.blend_mode;
                 if drawable.clipping != meta.clipping {
                     drawable.clipping = meta.clipping.clone();
@@ -1517,14 +1555,22 @@ mod runtime {
         unsafe fn dynamic_snapshot_state(
             &self,
             model_opacity: f32,
-        ) -> Result<(Vec<DrawableDynamicState>, Vec<bool>), String> {
+        ) -> Result<DynamicSnapshotState, String> {
             let count = live2d_sys::csmGetDrawableCount(self.model).max(0) as usize;
+            let offscreen_count = live2d_sys::csmGetOffscreenCount(self.model).max(0) as usize;
+            if offscreen_count != self.offscreens.len() {
+                return Err("live2d_model_topology_changed".into());
+            }
             let dynamic_flags = live2d_sys::csmGetDrawableDynamicFlags(self.model);
             let render_orders = live2d_sys::csmGetRenderOrders(self.model);
             let opacities = live2d_sys::csmGetDrawableOpacities(self.model);
+            let offscreen_opacities = live2d_sys::csmGetOffscreenOpacities(self.model);
             if (dynamic_flags.is_null() || render_orders.is_null() || opacities.is_null())
                 && count > 0
             {
+                return Err("live2d_model_snapshot_failed".into());
+            }
+            if offscreen_opacities.is_null() && offscreen_count > 0 {
                 return Err("live2d_model_snapshot_failed".into());
             }
 
@@ -1545,6 +1591,15 @@ mod runtime {
                 states.push(state);
             }
 
+            let mut offscreens = self.offscreens.clone();
+            for (index, offscreen) in offscreens.iter_mut().enumerate() {
+                offscreen.render_order = *render_orders.add(count + index);
+                offscreen.opacity =
+                    (*offscreen_opacities.add(index) * opacity_scale).clamp(0.0, 1.0);
+            }
+            let render_objects =
+                render_objects_from_orders(count, &self.drawable_metas, &offscreens, render_orders);
+
             for (meta, state) in self.drawable_metas.iter().zip(states.iter()) {
                 if state.visible && state.opacity > 1e-6 {
                     retained_indices[meta.source_index] = true;
@@ -1555,7 +1610,12 @@ mod runtime {
                     }
                 }
             }
-            Ok((states, retained_indices))
+            Ok(DynamicSnapshotState {
+                drawables: states,
+                offscreens,
+                render_objects,
+                retained_indices,
+            })
         }
     }
 
@@ -1700,12 +1760,13 @@ mod runtime {
             measure(probe, Stage::RuntimeModelUpdate, Vec::new(), || unsafe {
                 live2d_sys::csmUpdateModel(model)
             });
-            let (canvas, drawables, art_meshes) = measure(
-                probe,
-                Stage::RuntimeSnapshotExtract,
-                Vec::new(),
-                || unsafe { snapshot_model(model, 1.0) },
-            )?;
+            let (canvas, drawables, offscreens, render_objects, part_parent_indices, art_meshes) =
+                measure(
+                    probe,
+                    Stage::RuntimeSnapshotExtract,
+                    Vec::new(),
+                    || unsafe { snapshot_model(model, 1.0) },
+                )?;
             counter(
                 probe,
                 Stage::RuntimeSnapshotExtract,
@@ -1719,6 +1780,9 @@ mod runtime {
                 canvas,
                 art_meshes,
                 drawables,
+                offscreens,
+                render_objects,
+                part_parent_indices,
                 textures,
             })
         })
@@ -1903,7 +1967,7 @@ mod runtime {
 
     unsafe fn read_static_model(
         model: *mut live2d_sys::CsmModel,
-    ) -> Result<(CanvasInfo, Vec<DrawableStaticMeta>, Vec<ArtMeshInfo>), String> {
+    ) -> Result<StaticModelData, String> {
         let mut canvas_size = live2d_sys::CsmVector2 { x: 2.0, y: 2.0 };
         let mut canvas_origin = live2d_sys::CsmVector2 { x: 0.0, y: 0.0 };
         let mut pixels_per_unit = 1.0;
@@ -1914,20 +1978,32 @@ mod runtime {
             &mut pixels_per_unit,
         );
 
+        let part_count = live2d_sys::csmGetPartCount(model).max(0) as usize;
         let count = live2d_sys::csmGetDrawableCount(model).max(0) as usize;
+        let offscreen_count = live2d_sys::csmGetOffscreenCount(model).max(0) as usize;
         let ids = live2d_sys::csmGetDrawableIds(model);
         let constant_flags = live2d_sys::csmGetDrawableConstantFlags(model);
         let blend_modes = live2d_sys::csmGetDrawableBlendModes(model);
         let texture_indices = live2d_sys::csmGetDrawableTextureIndices(model);
+        let parent_part_indices = live2d_sys::csmGetDrawableParentPartIndices(model);
         let mask_counts = live2d_sys::csmGetDrawableMaskCounts(model);
         let masks = live2d_sys::csmGetDrawableMasks(model);
         let vertex_counts = live2d_sys::csmGetDrawableVertexCounts(model);
         let vertex_uvs = live2d_sys::csmGetDrawableVertexUvs(model);
         let index_counts = live2d_sys::csmGetDrawableIndexCounts(model);
         let indices = live2d_sys::csmGetDrawableIndices(model);
+        let part_parent_indices_ptr = live2d_sys::csmGetPartParentPartIndices(model);
+        let render_orders = live2d_sys::csmGetRenderOrders(model);
+        let offscreen_blend_modes = live2d_sys::csmGetOffscreenBlendModes(model);
+        let offscreen_opacities = live2d_sys::csmGetOffscreenOpacities(model);
+        let offscreen_owner_indices = live2d_sys::csmGetOffscreenOwnerIndices(model);
+        let offscreen_mask_counts = live2d_sys::csmGetOffscreenMaskCounts(model);
+        let offscreen_masks = live2d_sys::csmGetOffscreenMasks(model);
+        let offscreen_constant_flags = live2d_sys::csmGetOffscreenConstantFlags(model);
         if (ids.is_null()
             || constant_flags.is_null()
             || texture_indices.is_null()
+            || parent_part_indices.is_null()
             || mask_counts.is_null()
             || masks.is_null()
             || vertex_counts.is_null()
@@ -1938,6 +2014,26 @@ mod runtime {
         {
             return Err("live2d_model_snapshot_failed".into());
         }
+        if part_parent_indices_ptr.is_null() && part_count > 0 {
+            return Err("live2d_model_snapshot_failed".into());
+        }
+        if render_orders.is_null() && (count + offscreen_count) > 0 {
+            return Err("live2d_model_snapshot_failed".into());
+        }
+        if (offscreen_blend_modes.is_null()
+            || offscreen_opacities.is_null()
+            || offscreen_owner_indices.is_null()
+            || offscreen_mask_counts.is_null()
+            || offscreen_masks.is_null()
+            || offscreen_constant_flags.is_null())
+            && offscreen_count > 0
+        {
+            return Err("live2d_model_snapshot_failed".into());
+        }
+
+        let part_parent_indices = (0..part_count)
+            .map(|index| optional_index(*part_parent_indices_ptr.add(index)))
+            .collect::<Vec<_>>();
 
         let mut id_by_index = Vec::with_capacity(count);
         let mut art_meshes = Vec::new();
@@ -2023,6 +2119,7 @@ mod runtime {
             drawable_metas.push(DrawableStaticMeta {
                 id: drawable_id,
                 source_index: index,
+                parent_part_index: optional_index(*parent_part_indices.add(index)),
                 texture_index: (*texture_indices.add(index)).max(0) as usize,
                 blend_mode,
                 clipping,
@@ -2032,15 +2129,116 @@ mod runtime {
             });
         }
 
-        Ok((
-            CanvasInfo {
+        let offscreens = read_offscreens(
+            count,
+            offscreen_count,
+            render_orders,
+            offscreen_blend_modes,
+            offscreen_opacities,
+            offscreen_owner_indices,
+            offscreen_mask_counts,
+            offscreen_masks,
+            offscreen_constant_flags,
+            &id_by_index,
+        )?;
+        let render_objects =
+            render_objects_from_orders(count, &drawable_metas, &offscreens, render_orders);
+
+        Ok(StaticModelData {
+            canvas: CanvasInfo {
                 size: [canvas_size.x, canvas_size.y],
                 origin: [canvas_origin.x, canvas_origin.y],
                 pixels_per_unit,
             },
-            drawable_metas,
+            drawables: drawable_metas,
+            offscreens,
+            part_parent_indices,
+            render_objects,
             art_meshes,
-        ))
+        })
+    }
+
+    unsafe fn read_offscreens(
+        drawable_count: usize,
+        offscreen_count: usize,
+        render_orders: *const std::os::raw::c_int,
+        blend_modes: *const std::os::raw::c_int,
+        opacities: *const f32,
+        owner_indices: *const std::os::raw::c_int,
+        mask_counts: *const std::os::raw::c_int,
+        masks: *const *const std::os::raw::c_int,
+        constant_flags: *const live2d_sys::csmFlags,
+        id_by_index: &[Option<DrawableId>],
+    ) -> Result<Vec<Offscreen>, String> {
+        let mut offscreens = Vec::with_capacity(offscreen_count);
+        for index in 0..offscreen_count {
+            let mask_count = (*mask_counts.add(index)).max(0) as usize;
+            let mut mask_ids = Vec::new();
+            if mask_count > 0 {
+                let mask_ptr = *masks.add(index);
+                if mask_ptr.is_null() {
+                    return Err("live2d_model_snapshot_failed".into());
+                }
+                for mask_index in std::slice::from_raw_parts(mask_ptr, mask_count) {
+                    if *mask_index < 0 {
+                        continue;
+                    }
+                    if let Some(Some(mask_id)) = id_by_index.get(*mask_index as usize) {
+                        mask_ids.push(mask_id.clone());
+                    }
+                }
+            }
+            let clipping = if mask_ids.is_empty() {
+                None
+            } else {
+                Some(ClippingInfo {
+                    drawable_ids: mask_ids,
+                    inverted: false,
+                })
+            };
+            let constant = *constant_flags.add(index);
+            let blend_mode = if blend_modes.is_null() {
+                blend_mode_from_constant_flags(constant)
+            } else {
+                BlendMode::from_cubism_blend_mode(*blend_modes.add(index))
+            };
+            offscreens.push(Offscreen {
+                index,
+                render_order: *render_orders.add(drawable_count + index),
+                owner_part_index: optional_index(*owner_indices.add(index)),
+                opacity: (*opacities.add(index)).clamp(0.0, 1.0),
+                blend_mode,
+                clipping,
+            });
+        }
+        Ok(offscreens)
+    }
+
+    fn optional_index(index: std::os::raw::c_int) -> Option<usize> {
+        (index >= 0).then_some(index as usize)
+    }
+
+    unsafe fn render_objects_from_orders(
+        drawable_count: usize,
+        drawables: &[DrawableStaticMeta],
+        offscreens: &[Offscreen],
+        render_orders: *const std::os::raw::c_int,
+    ) -> Vec<RenderObject> {
+        let mut ordered = Vec::new();
+        for drawable in drawables {
+            ordered.push((
+                *render_orders.add(drawable.source_index),
+                RenderObject::Drawable(drawable.id.clone()),
+            ));
+        }
+        for offscreen in offscreens {
+            ordered.push((
+                *render_orders.add(drawable_count + offscreen.index),
+                RenderObject::Offscreen(offscreen.index),
+            ));
+        }
+        ordered.sort_by_key(|(order, _)| *order);
+        ordered.into_iter().map(|(_, object)| object).collect()
     }
 
     fn blend_mode_from_constant_flags(flags: live2d_sys::csmFlags) -> BlendMode {
@@ -2057,191 +2255,51 @@ mod runtime {
     unsafe fn snapshot_model(
         model: *mut live2d_sys::CsmModel,
         model_opacity: f32,
-    ) -> Result<(CanvasInfo, Vec<Drawable>, Vec<ArtMeshInfo>), String> {
-        let mut canvas_size = live2d_sys::CsmVector2 { x: 2.0, y: 2.0 };
-        let mut canvas_origin = live2d_sys::CsmVector2 { x: 0.0, y: 0.0 };
-        let mut pixels_per_unit = 1.0;
-        live2d_sys::csmReadCanvasInfo(
+    ) -> Result<
+        (
+            CanvasInfo,
+            Vec<Drawable>,
+            Vec<Offscreen>,
+            Vec<RenderObject>,
+            Vec<Option<usize>>,
+            Vec<ArtMeshInfo>,
+        ),
+        String,
+    > {
+        let static_model = read_static_model(model)?;
+        let runtime = CubismLive2DModel {
+            _moc_bytes: Vec::new(),
+            _model_bytes: Vec::new(),
             model,
-            &mut canvas_size,
-            &mut canvas_origin,
-            &mut pixels_per_unit,
-        );
-        let count = live2d_sys::csmGetDrawableCount(model).max(0) as usize;
-        let ids = live2d_sys::csmGetDrawableIds(model);
-        let constant_flags = live2d_sys::csmGetDrawableConstantFlags(model);
-        let dynamic_flags = live2d_sys::csmGetDrawableDynamicFlags(model);
-        let render_orders = live2d_sys::csmGetRenderOrders(model);
-        let texture_indices = live2d_sys::csmGetDrawableTextureIndices(model);
-        let opacities = live2d_sys::csmGetDrawableOpacities(model);
-        let mask_counts = live2d_sys::csmGetDrawableMaskCounts(model);
-        let masks = live2d_sys::csmGetDrawableMasks(model);
-        let vertex_counts = live2d_sys::csmGetDrawableVertexCounts(model);
-        let vertex_positions = live2d_sys::csmGetDrawableVertexPositions(model);
-        let vertex_uvs = live2d_sys::csmGetDrawableVertexUvs(model);
-        let index_counts = live2d_sys::csmGetDrawableIndexCounts(model);
-        let indices = live2d_sys::csmGetDrawableIndices(model);
-        if ids.is_null()
-            || constant_flags.is_null()
-            || dynamic_flags.is_null()
-            || render_orders.is_null()
-            || texture_indices.is_null()
-            || opacities.is_null()
-            || mask_counts.is_null()
-            || masks.is_null()
-            || vertex_counts.is_null()
-            || vertex_positions.is_null()
-            || vertex_uvs.is_null()
-            || index_counts.is_null()
-            || indices.is_null()
-        {
-            return Err("live2d_model_snapshot_failed".into());
-        }
-
-        struct DrawableMeta {
-            id: DrawableId,
-            source_index: usize,
-            render_order: i32,
-            texture_index: usize,
-            visible: bool,
-            opacity: f32,
-            blend_mode: BlendMode,
-            clipping: Option<ClippingInfo>,
-            mask_indices: Vec<usize>,
-        }
-
-        let opacity_scale = model_opacity.clamp(0.0, 1.0);
-        let mut id_by_index = Vec::with_capacity(count);
-        let mut art_meshes = Vec::new();
-        for index in 0..count {
-            let id_ptr = *ids.add(index);
-            if id_ptr.is_null() {
-                id_by_index.push(None);
-                continue;
-            }
-            let id = CStr::from_ptr(id_ptr).to_string_lossy().into_owned();
-            let drawable_id = DrawableId(id);
-            art_meshes.push(ArtMeshInfo {
-                id: drawable_id.clone(),
-                label: drawable_id.0.clone(),
-                original_name: drawable_id.0.clone(),
-                index,
-                mask_type: "unknown".into(),
-            });
-            id_by_index.push(Some(drawable_id));
-        }
-
-        let mut metas = Vec::new();
-        for index in 0..count {
-            let Some(drawable_id) = id_by_index[index].clone() else {
-                continue;
-            };
-            let constant = *constant_flags.add(index);
-            let dynamic = *dynamic_flags.add(index);
-            let mask_count = (*mask_counts.add(index)).max(0) as usize;
-            let mut mask_indices = Vec::new();
-            let mut mask_ids = Vec::new();
-            if mask_count > 0 {
-                let mask_ptr = *masks.add(index);
-                if mask_ptr.is_null() {
-                    return Err("live2d_model_snapshot_failed".into());
-                }
-                for mask_index in std::slice::from_raw_parts(mask_ptr, mask_count) {
-                    let mask_index = *mask_index;
-                    if mask_index < 0 {
-                        continue;
-                    }
-                    let mask_index = mask_index as usize;
-                    if let Some(Some(mask_id)) = id_by_index.get(mask_index) {
-                        mask_indices.push(mask_index);
-                        mask_ids.push(mask_id.clone());
-                    }
-                }
-            }
-            let clipping = if mask_ids.is_empty() {
-                None
-            } else {
-                Some(ClippingInfo {
-                    drawable_ids: mask_ids,
-                    inverted: false,
-                })
-            };
-            let blend_mode = if constant & live2d_sys::csmBlendAdditive != 0 {
-                BlendMode::Additive
-            } else if constant & live2d_sys::csmBlendMultiplicative != 0 {
-                BlendMode::Multiplicative
-            } else {
-                BlendMode::Normal
-            };
-            metas.push(DrawableMeta {
-                id: drawable_id,
-                source_index: index,
-                render_order: *render_orders.add(index),
-                texture_index: (*texture_indices.add(index)).max(0) as usize,
-                visible: dynamic & live2d_sys::csmIsVisible != 0,
-                opacity: (*opacities.add(index) * opacity_scale).clamp(0.0, 1.0),
-                blend_mode,
-                clipping,
-                mask_indices,
-            });
-        }
-
-        let mut retained_indices = vec![false; count];
-        for meta in &metas {
-            if meta.visible && meta.opacity > 1e-6 {
-                retained_indices[meta.source_index] = true;
-                for mask_index in &meta.mask_indices {
-                    retained_indices[*mask_index] = true;
-                }
-            }
-        }
-
-        let mut drawables = Vec::with_capacity(metas.len());
-        for meta in metas {
-            let mut vertices = Vec::new();
-            let mut drawable_indices = Vec::new();
-            if retained_indices[meta.source_index] {
-                let vertex_count = *vertex_counts.add(meta.source_index) as usize;
-                let index_count = *index_counts.add(meta.source_index) as usize;
-                let pos_ptr = *vertex_positions.add(meta.source_index);
-                let uv_ptr = *vertex_uvs.add(meta.source_index);
-                let index_ptr = *indices.add(meta.source_index);
-                if pos_ptr.is_null() || uv_ptr.is_null() || index_ptr.is_null() {
-                    return Err("live2d_model_snapshot_failed".into());
-                }
-                let positions = std::slice::from_raw_parts(pos_ptr, vertex_count);
-                let uvs = std::slice::from_raw_parts(uv_ptr, vertex_count);
-                vertices = positions
-                    .iter()
-                    .zip(uvs.iter())
-                    .map(|(position, uv)| Vertex {
-                        position: [position.x, position.y],
-                        uv: [uv.x, uv.y],
-                    })
-                    .collect::<Vec<_>>();
-                drawable_indices = std::slice::from_raw_parts(index_ptr, index_count).to_vec();
-            }
-            drawables.push(Drawable {
-                id: meta.id,
-                render_order: meta.render_order,
-                texture_index: meta.texture_index,
-                vertices,
-                indices: drawable_indices,
-                visible: meta.visible,
-                opacity: meta.opacity,
-                blend_mode: meta.blend_mode,
-                clipping: meta.clipping,
-            });
-        }
-        drawables.sort_by_key(|drawable| drawable.render_order);
+            parameters: Vec::new(),
+            parameter_indices: HashMap::new(),
+            parts: Vec::new(),
+            part_indices: HashMap::new(),
+            canvas: static_model.canvas,
+            art_meshes: static_model.art_meshes,
+            drawable_metas: static_model.drawables,
+            offscreens: static_model.offscreens,
+            part_parent_indices: static_model.part_parent_indices,
+            render_objects: static_model.render_objects,
+        };
+        let mut snapshot = ModelSnapshot {
+            model_key: String::new(),
+            canvas: runtime.canvas.clone(),
+            art_meshes: runtime.art_meshes.clone(),
+            drawables: runtime.empty_drawables(),
+            offscreens: runtime.offscreens.clone(),
+            render_objects: runtime.render_objects.clone(),
+            part_parent_indices: runtime.part_parent_indices.clone(),
+            textures: Vec::new(),
+        };
+        runtime.refresh_snapshot_drawables(&mut snapshot, model_opacity)?;
         Ok((
-            CanvasInfo {
-                size: [canvas_size.x, canvas_size.y],
-                origin: [canvas_origin.x, canvas_origin.y],
-                pixels_per_unit,
-            },
-            drawables,
-            art_meshes,
+            snapshot.canvas,
+            snapshot.drawables,
+            snapshot.offscreens,
+            snapshot.render_objects,
+            snapshot.part_parent_indices,
+            snapshot.art_meshes,
         ))
     }
 
@@ -2613,6 +2671,9 @@ mod tests {
             canvas: live2d_core::CanvasInfo::default(),
             art_meshes: Vec::new(),
             drawables: Vec::new(),
+            offscreens: Vec::new(),
+            render_objects: Vec::new(),
+            part_parent_indices: Vec::new(),
             textures: Vec::new(),
         }
     }

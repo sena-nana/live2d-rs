@@ -20,6 +20,7 @@ pub(crate) fn snapshot_with_drawable(
         drawables: vec![Drawable {
             id: DrawableId::from(id),
             render_order,
+            parent_part_index: None,
             texture_index,
             vertices: (0..vertex_count)
                 .map(|index| Vertex {
@@ -40,6 +41,9 @@ pub(crate) fn snapshot_with_drawable(
                 rgba: vec![255, 255, 255, 255],
             })
             .collect(),
+        offscreens: Vec::new(),
+        render_objects: Vec::new(),
+        part_parent_indices: Vec::new(),
     }
 }
 
@@ -53,6 +57,7 @@ pub(crate) fn snapshot_with_drawables(drawables: &[(&str, i32, usize, usize)]) -
             .map(|(id, render_order, vertex_count, index_count)| Drawable {
                 id: DrawableId::from(*id),
                 render_order: *render_order,
+                parent_part_index: None,
                 texture_index: 0,
                 vertices: (0..*vertex_count)
                     .map(|index| Vertex {
@@ -72,6 +77,9 @@ pub(crate) fn snapshot_with_drawables(drawables: &[(&str, i32, usize, usize)]) -
             height: 1,
             rgba: vec![255, 255, 255, 255],
         }],
+        offscreens: Vec::new(),
+        render_objects: Vec::new(),
+        part_parent_indices: Vec::new(),
     }
 }
 
@@ -84,6 +92,7 @@ pub(crate) fn masked_snapshot() -> ModelSnapshot {
             Drawable {
                 id: DrawableId::from("mask"),
                 render_order: 0,
+                parent_part_index: None,
                 texture_index: 0,
                 vertices: vec![Vertex {
                     position: [0.0, 0.0],
@@ -98,6 +107,7 @@ pub(crate) fn masked_snapshot() -> ModelSnapshot {
             Drawable {
                 id: DrawableId::from("masked"),
                 render_order: 1,
+                parent_part_index: None,
                 texture_index: 0,
                 vertices: vec![Vertex {
                     position: [1.0, 1.0],
@@ -118,6 +128,9 @@ pub(crate) fn masked_snapshot() -> ModelSnapshot {
             height: 1,
             rgba: vec![255, 255, 255, 255],
         }],
+        offscreens: Vec::new(),
+        render_objects: Vec::new(),
+        part_parent_indices: Vec::new(),
     }
 }
 

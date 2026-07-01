@@ -813,6 +813,7 @@ mod tests {
         snapshot.drawables.push(Drawable {
             id: DrawableId::from("mask_extra"),
             render_order: 2,
+            parent_part_index: None,
             texture_index: 0,
             vertices: vec![Vertex {
                 position: [2.0, 2.0],

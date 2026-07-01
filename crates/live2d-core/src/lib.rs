@@ -154,6 +154,7 @@ pub struct ClippingInfo {
 pub struct Drawable {
     pub id: DrawableId,
     pub render_order: i32,
+    pub parent_part_index: Option<usize>,
     pub texture_index: usize,
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u16>,
@@ -161,6 +162,24 @@ pub struct Drawable {
     pub opacity: f32,
     pub blend_mode: BlendMode,
     pub clipping: Option<ClippingInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Offscreen {
+    pub index: usize,
+    pub render_order: i32,
+    pub owner_part_index: Option<usize>,
+    pub opacity: f32,
+    pub blend_mode: BlendMode,
+    pub clipping: Option<ClippingInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RenderObject {
+    Drawable(DrawableId),
+    Offscreen(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -180,6 +199,9 @@ pub struct ModelSnapshot {
     pub canvas: CanvasInfo,
     pub art_meshes: Vec<ArtMeshInfo>,
     pub drawables: Vec<Drawable>,
+    pub offscreens: Vec<Offscreen>,
+    pub render_objects: Vec<RenderObject>,
+    pub part_parent_indices: Vec<Option<usize>>,
     pub textures: Vec<TextureAsset>,
 }
 

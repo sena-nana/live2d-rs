@@ -29,6 +29,7 @@ pub struct WgpuLive2DRenderer {
     pub(crate) texture_sampling: WgpuTextureSampling,
     pub(crate) fallback_mask_bind_group: wgpu::BindGroup,
     pub(crate) fallback_blend_bind_group: wgpu::BindGroup,
+    pub(crate) offscreen_composite_pipeline: wgpu::RenderPipeline,
     pub(crate) uniform_buffer: wgpu::Buffer,
     pub(crate) uniform_bind_group: wgpu::BindGroup,
     pub(crate) uniform_stride: u64,
@@ -40,6 +41,7 @@ pub struct WgpuLive2DRenderer {
     pub(crate) mask_atlas: Option<MaskAtlas>,
     pub(crate) mask_atlas_dirty: bool,
     pub(crate) offscreen_target: Option<OffscreenTarget>,
+    pub(crate) model_offscreen_targets: HashMap<usize, OffscreenTarget>,
     pub(crate) blend_copy_target: Option<BlendCopyTarget>,
     pub(crate) gpu_scenes: HashMap<String, GpuScene>,
     pub(crate) render_world: RenderWorld,
@@ -110,6 +112,53 @@ impl WgpuLive2DRenderer {
                 },
             ],
         });
+        let offscreen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Live2D Offscreen Composite Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("offscreen.wgsl").into()),
+        });
+        let offscreen_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Live2D Offscreen Composite Pipeline Layout"),
+                bind_group_layouts: &[Some(&texture_layout)],
+                immediate_size: 0,
+            });
+        let offscreen_composite_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Live2D Offscreen Composite Pipeline"),
+                layout: Some(&offscreen_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &offscreen_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &offscreen_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Live2D Sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -151,6 +200,7 @@ impl WgpuLive2DRenderer {
             texture_sampling: WgpuTextureSampling::default(),
             fallback_mask_bind_group,
             fallback_blend_bind_group,
+            offscreen_composite_pipeline,
             uniform_buffer,
             uniform_bind_group,
             uniform_stride,
@@ -162,6 +212,7 @@ impl WgpuLive2DRenderer {
             mask_atlas: None,
             mask_atlas_dirty: true,
             offscreen_target: None,
+            model_offscreen_targets: HashMap::new(),
             blend_copy_target: None,
             gpu_scenes: HashMap::new(),
             render_world: RenderWorld::new(),

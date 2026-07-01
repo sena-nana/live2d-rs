@@ -46,6 +46,7 @@ pub(crate) struct OffscreenTarget {
     pub(crate) height: u32,
     pub(crate) texture: wgpu::Texture,
     pub(crate) view: wgpu::TextureView,
+    pub(crate) bind_group: wgpu::BindGroup,
 }
 
 pub(crate) struct BlendCopyTarget {
@@ -57,6 +58,35 @@ pub(crate) struct BlendCopyTarget {
 }
 
 impl WgpuLive2DRenderer {
+    pub(crate) fn ensure_model_offscreen_targets(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        count: usize,
+    ) {
+        let width = width.max(1);
+        let height = height.max(1);
+        self.model_offscreen_targets.retain(|index, target| {
+            *index < count && target.width == width && target.height == height
+        });
+        for index in 0..count {
+            if !self.model_offscreen_targets.contains_key(&index) {
+                self.model_offscreen_targets.insert(
+                    index,
+                    create_offscreen_target(
+                        device,
+                        &self.texture_layout,
+                        &self.sampler,
+                        self.pipelines.target_format,
+                        width,
+                        height,
+                    ),
+                );
+            }
+        }
+    }
+
     pub(crate) fn ensure_offscreen_target(
         &mut self,
         device: &wgpu::Device,
@@ -73,6 +103,8 @@ impl WgpuLive2DRenderer {
         if rebuild {
             self.offscreen_target = Some(create_offscreen_target(
                 device,
+                &self.texture_layout,
+                &self.sampler,
                 self.pipelines.target_format,
                 width,
                 height,
@@ -173,6 +205,8 @@ pub(crate) fn create_empty_sampled_texture_bind_group(
 
 pub(crate) fn create_offscreen_target(
     device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
@@ -195,11 +229,13 @@ pub(crate) fn create_offscreen_target(
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = create_sampled_texture_bind_group(device, layout, sampler, &view);
     OffscreenTarget {
         width,
         height,
         texture,
         view,
+        bind_group,
     }
 }
 
