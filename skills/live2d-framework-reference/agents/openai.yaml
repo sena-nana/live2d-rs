@@ -1,0 +1,4 @@
+interface:
+  display_name: "Live2D Framework Reference"
+  short_description: "Map official Cubism Framework capabilities."
+  default_prompt: "Use $live2d-framework-reference to check official Cubism Native Framework capabilities, source evidence, and live2d-rs coverage before planning or implementation."

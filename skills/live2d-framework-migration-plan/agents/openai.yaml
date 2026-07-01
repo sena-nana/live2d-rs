@@ -1,0 +1,4 @@
+interface:
+  display_name: "Live2D Framework Migration Plan"
+  short_description: "Plan Cubism Framework capability migrations."
+  default_prompt: "Use $live2d-framework-migration-plan to plan phased live2d-rs work against official Cubism Native Framework capabilities."
