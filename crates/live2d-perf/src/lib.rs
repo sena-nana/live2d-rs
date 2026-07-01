@@ -2,9 +2,12 @@ use live2d_core::{
     AlphaBlendMode, BlendMode, CanvasInfo, ClippingInfo, ColorBlendMode, Drawable, DrawableId,
     ModelSnapshot, TextureAsset, Vertex,
 };
-use live2d_probe::{counter, ProbeAttr, ProbeRecorder, RunReport, Stage, StageStats};
+use live2d_probe::{counter, measure, ProbeAttr, ProbeRecorder, RunReport, Stage, StageStats};
 use live2d_render::{
     DrawCommand, Live2DRenderBackend, MaskPass, ModelRenderCtx, RenderPlanner, RenderWorld,
+};
+use live2d_runtime::{
+    Live2DMotion, MotionEvaluation, MotionPlayOptions, MotionPlayer, MotionPriority,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -631,6 +634,113 @@ pub fn run_dispatch_null_backend(config: &SyntheticConfig) -> (RunReport, Counti
     )
 }
 
+pub fn run_motion_update(config: &SyntheticConfig) -> RunReport {
+    let recorder = ProbeRecorder::new();
+    let instance_count = config.drawables.max(1);
+    let frames = config.frames.max(1);
+    let idle_motion = motion_for("ParamAngleX", -5.0, 5.0, true);
+    let action_motion = motion_for("ParamAngleX", 0.0, 30.0, false);
+    let mut players = (0..instance_count)
+        .map(|index| {
+            let mut player = MotionPlayer::new();
+            player.set_idle_motion(
+                idle_motion.clone(),
+                MotionPlayOptions {
+                    loop_playback: true,
+                    fade_in_seconds: 0.1,
+                    fade_out_seconds: 0.1,
+                    priority: MotionPriority::IDLE,
+                    ..MotionPlayOptions::default()
+                },
+            );
+            if index % 4 == 0 {
+                player.play_with_options(
+                    action_motion.clone(),
+                    MotionPlayOptions {
+                        fade_out_seconds: 0.1,
+                        priority: MotionPriority::NORMAL,
+                        ..MotionPlayOptions::default()
+                    },
+                );
+            }
+            player
+        })
+        .collect::<Vec<_>>();
+    let mut evaluations = vec![MotionEvaluation::default(); instance_count];
+    let mut changed_indices = Vec::with_capacity(instance_count);
+    let mut total_events = 0usize;
+
+    for frame in 0..frames {
+        if frame > 0 && frame % 60 == 0 {
+            for player in players.iter_mut().step_by(8) {
+                let _ = player.request_motion(
+                    action_motion.clone(),
+                    MotionPlayOptions {
+                        fade_in_seconds: 0.05,
+                        fade_out_seconds: 0.1,
+                        priority: MotionPriority::FORCE,
+                        ..MotionPlayOptions::default()
+                    },
+                );
+            }
+        }
+        changed_indices.clear();
+        let events = measure(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            vec![ProbeAttr::new("frame", frame as u64)],
+            || {
+                let mut frame_events = 0usize;
+                for (index, (player, evaluation)) in
+                    players.iter_mut().zip(evaluations.iter_mut()).enumerate()
+                {
+                    if player.advance_into(1.0 / 60.0, evaluation) {
+                        changed_indices.push(index);
+                    }
+                    frame_events += evaluation.events.len();
+                }
+                frame_events
+            },
+        );
+        total_events += events;
+        counter(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            "motion_changed_instances",
+            changed_indices.len() as u64,
+            Vec::new(),
+        );
+        counter(
+            &recorder,
+            Stage::RuntimeMotionUpdate,
+            "motion_events",
+            events as u64,
+            Vec::new(),
+        );
+    }
+
+    let mut report_config = config.as_report_config();
+    report_config.insert("motion_instances".into(), instance_count.to_string());
+    report_config.insert("motion_total_events".into(), total_events.to_string());
+    recorder.report("motion-update", report_config, Vec::new())
+}
+
+fn motion_for(parameter_id: &str, start: f32, end: f32, looped: bool) -> Live2DMotion {
+    Live2DMotion::from_json_str(&format!(
+        r#"{{
+            "Meta": {{ "Duration": 1.0, "Loop": {looped} }},
+            "Curves": [
+                {{ "Target": "Parameter", "Id": "{parameter_id}", "Segments": [0, {start}, 0, 1, {end}] }},
+                {{ "Target": "PartOpacity", "Id": "PartBody", "Segments": [0, 1, 0, 1, 0.75] }}
+            ],
+            "UserData": [
+                {{ "Time": 0.5, "Value": "midpoint" }}
+            ]
+        }}"#
+    ))
+    .expect("synthetic motion is valid")
+}
+
 pub fn run_real_model_load(model_path: &Path) -> RunReport {
     let recorder = ProbeRecorder::new();
     let warnings = match live2d_runtime::load_snapshot_with_probe(model_path, &recorder) {
@@ -642,6 +752,161 @@ pub fn run_real_model_load(model_path: &Path) -> RunReport {
         BTreeMap::from([("model".into(), model_path.display().to_string())]),
         warnings,
     )
+}
+
+#[cfg(feature = "live2d-cubism")]
+pub fn run_real_model_motion(
+    model_path: &Path,
+    frames: usize,
+    motion_group: Option<&str>,
+) -> RunReport {
+    let recorder = ProbeRecorder::new();
+    let mut config = BTreeMap::from([
+        ("model".into(), model_path.display().to_string()),
+        ("frames".into(), frames.max(1).to_string()),
+    ]);
+    if let Some(group) = motion_group {
+        config.insert("motion_group".into(), group.to_owned());
+    }
+    let warnings = run_real_model_motion_inner(model_path, frames.max(1), motion_group, &recorder)
+        .map(|metadata| {
+            config.insert("motion_group".into(), metadata.group);
+            config.insert("motion".into(), metadata.motion);
+            config.insert("changed_frames".into(), metadata.changed_frames.to_string());
+            config.insert("motion_events".into(), metadata.motion_events.to_string());
+            Vec::new()
+        })
+        .unwrap_or_else(|err| vec![format!("real model motion failed: {err}")]);
+    recorder.report("real-model-motion", config, warnings)
+}
+
+#[cfg(not(feature = "live2d-cubism"))]
+pub fn run_real_model_motion(
+    model_path: &Path,
+    frames: usize,
+    motion_group: Option<&str>,
+) -> RunReport {
+    let mut config = BTreeMap::from([
+        ("model".into(), model_path.display().to_string()),
+        ("frames".into(), frames.max(1).to_string()),
+    ]);
+    if let Some(group) = motion_group {
+        config.insert("motion_group".into(), group.to_owned());
+    }
+    ProbeRecorder::new().report(
+        "real-model-motion",
+        config,
+        vec!["real-model-motion requires `--features live2d-cubism`".to_owned()],
+    )
+}
+
+#[cfg(feature = "live2d-cubism")]
+struct RealModelMotionMetadata {
+    group: String,
+    motion: String,
+    changed_frames: usize,
+    motion_events: usize,
+}
+
+#[cfg(feature = "live2d-cubism")]
+fn run_real_model_motion_inner(
+    model_path: &Path,
+    frames: usize,
+    motion_group: Option<&str>,
+    recorder: &ProbeRecorder,
+) -> Result<RealModelMotionMetadata, String> {
+    let files = live2d_runtime::resolve_model_files(model_path)?;
+    if !files.missing_files.is_empty() {
+        return Err(format!(
+            "model assets missing: {}",
+            files.missing_files.join(", ")
+        ));
+    }
+    let (group_name, motion_file) = select_motion_file(&files, motion_group)?;
+    let mut instance = live2d_runtime::Live2DInstance::load_file(model_path)?;
+    let mut changed_frames = 0usize;
+    let mut motion_events = 0usize;
+
+    measure(
+        recorder,
+        Stage::RuntimeMotionUpdate,
+        vec![ProbeAttr::new("phase", "start")],
+        || instance.request_motion_file(motion_file, false),
+    )?;
+
+    for frame in 0..frames {
+        if frame > 0 && frame % 120 == 0 {
+            measure(
+                recorder,
+                Stage::RuntimeMotionUpdate,
+                vec![
+                    ProbeAttr::new("phase", "restart"),
+                    ProbeAttr::new("frame", frame as u64),
+                ],
+                || instance.request_motion_file(motion_file, false),
+            )?;
+        }
+        let changed = measure(
+            recorder,
+            Stage::RuntimeMotionUpdate,
+            vec![
+                ProbeAttr::new("phase", "update"),
+                ProbeAttr::new("frame", frame as u64),
+            ],
+            || instance.update_motion(1.0 / 60.0),
+        )?;
+        if changed {
+            changed_frames += 1;
+        }
+        motion_events += instance.motion_events().len();
+    }
+
+    counter(
+        recorder,
+        Stage::RuntimeMotionUpdate,
+        "motion_changed_frames",
+        changed_frames as u64,
+        Vec::new(),
+    );
+    counter(
+        recorder,
+        Stage::RuntimeMotionUpdate,
+        "motion_events",
+        motion_events as u64,
+        Vec::new(),
+    );
+
+    Ok(RealModelMotionMetadata {
+        group: group_name,
+        motion: motion_file.relative_path.clone(),
+        changed_frames,
+        motion_events,
+    })
+}
+
+#[cfg(feature = "live2d-cubism")]
+fn select_motion_file<'a>(
+    files: &'a live2d_runtime::ModelFiles,
+    motion_group: Option<&str>,
+) -> Result<(String, &'a live2d_runtime::ModelMotionFile), String> {
+    let group = if let Some(group_name) = motion_group {
+        files
+            .motion_groups
+            .iter()
+            .find(|group| group.name == group_name)
+            .ok_or_else(|| format!("motion group `{group_name}` not found"))?
+    } else {
+        files
+            .motion_groups
+            .iter()
+            .find(|group| !group.motions.is_empty())
+            .ok_or_else(|| "model declares no motion files".to_owned())?
+    };
+    let motion = group
+        .motions
+        .first()
+        .ok_or_else(|| format!("motion group `{}` is empty", group.name))?;
+    Ok((group.name.clone(), motion))
 }
 
 pub fn synthetic_blend_mode(profile: SyntheticBlendProfile, index: usize) -> BlendMode {
@@ -965,6 +1230,27 @@ mod tests {
         assert_eq!(backend.main_draws, 12);
         assert_eq!(backend.mask_passes, 2);
         assert_eq!(backend.mask_draws, 4);
+    }
+
+    #[test]
+    fn motion_update_reports_changed_instances_and_events() {
+        let config = SyntheticConfig {
+            drawables: 8,
+            frames: 60,
+            ..SyntheticConfig::small()
+        };
+
+        let report = run_motion_update(&config);
+        let stage = report
+            .analysis
+            .stages
+            .get(&Stage::RuntimeMotionUpdate)
+            .unwrap();
+
+        assert_eq!(stage.calls, 60);
+        assert_eq!(report.config.get("motion_instances").unwrap(), "8");
+        assert!(stage.counters["motion_changed_instances"] > 0);
+        assert!(stage.counters["motion_events"] > 0);
     }
 
     #[test]

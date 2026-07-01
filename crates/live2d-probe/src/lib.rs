@@ -18,6 +18,7 @@ pub enum Stage {
     RuntimeModelAllocation,
     RuntimeModelInit,
     RuntimeModelUpdate,
+    RuntimeMotionUpdate,
     RuntimeSnapshotExtract,
     RuntimeLoadSnapshot,
     RenderPlanTotal,

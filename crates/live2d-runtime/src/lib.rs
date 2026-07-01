@@ -8,13 +8,18 @@ use live2d_probe::ProbeAttr;
 #[cfg(feature = "probe")]
 use live2d_probe::{counter, measure, ProbeSink, Stage};
 use serde_json::Value;
+#[cfg(feature = "live2d-cubism")]
+use std::collections::HashMap;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
 mod motion;
-pub use motion::{Live2DMotion, MotionEvaluation, MotionPlaybackState, MotionPlayer};
+pub use motion::{
+    Live2DMotion, MotionEvaluation, MotionEvent, MotionPlayOptions, MotionPlaybackState,
+    MotionPlayer, MotionPriority, MotionStartResult,
+};
 
 #[cfg(not(feature = "live2d-cubism"))]
 const RUNTIME_UNAVAILABLE: &str = "live2d_runtime_unavailable";
@@ -49,6 +54,34 @@ pub struct ParameterInfo {
     pub value: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PartId(pub String);
+
+impl From<String> for PartId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for PartId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl AsRef<str> for PartId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartInfo {
+    pub id: PartId,
+    pub default_opacity: f32,
+    pub opacity: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelFiles {
     pub model_json_path: PathBuf,
@@ -71,6 +104,21 @@ pub struct ModelMotionFile {
     pub relative_path: String,
     pub fade_in_seconds: Option<f32>,
     pub fade_out_seconds: Option<f32>,
+}
+
+impl ModelMotionFile {
+    pub fn load_motion(&self) -> Result<Live2DMotion, String> {
+        Live2DMotion::load_file(&self.path)
+    }
+
+    pub fn play_options(&self, loop_playback: bool) -> MotionPlayOptions {
+        MotionPlayOptions {
+            loop_playback,
+            fade_in_seconds: self.fade_in_seconds.unwrap_or(0.0),
+            fade_out_seconds: self.fade_out_seconds.unwrap_or(0.0),
+            ..MotionPlayOptions::default()
+        }
+    }
 }
 
 pub trait AssetResolver {
@@ -107,6 +155,7 @@ pub struct Live2DInstance {
     snapshot: ModelSnapshot,
     elapsed_seconds: f32,
     motion_player: MotionPlayer,
+    motion_evaluation: MotionEvaluation,
     #[cfg(feature = "live2d-cubism")]
     model: runtime::CubismLive2DModel,
 }
@@ -121,12 +170,21 @@ impl Live2DInstance {
     }
 
     pub fn update(&mut self, dt: f32) -> Result<(), String> {
+        let _ = self.update_motion(dt)?;
+        Ok(())
+    }
+
+    pub fn update_motion(&mut self, dt: f32) -> Result<bool, String> {
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
         self.elapsed_seconds += dt;
-        if let Some(evaluation) = self.motion_player.advance(dt) {
-            self.apply_evaluation(evaluation)?;
+        if self
+            .motion_player
+            .advance_into(dt, &mut self.motion_evaluation)
+        {
+            self.apply_buffered_motion_frame()?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub fn elapsed_seconds(&self) -> f32 {
@@ -146,6 +204,84 @@ impl Live2DInstance {
         Ok(())
     }
 
+    pub fn play_motion_with_options(
+        &mut self,
+        motion: Live2DMotion,
+        options: MotionPlayOptions,
+    ) -> Result<(), String> {
+        self.motion_player.play_with_options(motion, options);
+        if let Err(error) = self.apply_current_motion_frame() {
+            self.motion_player.stop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn play_motion_file(
+        &mut self,
+        motion_file: &ModelMotionFile,
+        loop_playback: bool,
+    ) -> Result<(), String> {
+        let motion = motion_file.load_motion()?;
+        self.play_motion_with_options(motion, motion_file.play_options(loop_playback))
+    }
+
+    pub fn request_motion(
+        &mut self,
+        motion: Live2DMotion,
+        options: MotionPlayOptions,
+    ) -> Result<MotionStartResult, String> {
+        let result = self.motion_player.request_motion(motion, options);
+        if result == MotionStartResult::Started {
+            if let Err(error) = self.apply_current_motion_frame() {
+                self.motion_player.stop();
+                return Err(error);
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn request_motion_file(
+        &mut self,
+        motion_file: &ModelMotionFile,
+        loop_playback: bool,
+    ) -> Result<MotionStartResult, String> {
+        let motion = motion_file.load_motion()?;
+        self.request_motion(motion, motion_file.play_options(loop_playback))
+    }
+
+    pub fn queue_motion(&mut self, motion: Live2DMotion, options: MotionPlayOptions) {
+        self.motion_player.queue_motion(motion, options);
+    }
+
+    pub fn queue_motion_file(
+        &mut self,
+        motion_file: &ModelMotionFile,
+        loop_playback: bool,
+    ) -> Result<(), String> {
+        let motion = motion_file.load_motion()?;
+        self.queue_motion(motion, motion_file.play_options(loop_playback));
+        Ok(())
+    }
+
+    pub fn set_idle_motion(&mut self, motion: Live2DMotion, options: MotionPlayOptions) {
+        self.motion_player.set_idle_motion(motion, options);
+    }
+
+    pub fn set_idle_motion_file(&mut self, motion_file: &ModelMotionFile) -> Result<(), String> {
+        let motion = motion_file.load_motion()?;
+        self.set_idle_motion(motion, motion_file.play_options(true));
+        Ok(())
+    }
+
+    pub fn clear_idle_motion(&mut self) {
+        self.motion_player.clear_idle_motion();
+    }
+
+    pub fn queued_motion_count(&self) -> usize {
+        self.motion_player.queued_motion_count()
+    }
+
     pub fn pause_motion(&mut self) {
         self.motion_player.pause();
     }
@@ -156,6 +292,10 @@ impl Live2DInstance {
 
     pub fn stop_motion(&mut self) {
         self.motion_player.stop();
+    }
+
+    pub fn stop_motion_with_fade(&mut self, fade_out_seconds: f32) {
+        self.motion_player.stop_with_fade(fade_out_seconds);
     }
 
     pub fn seek_motion(&mut self, elapsed_seconds: f32) -> Result<(), String> {
@@ -183,6 +323,10 @@ impl Live2DInstance {
         &self.motion_player
     }
 
+    pub fn motion_events(&self) -> &[MotionEvent] {
+        &self.motion_evaluation.events
+    }
+
     pub fn parameters(&self) -> Result<Vec<ParameterInfo>, String> {
         #[cfg(feature = "live2d-cubism")]
         {
@@ -200,6 +344,25 @@ impl Live2DInstance {
             .parameters()?
             .into_iter()
             .find(|parameter| parameter.id.as_ref() == id))
+    }
+
+    pub fn parts(&self) -> Result<Vec<PartInfo>, String> {
+        #[cfg(feature = "live2d-cubism")]
+        {
+            return self.model.parts();
+        }
+        #[cfg(not(feature = "live2d-cubism"))]
+        {
+            Err(RUNTIME_UNAVAILABLE.into())
+        }
+    }
+
+    pub fn part(&self, id: impl AsRef<str>) -> Result<Option<PartInfo>, String> {
+        let id = id.as_ref();
+        Ok(self
+            .parts()?
+            .into_iter()
+            .find(|part| part.id.as_ref() == id))
     }
 
     pub fn set_parameter(&mut self, id: impl AsRef<str>, value: f32) -> Result<(), String> {
@@ -228,6 +391,32 @@ impl Live2DInstance {
         }
     }
 
+    pub fn set_part_opacity(&mut self, id: impl AsRef<str>, opacity: f32) -> Result<(), String> {
+        self.set_part_opacities(std::iter::once((id, opacity)))
+    }
+
+    pub fn set_part_opacities<I, S>(&mut self, parts: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = (S, f32)>,
+        S: AsRef<str>,
+    {
+        #[cfg(feature = "live2d-cubism")]
+        {
+            let parts = parts
+                .into_iter()
+                .map(|(id, opacity)| (id.as_ref().to_owned(), opacity))
+                .collect::<Vec<_>>();
+            self.model.set_part_opacities(&parts)?;
+            self.model.update_snapshot(&mut self.snapshot, 1.0)?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "live2d-cubism"))]
+        {
+            let _ = parts.into_iter();
+            Err(RUNTIME_UNAVAILABLE.into())
+        }
+    }
+
     pub fn apply_motion(
         &mut self,
         motion: &Live2DMotion,
@@ -235,7 +424,7 @@ impl Live2DInstance {
         loop_playback: bool,
     ) -> Result<(), String> {
         let evaluation = motion.sample(elapsed_seconds, loop_playback);
-        self.apply_evaluation(evaluation)
+        self.apply_evaluation(&evaluation)
     }
 
     #[cfg(feature = "probe")]
@@ -254,16 +443,20 @@ impl Live2DInstance {
     }
 
     pub fn reset_pose(&mut self) -> Result<(), String> {
-        self.apply_evaluation(MotionEvaluation {
+        let evaluation = MotionEvaluation {
             model_opacity: Some(1.0),
             parameters: Vec::new(),
-        })
+            part_opacities: Vec::new(),
+            events: Vec::new(),
+        };
+        self.apply_evaluation(&evaluation)
     }
 
     pub fn reset_parameters(&mut self) -> Result<(), String> {
         #[cfg(feature = "live2d-cubism")]
         {
             self.model.reset_parameters()?;
+            self.model.reset_parts()?;
             self.model.update_snapshot(&mut self.snapshot, 1.0)?;
             return Ok(());
         }
@@ -273,11 +466,14 @@ impl Live2DInstance {
         }
     }
 
-    fn apply_evaluation(&mut self, evaluation: MotionEvaluation) -> Result<(), String> {
+    fn apply_evaluation(&mut self, evaluation: &MotionEvaluation) -> Result<(), String> {
         #[cfg(feature = "live2d-cubism")]
         {
             self.model.reset_parameters()?;
+            self.model.reset_parts()?;
             self.model.write_parameters(&evaluation.parameters)?;
+            self.model
+                .write_part_opacities(&evaluation.part_opacities)?;
             self.model
                 .update_snapshot(&mut self.snapshot, evaluation.model_opacity.unwrap_or(1.0))?;
             return Ok(());
@@ -290,10 +486,34 @@ impl Live2DInstance {
     }
 
     fn apply_current_motion_frame(&mut self) -> Result<(), String> {
-        if let Some(evaluation) = self.motion_player.evaluate() {
-            self.apply_evaluation(evaluation)?;
+        if self
+            .motion_player
+            .evaluate_into(&mut self.motion_evaluation)
+        {
+            self.apply_buffered_motion_frame()?;
         }
         Ok(())
+    }
+
+    fn apply_buffered_motion_frame(&mut self) -> Result<(), String> {
+        #[cfg(feature = "live2d-cubism")]
+        {
+            self.model.reset_parameters()?;
+            self.model.reset_parts()?;
+            self.model
+                .write_parameters(&self.motion_evaluation.parameters)?;
+            self.model
+                .write_part_opacities(&self.motion_evaluation.part_opacities)?;
+            self.model.update_snapshot(
+                &mut self.snapshot,
+                self.motion_evaluation.model_opacity.unwrap_or(1.0),
+            )?;
+            return Ok(());
+        }
+        #[cfg(not(feature = "live2d-cubism"))]
+        {
+            Err(RUNTIME_UNAVAILABLE.into())
+        }
     }
 
     #[cfg(feature = "probe")]
@@ -308,7 +528,10 @@ impl Live2DInstance {
         #[cfg(feature = "live2d-cubism")]
         {
             self.model.reset_parameters()?;
+            self.model.reset_parts()?;
             self.model.write_parameters(&evaluation.parameters)?;
+            self.model
+                .write_part_opacities(&evaluation.part_opacities)?;
             self.model.update_snapshot_with_probe(
                 &mut self.snapshot,
                 evaluation.model_opacity.unwrap_or(1.0),
@@ -323,6 +546,36 @@ impl Live2DInstance {
             Err(RUNTIME_UNAVAILABLE.into())
         }
     }
+}
+
+pub fn update_instances<'a, I>(instances: I, dt: f32) -> Result<usize, String>
+where
+    I: IntoIterator<Item = &'a mut Live2DInstance>,
+{
+    let mut changed = 0;
+    for instance in instances {
+        if instance.update_motion(dt)? {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+pub fn update_instances_into<'a, I>(
+    instances: I,
+    dt: f32,
+    changed_indices: &mut Vec<usize>,
+) -> Result<usize, String>
+where
+    I: IntoIterator<Item = &'a mut Live2DInstance>,
+{
+    changed_indices.clear();
+    for (index, instance) in instances.into_iter().enumerate() {
+        if instance.update_motion(dt)? {
+            changed_indices.push(index);
+        }
+    }
+    Ok(changed_indices.len())
 }
 
 pub fn resolve_model_files(model_json_path: impl AsRef<Path>) -> Result<ModelFiles, String> {
@@ -581,6 +834,7 @@ mod runtime {
             snapshot,
             elapsed_seconds: 0.0,
             motion_player: MotionPlayer::new(),
+            motion_evaluation: MotionEvaluation::default(),
         })
     }
 
@@ -624,6 +878,9 @@ mod runtime {
         _model_bytes: Vec<u8>,
         model: *mut live2d_sys::CsmModel,
         parameters: Vec<ParameterInfo>,
+        parameter_indices: HashMap<String, usize>,
+        parts: Vec<PartInfo>,
+        part_indices: HashMap<String, usize>,
         canvas: CanvasInfo,
         art_meshes: Vec<ArtMeshInfo>,
         drawable_metas: Vec<DrawableStaticMeta>,
@@ -668,6 +925,9 @@ mod runtime {
                 _model_bytes: model_bytes,
                 model,
                 parameters: Vec::new(),
+                parameter_indices: HashMap::new(),
+                parts: Vec::new(),
+                part_indices: HashMap::new(),
                 canvas: CanvasInfo::default(),
                 art_meshes: Vec::new(),
                 drawable_metas: Vec::new(),
@@ -678,12 +938,18 @@ mod runtime {
             let (moc_bytes, model_bytes, model) = load_cubism_model(files)?;
             unsafe { live2d_sys::csmUpdateModel(model) };
             let parameters = unsafe { read_parameters(model)? };
+            let parameter_indices = build_parameter_indices(&parameters);
+            let parts = unsafe { read_parts(model)? };
+            let part_indices = build_part_indices(&parts);
             let (canvas, drawable_metas, art_meshes) = unsafe { read_static_model(model)? };
             Ok(Self {
                 _moc_bytes: moc_bytes,
                 _model_bytes: model_bytes,
                 model,
                 parameters,
+                parameter_indices,
+                parts,
+                part_indices,
                 canvas,
                 art_meshes,
                 drawable_metas,
@@ -707,6 +973,23 @@ mod runtime {
                 .collect())
         }
 
+        pub(crate) fn parts(&self) -> Result<Vec<PartInfo>, String> {
+            let values = unsafe { part_opacity_values(self.model, self.parts.len())? };
+            if values.len() != self.parts.len() {
+                return Err("live2d_part_table_changed".into());
+            }
+            Ok(self
+                .parts
+                .iter()
+                .zip(values.iter())
+                .map(|(part, opacity)| {
+                    let mut part = part.clone();
+                    part.opacity = *opacity;
+                    part
+                })
+                .collect())
+        }
+
         pub(crate) fn reset_parameters(&mut self) -> Result<(), String> {
             let values = unsafe { parameter_values_mut(self.model, self.parameters.len())? };
             if values.len() != self.parameters.len() {
@@ -714,6 +997,17 @@ mod runtime {
             }
             for (value, parameter) in values.iter_mut().zip(self.parameters.iter()) {
                 *value = parameter.default;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn reset_parts(&mut self) -> Result<(), String> {
+            let values = unsafe { part_opacity_values_mut(self.model, self.parts.len())? };
+            if values.len() != self.parts.len() {
+                return Err("live2d_part_table_changed".into());
+            }
+            for (value, part) in values.iter_mut().zip(self.parts.iter()) {
+                *value = part.default_opacity;
             }
             Ok(())
         }
@@ -736,6 +1030,21 @@ mod runtime {
             Ok(())
         }
 
+        pub(crate) fn set_part_opacities(&mut self, parts: &[(String, f32)]) -> Result<(), String> {
+            if parts.is_empty() {
+                return Ok(());
+            }
+            let writes = self.checked_part_opacity_writes(parts)?;
+            let values = unsafe { part_opacity_values_mut(self.model, self.parts.len())? };
+            if values.len() != self.parts.len() {
+                return Err("live2d_part_table_changed".into());
+            }
+            for (index, opacity) in writes {
+                values[index] = opacity;
+            }
+            Ok(())
+        }
+
         pub(crate) fn write_parameters(
             &mut self,
             parameters: &[(String, f32)],
@@ -746,15 +1055,34 @@ mod runtime {
             let writes = parameters
                 .iter()
                 .filter_map(|(id, value)| {
-                    self.parameters
-                        .iter()
-                        .position(|candidate| candidate.id.as_ref() == id)
-                        .map(|index| (index, *value))
+                    self.parameter_indices.get(id).map(|index| (*index, *value))
                 })
                 .collect::<Vec<_>>();
             let values = unsafe { parameter_values_mut(self.model, self.parameters.len())? };
             for (index, value) in writes {
                 values[index] = value;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn write_part_opacities(
+            &mut self,
+            parts: &[(String, f32)],
+        ) -> Result<(), String> {
+            if parts.is_empty() {
+                return Ok(());
+            }
+            let writes = parts
+                .iter()
+                .filter_map(|(id, opacity)| {
+                    self.part_indices
+                        .get(id)
+                        .map(|index| (*index, opacity.clamp(0.0, 1.0)))
+                })
+                .collect::<Vec<_>>();
+            let values = unsafe { part_opacity_values_mut(self.model, self.parts.len())? };
+            for (index, opacity) in writes {
+                values[index] = opacity;
             }
             Ok(())
         }
@@ -765,15 +1093,25 @@ mod runtime {
         ) -> Result<Vec<(usize, f32)>, String> {
             let mut writes = Vec::with_capacity(parameters.len());
             for (id, value) in parameters {
-                let Some(index) = self
-                    .parameters
-                    .iter()
-                    .position(|parameter| parameter.id.as_ref() == id)
-                else {
+                let Some(index) = self.parameter_indices.get(id).copied() else {
                     return Err("live2d_parameter_not_found".into());
                 };
                 let parameter = &self.parameters[index];
                 writes.push((index, value.max(parameter.minimum).min(parameter.maximum)));
+            }
+            Ok(writes)
+        }
+
+        fn checked_part_opacity_writes(
+            &self,
+            parts: &[(String, f32)],
+        ) -> Result<Vec<(usize, f32)>, String> {
+            let mut writes = Vec::with_capacity(parts.len());
+            for (id, opacity) in parts {
+                let Some(index) = self.part_indices.get(id).copied() else {
+                    return Err("live2d_part_not_found".into());
+                };
+                writes.push((index, opacity.clamp(0.0, 1.0)));
             }
             Ok(writes)
         }
@@ -1066,6 +1404,7 @@ mod runtime {
             snapshot,
             elapsed_seconds: 0.0,
             motion_player: MotionPlayer::new(),
+            motion_evaluation: MotionEvaluation::default(),
             model,
         })
     }
@@ -1214,6 +1553,52 @@ mod runtime {
         Ok(parameters)
     }
 
+    unsafe fn read_parts(model: *mut live2d_sys::CsmModel) -> Result<Vec<PartInfo>, String> {
+        let count = live2d_sys::csmGetPartCount(model).max(0) as usize;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let ids = live2d_sys::csmGetPartIds(model);
+        let opacities = live2d_sys::csmGetPartOpacities(model);
+        if ids.is_null() || opacities.is_null() {
+            return Err("live2d_part_table_unavailable".into());
+        }
+        let id_slice = std::slice::from_raw_parts(ids, count);
+        let opacity_slice = std::slice::from_raw_parts(opacities, count);
+        let mut parts = Vec::with_capacity(count);
+        for index in 0..count {
+            let id = if id_slice[index].is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(id_slice[index])
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            parts.push(PartInfo {
+                id: PartId(id),
+                default_opacity: opacity_slice[index],
+                opacity: opacity_slice[index],
+            });
+        }
+        Ok(parts)
+    }
+
+    fn build_parameter_indices(parameters: &[ParameterInfo]) -> HashMap<String, usize> {
+        parameters
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| (parameter.id.0.clone(), index))
+            .collect()
+    }
+
+    fn build_part_indices(parts: &[PartInfo]) -> HashMap<String, usize> {
+        parts
+            .iter()
+            .enumerate()
+            .map(|(index, part)| (part.id.0.clone(), index))
+            .collect()
+    }
+
     unsafe fn read_art_mesh_metadata(
         model: *mut live2d_sys::CsmModel,
     ) -> Result<Vec<ArtMeshInfo>, String> {
@@ -1268,6 +1653,34 @@ mod runtime {
         let values = live2d_sys::csmGetParameterValues(model);
         if values.is_null() {
             return Err("live2d_parameter_values_unavailable".into());
+        }
+        Ok(std::slice::from_raw_parts_mut(values, count))
+    }
+
+    unsafe fn part_opacity_values(
+        model: *mut live2d_sys::CsmModel,
+        count: usize,
+    ) -> Result<&'static [f32], String> {
+        if count == 0 {
+            return Ok(&[]);
+        }
+        let values = live2d_sys::csmGetPartOpacities(model);
+        if values.is_null() {
+            return Err("live2d_part_opacities_unavailable".into());
+        }
+        Ok(std::slice::from_raw_parts(values, count))
+    }
+
+    unsafe fn part_opacity_values_mut(
+        model: *mut live2d_sys::CsmModel,
+        count: usize,
+    ) -> Result<&'static mut [f32], String> {
+        if count == 0 {
+            return Ok(&mut []);
+        }
+        let values = live2d_sys::csmGetPartOpacities(model);
+        if values.is_null() {
+            return Err("live2d_part_opacities_unavailable".into());
         }
         Ok(std::slice::from_raw_parts_mut(values, count))
     }
@@ -1684,7 +2097,7 @@ mod tests {
         fs::create_dir_all(root.join("textures")).unwrap();
         fs::create_dir_all(root.join("motions")).unwrap();
         fs::write(root.join("texture_ok.png"), "").unwrap();
-        fs::write(root.join("motions/idle.motion3.json"), "{}").unwrap();
+        fs::write(root.join("motions/idle.motion3.json"), test_motion_json()).unwrap();
         let model = root.join("sample.model3.json");
         fs::write(
             &model,
@@ -1719,6 +2132,9 @@ mod tests {
         assert_eq!(idle.motions[0].relative_path, "motions/idle.motion3.json");
         assert_eq!(idle.motions[0].fade_in_seconds, Some(0.75));
         assert_eq!(idle.motions[0].fade_out_seconds, None);
+        assert_eq!(idle.motions[0].load_motion().unwrap().duration(), 2.0);
+        assert_eq!(idle.motions[0].play_options(true).fade_in_seconds, 0.75);
+        assert!(idle.motions[0].play_options(true).loop_playback);
         let tap = files
             .motion_groups
             .iter()
@@ -1745,6 +2161,7 @@ mod tests {
             snapshot: empty_snapshot(),
             elapsed_seconds: 0.0,
             motion_player: MotionPlayer::new(),
+            motion_evaluation: MotionEvaluation::default(),
         };
         instance.motion_player.play(test_motion(), false);
 
@@ -1769,6 +2186,37 @@ mod tests {
         assert_eq!(instance.motion_state(), MotionPlaybackState::Stopped);
         instance.update(1.0).unwrap();
         assert_eq!(instance.motion_state(), MotionPlaybackState::Stopped);
+    }
+
+    #[test]
+    #[cfg(not(feature = "live2d-cubism"))]
+    fn batch_update_advances_instances_without_active_motion() {
+        let mut first = test_instance();
+        let mut second = test_instance();
+
+        let changed = update_instances([&mut first, &mut second], 0.25).unwrap();
+
+        assert_eq!(changed, 0);
+        assert!((first.elapsed_seconds() - 0.25).abs() < 0.001);
+        assert!((second.elapsed_seconds() - 0.25).abs() < 0.001);
+
+        let mut changed_indices = vec![99];
+        let changed =
+            update_instances_into([&mut first, &mut second], 0.25, &mut changed_indices).unwrap();
+        assert_eq!(changed, 0);
+        assert!(changed_indices.is_empty());
+    }
+
+    #[test]
+    #[cfg(not(feature = "live2d-cubism"))]
+    fn instance_update_exposes_motion_events_without_snapshot_change() {
+        let mut instance = test_instance();
+        instance.play_motion(event_motion(), false).unwrap();
+
+        let changed = instance.update_motion(0.6).unwrap();
+
+        assert!(!changed);
+        assert_eq!(instance.motion_events()[0].value, "blink");
     }
 
     #[test]
@@ -1904,15 +2352,40 @@ mod tests {
     }
 
     #[cfg(not(feature = "live2d-cubism"))]
+    fn test_instance() -> Live2DInstance {
+        Live2DInstance {
+            snapshot: empty_snapshot(),
+            elapsed_seconds: 0.0,
+            motion_player: MotionPlayer::new(),
+            motion_evaluation: MotionEvaluation::default(),
+        }
+    }
+
+    #[cfg(not(feature = "live2d-cubism"))]
     fn test_motion() -> Live2DMotion {
+        Live2DMotion::from_json_str(test_motion_json()).unwrap()
+    }
+
+    #[cfg(not(feature = "live2d-cubism"))]
+    fn event_motion() -> Live2DMotion {
         Live2DMotion::from_json_str(
             r#"{
-                "Meta": { "Duration": 2.0, "Loop": false },
-                "Curves": [
-                    { "Target": "Parameter", "Id": "ParamAngleX", "Segments": [0, 0, 0, 2, 10] }
+                "Meta": { "Duration": 1.0, "Loop": false },
+                "Curves": [],
+                "UserData": [
+                    { "Time": 0.5, "Value": "blink" }
                 ]
             }"#,
         )
         .unwrap()
+    }
+
+    fn test_motion_json() -> &'static str {
+        r#"{
+                "Meta": { "Duration": 2.0, "Loop": false },
+                "Curves": [
+                    { "Target": "Parameter", "Id": "ParamAngleX", "Segments": [0, 0, 0, 2, 10] }
+                ]
+            }"#
     }
 }

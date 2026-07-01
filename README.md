@@ -63,6 +63,43 @@ let snapshot = instance.snapshot();
 let plan = RenderPlanner::new().build(snapshot);
 ```
 
+Motion playback can use `.model3.json` motion metadata directly, including fade times:
+
+```rust
+use live2d::{resolve_model_files, update_instances_into, Live2DInstance};
+
+let files = resolve_model_files("assets/live2d/hiyori/hiyori.model3.json")?;
+let idle = files
+    .motion_groups
+    .iter()
+    .find(|group| group.name == "Idle")
+    .and_then(|group| group.motions.first())
+    .ok_or("idle_motion_missing")?;
+
+let mut instance = Live2DInstance::load_file(&files.model_json_path)?;
+instance.set_idle_motion_file(idle)?;
+
+if instance.update_motion(1.0 / 60.0)? {
+    // Rebuild the render plan or upload dynamic buffers for this model.
+}
+for event in instance.motion_events() {
+    println!("motion event: {}", event.value);
+}
+
+let tap = files
+    .motion_groups
+    .iter()
+    .find(|group| group.name == "TapBody")
+    .and_then(|group| group.motions.first())
+    .ok_or("tap_motion_missing")?;
+instance.request_motion_file(tap, false)?;
+
+let mut first = instance;
+let mut second = Live2DInstance::load_file(&files.model_json_path)?;
+let mut changed_indices = Vec::new();
+update_instances_into([&mut first, &mut second], 1.0 / 60.0, &mut changed_indices)?;
+```
+
 Applications that want the built-in wgpu path enable `features = ["wgpu"]` and use `live2d::wgpu::WgpuLive2DRenderer`. The same backend owns the built-in `WgpuPreviewRenderer`; application preview code should call that backend instead of keeping local wgpu shader or pipeline state.
 
 ## Validation
@@ -70,6 +107,8 @@ Applications that want the built-in wgpu path enable `features = ["wgpu"]` and u
 ```powershell
 cargo check --workspace --no-default-features
 cargo test --workspace --no-default-features
+cargo run -p live2d-perf -- motion-update --profile medium --frames 300
 cargo check -p live2d --features wgpu
 cargo check -p live2d --features live2d-cubism,wgpu
+cargo run -p live2d-perf --features live2d-cubism -- real-model-motion --model <path-to-model3.json> --frames 300
 ```

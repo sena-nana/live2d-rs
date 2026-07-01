@@ -1,6 +1,7 @@
 use live2d_perf::{
-    compare_reports, run_dispatch_null_backend, run_real_model_load, run_render_plan,
-    run_render_world_switch, CompareSummary, SyntheticBlendProfile, SyntheticConfig,
+    compare_reports, run_dispatch_null_backend, run_motion_update, run_real_model_load,
+    run_real_model_motion, run_render_plan, run_render_world_switch, CompareSummary,
+    SyntheticBlendProfile, SyntheticConfig,
 };
 use live2d_probe::{RunReport, Stage, StageStats};
 use serde::Serialize;
@@ -63,10 +64,17 @@ fn run() -> Result<(), String> {
             );
             report
         }
+        "motion-update" => run_motion_update(&config),
         "real-model-load" => {
             let model = value_arg(&args, "--model")
                 .ok_or_else(|| "real-model-load requires --model <path>".to_owned())?;
             run_real_model_load(Path::new(&model))
+        }
+        "real-model-motion" => {
+            let model = value_arg(&args, "--model")
+                .ok_or_else(|| "real-model-motion requires --model <path>".to_owned())?;
+            let motion_group = value_arg(&args, "--motion-group");
+            run_real_model_motion(Path::new(&model), config.frames, motion_group.as_deref())
         }
         #[cfg(feature = "wgpu")]
         "wgpu-cold" | "wgpu-warm" | "wgpu-mask" | "wgpu-resize" | "wgpu-model-switch"
@@ -78,7 +86,7 @@ fn run() -> Result<(), String> {
         }
         _ => {
             return Err(format!(
-                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, or wgpu-postprocess"
+                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, real-model-load, real-model-motion, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, or wgpu-postprocess"
             ));
         }
     };
@@ -94,8 +102,8 @@ fn run() -> Result<(), String> {
 }
 
 fn print_help() {
-    println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--blend-profile <name>] [--model <path>]");
-    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, real-model-load, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, wgpu-postprocess, compare-revs");
+    println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--blend-profile <name>] [--model <path>] [--motion-group <name>]");
+    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, real-model-load, real-model-motion, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, wgpu-postprocess, compare-revs");
     println!("profiles: small, medium, large, mask-heavy, static-mask-heavy, texture-heavy, target-filter");
     println!(
         "blend profiles: classic-mix, advanced-colors, advanced-alphas, advanced-matrix, all-modes"
@@ -109,6 +117,7 @@ fn uses_synthetic_config(scenario: &str) -> bool {
         "synthetic-render-plan"
             | "render-world-switch"
             | "dispatch-null-backend"
+            | "motion-update"
             | "wgpu-cold"
             | "wgpu-warm"
             | "wgpu-mask"
@@ -478,6 +487,7 @@ fn stages_for_scenario(scenario: &str) -> &'static [Stage] {
             Stage::RenderDrawCommandBuild,
         ],
         "dispatch-null-backend" => &[Stage::RenderPlanTotal, Stage::RenderDispatchTotal],
+        "motion-update" => &[Stage::RuntimeMotionUpdate],
         "wgpu-warm" => &[
             Stage::WgpuPrepareRender,
             Stage::WgpuMainPassEncode,
@@ -492,13 +502,18 @@ fn compare_scenarios() -> &'static [&'static str] {
     &[
         "synthetic-render-plan",
         "dispatch-null-backend",
+        "motion-update",
         "wgpu-warm",
     ]
 }
 
 #[cfg(not(feature = "wgpu"))]
 fn compare_scenarios() -> &'static [&'static str] {
-    &["synthetic-render-plan", "dispatch-null-backend"]
+    &[
+        "synthetic-render-plan",
+        "dispatch-null-backend",
+        "motion-update",
+    ]
 }
 
 fn advanced_check(scenario: &str, report: &RunReport) -> AdvancedCheck {

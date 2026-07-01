@@ -6,9 +6,10 @@ pub use live2d_runtime as runtime;
 pub use live2d_wgpu as wgpu;
 
 pub use live2d_runtime::{
-    inspect_art_mesh_metadata, resolve_model_files, Live2DInstance, Live2DMotion, ModelFiles,
-    ModelMotionFile, ModelMotionGroup, MotionEvaluation, MotionPlaybackState, MotionPlayer,
-    ParameterId, ParameterInfo,
+    inspect_art_mesh_metadata, resolve_model_files, update_instances, update_instances_into,
+    Live2DInstance, Live2DMotion, ModelFiles, ModelMotionFile, ModelMotionGroup, MotionEvaluation,
+    MotionEvent, MotionPlayOptions, MotionPlaybackState, MotionPlayer, MotionPriority,
+    MotionStartResult, ParameterId, ParameterInfo, PartId, PartInfo,
 };
 
 #[cfg(feature = "probe")]
