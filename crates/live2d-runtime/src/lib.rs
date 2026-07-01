@@ -391,6 +391,12 @@ pub fn inspect_art_meshes(model_json_path: impl AsRef<Path>) -> Result<Vec<ArtMe
     runtime::inspect_art_meshes(model_json_path.as_ref())
 }
 
+pub fn inspect_art_mesh_metadata(
+    model_json_path: impl AsRef<Path>,
+) -> Result<Vec<ArtMeshInfo>, String> {
+    runtime::inspect_art_mesh_metadata(model_json_path.as_ref())
+}
+
 pub fn load_snapshot(model_json_path: impl AsRef<Path>) -> Result<ModelSnapshot, String> {
     runtime::load_snapshot(model_json_path.as_ref())
 }
@@ -426,6 +432,14 @@ mod runtime {
     use super::*;
 
     pub fn inspect_art_meshes(model_json_path: &Path) -> Result<Vec<ArtMeshInfo>, String> {
+        let files = resolve_model_files(model_json_path)?;
+        if !files.missing_files.is_empty() {
+            return Err("live2d_model_assets_missing".into());
+        }
+        Err(RUNTIME_UNAVAILABLE.into())
+    }
+
+    pub fn inspect_art_mesh_metadata(model_json_path: &Path) -> Result<Vec<ArtMeshInfo>, String> {
         let files = resolve_model_files(model_json_path)?;
         if !files.missing_files.is_empty() {
             return Err("live2d_model_assets_missing".into());
@@ -525,29 +539,22 @@ mod runtime {
     unsafe impl Sync for CubismLive2DModel {}
 
     impl CubismLive2DModel {
+        fn load_metadata(files: &ModelFiles) -> Result<Self, String> {
+            let (moc_bytes, model_bytes, model) = load_cubism_model(files)?;
+            unsafe { live2d_sys::csmUpdateModel(model) };
+            Ok(Self {
+                _moc_bytes: moc_bytes,
+                _model_bytes: model_bytes,
+                model,
+                parameters: Vec::new(),
+                canvas: CanvasInfo::default(),
+                art_meshes: Vec::new(),
+                drawable_metas: Vec::new(),
+            })
+        }
+
         fn load(files: &ModelFiles) -> Result<Self, String> {
-            let mut moc_bytes = fs::read(&files.moc_path).map_err(|_| "live2d_moc_unreadable")?;
-            let moc = unsafe {
-                live2d_sys::csmReviveMocInPlace(moc_bytes.as_mut_ptr().cast(), moc_bytes.len() as _)
-            };
-            if moc.is_null() {
-                return Err("live2d_moc_invalid".into());
-            }
-            let model_size = unsafe { live2d_sys::csmGetSizeofModel(moc) } as usize;
-            if model_size == 0 {
-                return Err("live2d_model_allocation_failed".into());
-            }
-            let mut model_bytes = vec![0_u8; model_size];
-            let model = unsafe {
-                live2d_sys::csmInitializeModelInPlace(
-                    moc,
-                    model_bytes.as_mut_ptr().cast(),
-                    model_bytes.len() as _,
-                )
-            };
-            if model.is_null() {
-                return Err("live2d_model_initialization_failed".into());
-            }
+            let (moc_bytes, model_bytes, model) = load_cubism_model(files)?;
             unsafe { live2d_sys::csmUpdateModel(model) };
             let parameters = unsafe { read_parameters(model)? };
             let (canvas, drawable_metas, art_meshes) = unsafe { read_static_model(model)? };
@@ -881,8 +888,45 @@ mod runtime {
         }
     }
 
+    fn load_cubism_model(
+        files: &ModelFiles,
+    ) -> Result<(Vec<u8>, Vec<u8>, *mut live2d_sys::CsmModel), String> {
+        let mut moc_bytes = fs::read(&files.moc_path).map_err(|_| "live2d_moc_unreadable")?;
+        let moc = unsafe {
+            live2d_sys::csmReviveMocInPlace(moc_bytes.as_mut_ptr().cast(), moc_bytes.len() as _)
+        };
+        if moc.is_null() {
+            return Err("live2d_moc_invalid".into());
+        }
+        let model_size = unsafe { live2d_sys::csmGetSizeofModel(moc) } as usize;
+        if model_size == 0 {
+            return Err("live2d_model_allocation_failed".into());
+        }
+        let mut model_bytes = vec![0_u8; model_size];
+        let model = unsafe {
+            live2d_sys::csmInitializeModelInPlace(
+                moc,
+                model_bytes.as_mut_ptr().cast(),
+                model_bytes.len() as _,
+            )
+        };
+        if model.is_null() {
+            return Err("live2d_model_initialization_failed".into());
+        }
+        Ok((moc_bytes, model_bytes, model))
+    }
+
     pub fn inspect_art_meshes(model_json_path: &Path) -> Result<Vec<ArtMeshInfo>, String> {
         Ok(load_snapshot(model_json_path)?.art_meshes)
+    }
+
+    pub fn inspect_art_mesh_metadata(model_json_path: &Path) -> Result<Vec<ArtMeshInfo>, String> {
+        let files = resolve_model_files(model_json_path)?;
+        if !files.missing_files.is_empty() {
+            return Err("live2d_model_assets_missing".into());
+        }
+        let model = CubismLive2DModel::load_metadata(&files)?;
+        unsafe { read_art_mesh_metadata(model.model) }
     }
 
     pub fn load_instance(model_json_path: &Path) -> Result<Live2DInstance, String> {
@@ -1046,6 +1090,36 @@ mod runtime {
             });
         }
         Ok(parameters)
+    }
+
+    unsafe fn read_art_mesh_metadata(
+        model: *mut live2d_sys::CsmModel,
+    ) -> Result<Vec<ArtMeshInfo>, String> {
+        let count = live2d_sys::csmGetDrawableCount(model).max(0) as usize;
+        let ids = live2d_sys::csmGetDrawableIds(model);
+        let mask_counts = live2d_sys::csmGetDrawableMaskCounts(model);
+        if (ids.is_null() || mask_counts.is_null()) && count > 0 {
+            return Err("live2d_model_metadata_failed".into());
+        }
+
+        let mut art_meshes = Vec::with_capacity(count);
+        for index in 0..count {
+            let id_ptr = *ids.add(index);
+            if id_ptr.is_null() {
+                continue;
+            }
+            let id = CStr::from_ptr(id_ptr).to_string_lossy().into_owned();
+            let drawable_id = DrawableId(id);
+            let mask_count = (*mask_counts.add(index)).max(0);
+            art_meshes.push(ArtMeshInfo {
+                id: drawable_id.clone(),
+                label: drawable_id.0.clone(),
+                original_name: drawable_id.0.clone(),
+                index,
+                mask_type: if mask_count > 0 { "masked" } else { "plain" }.into(),
+            });
+        }
+        Ok(art_meshes)
     }
 
     unsafe fn parameter_values(
@@ -1521,6 +1595,40 @@ mod tests {
         assert_eq!(result.unwrap_err(), "live2d_runtime_unavailable");
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(feature = "live2d-cubism"))]
+    fn reports_unavailable_metadata_without_fake_art_meshes() {
+        let root = unique_temp_dir("live2d-runtime-metadata-unavailable");
+        fs::create_dir_all(&root).unwrap();
+        let moc = root.join("sample.moc3");
+        let model = root.join("sample.model3.json");
+        fs::write(&model, r#"{"FileReferences":{"Moc":"sample.moc3"}}"#).unwrap();
+        fs::write(&moc, b"noise\0ArtMeshZ\0").unwrap();
+
+        let result = inspect_art_mesh_metadata(model);
+
+        assert_eq!(result.unwrap_err(), "live2d_runtime_unavailable");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "live2d-cubism")]
+    fn sdk_metadata_inspection_reads_art_meshes_when_test_model_is_available() -> Result<(), String>
+    {
+        let Ok(model_path) = std::env::var("LIVE2D_CUBISM_TEST_MODEL") else {
+            return Ok(());
+        };
+
+        let meshes = inspect_art_mesh_metadata(model_path)?;
+
+        assert!(!meshes.is_empty());
+        assert!(meshes
+            .iter()
+            .all(|mesh| mesh.mask_type == "plain" || mesh.mask_type == "masked"));
+        Ok(())
     }
 
     #[test]
