@@ -12,6 +12,8 @@ use crate::{
     upload::{aligned_uniform_stride, uniform_binding, uniform_slots},
     POST_PROCESS_CLEAR,
 };
+#[cfg(feature = "probe")]
+use live2d_core::BlendMode;
 use live2d_core::{CanvasInfo, ModelSnapshot};
 #[cfg(feature = "probe")]
 use live2d_probe::{counter, gauge, measure, ProbeAttr, ProbeSink, Stage};
@@ -431,6 +433,7 @@ impl WgpuLive2DRenderer {
             Stage::WgpuMainPassEncode,
             vec![ProbeAttr::new("draws", render_plan.draws.len())],
             || {
+                let blend_counts = main_pass_blend_counts(render_plan);
                 self.encode_main_draws_to_target(
                     device,
                     queue,
@@ -450,6 +453,27 @@ impl WgpuLive2DRenderer {
                     Stage::WgpuMainPassEncode,
                     "draw_calls",
                     render_plan.draws.len() as u64,
+                    Vec::new(),
+                );
+                counter(
+                    probe,
+                    Stage::WgpuMainPassEncode,
+                    "advanced_draw_calls",
+                    blend_counts.advanced_draws,
+                    Vec::new(),
+                );
+                counter(
+                    probe,
+                    Stage::WgpuMainPassEncode,
+                    "advanced_copy_operations",
+                    blend_counts.advanced_copy_operations,
+                    Vec::new(),
+                );
+                counter(
+                    probe,
+                    Stage::WgpuMainPassEncode,
+                    "main_pass_segments",
+                    blend_counts.main_pass_segments,
                     Vec::new(),
                 );
             },
@@ -637,4 +661,38 @@ impl WgpuLive2DRenderer {
     pub(crate) fn active_gpu_scene_mut(&mut self) -> Option<&mut GpuScene> {
         self.gpu_scenes.get_mut(self.active_scene_key.as_deref()?)
     }
+}
+
+#[cfg(feature = "probe")]
+#[derive(Debug, Default, Clone, Copy)]
+struct MainPassBlendCounts {
+    advanced_draws: u64,
+    advanced_copy_operations: u64,
+    main_pass_segments: u64,
+}
+
+#[cfg(feature = "probe")]
+fn main_pass_blend_counts(render_plan: &RenderPlan) -> MainPassBlendCounts {
+    let mut counts = MainPassBlendCounts::default();
+    let mut start = 0;
+    while start < render_plan.draws.len() {
+        let advanced = matches!(
+            render_plan.draws[start].blend_mode,
+            BlendMode::Advanced { .. }
+        );
+        let end = if advanced {
+            counts.advanced_draws += 1;
+            counts.advanced_copy_operations += 1;
+            start + 1
+        } else {
+            render_plan.draws[start..]
+                .iter()
+                .position(|draw| matches!(draw.blend_mode, BlendMode::Advanced { .. }))
+                .map(|offset| start + offset)
+                .unwrap_or(render_plan.draws.len())
+        };
+        counts.main_pass_segments += 1;
+        start = end;
+    }
+    counts
 }
