@@ -1,5 +1,7 @@
 use bytemuck::{Pod, Zeroable};
-use live2d_core::{BlendMode, CanvasInfo, Drawable, ModelSnapshot, TextureAsset};
+use live2d_core::{
+    AlphaBlendMode, BlendMode, CanvasInfo, ColorBlendMode, Drawable, ModelSnapshot, TextureAsset,
+};
 #[cfg(feature = "probe")]
 use live2d_probe::{counter, gauge, measure, ProbeAttr, ProbeSink, Stage};
 use live2d_render::{
@@ -189,6 +191,7 @@ pub struct WgpuLive2DView {
 }
 
 pub struct WgpuLive2DTarget<'view> {
+    pub texture: &'view wgpu::Texture,
     pub view: &'view wgpu::TextureView,
     pub resolve_target: Option<&'view wgpu::TextureView>,
     pub load_op: wgpu::LoadOp<wgpu::Color>,
@@ -196,8 +199,9 @@ pub struct WgpuLive2DTarget<'view> {
 }
 
 impl<'view> WgpuLive2DTarget<'view> {
-    pub fn load(view: &'view wgpu::TextureView) -> Self {
+    pub fn load(texture: &'view wgpu::Texture, view: &'view wgpu::TextureView) -> Self {
         Self {
+            texture,
             view,
             resolve_target: None,
             load_op: wgpu::LoadOp::Load,
@@ -205,8 +209,13 @@ impl<'view> WgpuLive2DTarget<'view> {
         }
     }
 
-    pub fn clear(view: &'view wgpu::TextureView, color: wgpu::Color) -> Self {
+    pub fn clear(
+        texture: &'view wgpu::Texture,
+        view: &'view wgpu::TextureView,
+        color: wgpu::Color,
+    ) -> Self {
         Self {
+            texture,
             view,
             resolve_target: None,
             load_op: wgpu::LoadOp::Clear(color),
@@ -363,6 +372,7 @@ struct Live2dUniform {
     canvas: [f32; 4],
     effect: [f32; 4],
     mask: [f32; 4],
+    blend: [u32; 4],
 }
 
 #[repr(C)]
@@ -383,6 +393,7 @@ pub struct WgpuLive2DRenderer {
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     fallback_mask_bind_group: wgpu::BindGroup,
+    fallback_blend_bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     uniform_stride: u64,
@@ -394,6 +405,7 @@ pub struct WgpuLive2DRenderer {
     mask_atlas: Option<MaskAtlas>,
     mask_atlas_dirty: bool,
     offscreen_target: Option<OffscreenTarget>,
+    blend_copy_target: Option<BlendCopyTarget>,
     gpu_scenes: HashMap<String, GpuScene>,
     render_world: RenderWorld,
     #[cfg(feature = "probe")]
@@ -407,20 +419,30 @@ struct GpuTimestampFrame {
     readback_buffer: wgpu::Buffer,
     query_count: u32,
     mask_indices: Option<(u32, u32)>,
-    main_indices: (u32, u32),
+    main_indices: Option<(u32, u32)>,
 }
 
 #[cfg(feature = "probe")]
 impl GpuTimestampFrame {
-    fn new(device: &wgpu::Device, has_mask_pass: bool) -> Option<Self> {
+    fn new(device: &wgpu::Device, include_mask: bool, include_main: bool) -> Option<Self> {
         if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             return None;
         }
-        let (query_count, mask_indices, main_indices) = if has_mask_pass {
-            (4, Some((0, 1)), (2, 3))
-        } else {
-            (2, None, (0, 1))
-        };
+        let mut next = 0;
+        let mask_indices = include_mask.then(|| {
+            let indices = (next, next + 1);
+            next += 2;
+            indices
+        });
+        let main_indices = include_main.then(|| {
+            let indices = (next, next + 1);
+            next += 2;
+            indices
+        });
+        let query_count = next;
+        if query_count == 0 {
+            return None;
+        }
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("Live2D Probe Timestamp Query Set"),
             ty: wgpu::QueryType::Timestamp,
@@ -454,10 +476,6 @@ impl GpuTimestampFrame {
             beginning_of_pass_write_index: Some(indices.0),
             end_of_pass_write_index: Some(indices.1),
         }
-    }
-
-    fn main_timestamp_writes(&self) -> wgpu::RenderPassTimestampWrites<'_> {
-        self.timestamp_writes(self.main_indices)
     }
 
     fn mask_timestamp_writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
@@ -520,8 +538,16 @@ struct MaskAtlasUpdate {
 struct OffscreenTarget {
     width: u32,
     height: u32,
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
+}
+
+struct BlendCopyTarget {
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,6 +591,7 @@ struct WgpuRenderBackend<'a, 'pass> {
     uniform_stride: u64,
     uniform_index: usize,
     mask_bind_group: &'a wgpu::BindGroup,
+    blend_bind_group: &'a wgpu::BindGroup,
     mask_atlas: Option<&'a MaskAtlas>,
     gpu_scene: &'a GpuScene,
     last_pipeline_key: Option<PipelineKey>,
@@ -578,6 +605,7 @@ struct WgpuMaskRenderBackend<'a, 'pass> {
     uniform_stride: u64,
     uniform_index: usize,
     fallback_mask_bind_group: &'a wgpu::BindGroup,
+    fallback_blend_bind_group: &'a wgpu::BindGroup,
     gpu_scene: &'a GpuScene,
     layout: MaskAtlasLayout,
     skip_mask: bool,
@@ -632,14 +660,23 @@ struct PipelineCache {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PipelineKey {
     target_format: wgpu::TextureFormat,
-    blend_mode: BlendMode,
+    blend_mode: PipelineBlendMode,
     masked: bool,
     shader_variant: ShaderVariant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PipelineBlendMode {
+    Normal,
+    Additive,
+    Multiplicative,
+    Advanced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ShaderVariant {
     DefaultMesh,
+    AdvancedBlend,
     MaskWriter,
 }
 
@@ -653,15 +690,20 @@ impl PipelineCache {
         let mut pipelines = HashMap::new();
         for masked in [false, true] {
             for blend_mode in [
-                BlendMode::Normal,
-                BlendMode::Additive,
-                BlendMode::Multiplicative,
+                PipelineBlendMode::Normal,
+                PipelineBlendMode::Additive,
+                PipelineBlendMode::Multiplicative,
+                PipelineBlendMode::Advanced,
             ] {
                 let key = PipelineKey {
                     target_format,
                     blend_mode,
                     masked,
-                    shader_variant: ShaderVariant::DefaultMesh,
+                    shader_variant: if blend_mode == PipelineBlendMode::Advanced {
+                        ShaderVariant::AdvancedBlend
+                    } else {
+                        ShaderVariant::DefaultMesh
+                    },
                 };
                 pipelines.insert(
                     key,
@@ -677,7 +719,7 @@ impl PipelineCache {
         }
         let mask_key = PipelineKey {
             target_format: MASK_ATLAS_FORMAT,
-            blend_mode: BlendMode::Normal,
+            blend_mode: PipelineBlendMode::Normal,
             masked: false,
             shader_variant: ShaderVariant::MaskWriter,
         };
@@ -699,11 +741,16 @@ impl PipelineCache {
     }
 
     fn mesh_key(&self, blend_mode: BlendMode, masked: bool) -> PipelineKey {
+        let blend_mode = pipeline_blend_mode(blend_mode);
         PipelineKey {
             target_format: self.target_format,
             blend_mode,
             masked,
-            shader_variant: ShaderVariant::DefaultMesh,
+            shader_variant: if blend_mode == PipelineBlendMode::Advanced {
+                ShaderVariant::AdvancedBlend
+            } else {
+                ShaderVariant::DefaultMesh
+            },
         }
     }
 
@@ -716,7 +763,7 @@ impl PipelineCache {
     fn mask_writer(&self) -> &wgpu::RenderPipeline {
         let key = PipelineKey {
             target_format: MASK_ATLAS_FORMAT,
-            blend_mode: BlendMode::Normal,
+            blend_mode: PipelineBlendMode::Normal,
             masked: false,
             shader_variant: ShaderVariant::MaskWriter,
         };
@@ -730,6 +777,7 @@ impl<'a, 'pass> Live2DRenderBackend for WgpuRenderBackend<'a, 'pass> {
     fn begin_model(&mut self, _ctx: &ModelRenderCtx) {
         self.pass.push_debug_group("live2d model");
         self.pass.set_bind_group(2, self.mask_bind_group, &[]);
+        self.pass.set_bind_group(3, self.blend_bind_group, &[]);
         self.pass
             .set_vertex_buffer(0, self.gpu_scene.position_buffer.slice(..));
         self.pass
@@ -810,6 +858,8 @@ impl<'a, 'pass> Live2DRenderBackend for WgpuRenderBackend<'a, 'pass> {
 impl<'a, 'pass> Live2DRenderBackend for WgpuMaskRenderBackend<'a, 'pass> {
     fn begin_model(&mut self, _ctx: &ModelRenderCtx) {
         self.pass.set_pipeline(self.pipelines.mask_writer());
+        self.pass
+            .set_bind_group(3, self.fallback_blend_bind_group, &[]);
         self.pass
             .set_vertex_buffer(0, self.gpu_scene.position_buffer.slice(..));
         self.pass
@@ -1171,12 +1221,15 @@ impl WgpuLive2DRenderer {
                 Some(&bind_group_layout),
                 Some(&texture_layout),
                 Some(&texture_layout),
+                Some(&texture_layout),
             ],
             immediate_size: 0,
         });
         let pipelines = PipelineCache::new(device, &pipeline_layout, &shader, format);
         let fallback_mask_bind_group =
             create_empty_mask_bind_group(device, &texture_layout, &sampler);
+        let fallback_blend_bind_group =
+            create_empty_sampled_texture_bind_group(device, &texture_layout, &sampler);
 
         Self {
             pipelines,
@@ -1184,6 +1237,7 @@ impl WgpuLive2DRenderer {
             texture_layout,
             sampler,
             fallback_mask_bind_group,
+            fallback_blend_bind_group,
             uniform_buffer,
             uniform_bind_group,
             uniform_stride,
@@ -1195,6 +1249,7 @@ impl WgpuLive2DRenderer {
             mask_atlas: None,
             mask_atlas_dirty: true,
             offscreen_target: None,
+            blend_copy_target: None,
             gpu_scenes: HashMap::new(),
             render_world: RenderWorld::new(),
             #[cfg(feature = "probe")]
@@ -1267,18 +1322,6 @@ impl WgpuLive2DRenderer {
             self.ensure_uniform_capacity_with_probe(device, uniform_slots(&render_plan), probe);
             render_plan
         })
-    }
-
-    pub fn render<'pass>(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'pass>,
-        snapshot: &ModelSnapshot,
-        view: WgpuLive2DView,
-    ) {
-        let render_plan = self.prepare_render(device, queue, snapshot);
-        self.encode_render(queue, pass, &render_plan, &snapshot.canvas, view);
     }
 
     pub fn render_to_view(
@@ -1394,32 +1437,19 @@ impl WgpuLive2DRenderer {
         if !render_plan.masks.is_empty() {
             self.prepare_mask_atlas(device, queue, encoder, render_plan, canvas, &view, None);
         }
-        let first_main_uniform_slot = mask_uniform_slots(render_plan);
-        let mask_atlas = self.mask_atlas.as_ref();
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Live2D Render Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target.view,
-                depth_slice: None,
-                resolve_target: target.resolve_target,
-                ops: wgpu::Operations {
-                    load: target.load_op,
-                    store: target.store_op,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        self.encode_render_from_uniform_slot(
+        self.encode_main_draws_to_target(
+            device,
             queue,
-            &mut pass,
+            encoder,
+            target.texture,
+            target.view,
+            target.resolve_target,
+            target.load_op,
+            target.store_op,
             render_plan,
             canvas,
             view,
-            first_main_uniform_slot,
-            mask_atlas,
+            mask_uniform_slots(render_plan),
         );
     }
 
@@ -1445,22 +1475,30 @@ impl WgpuLive2DRenderer {
         let width = view.width.max(1);
         let height = view.height.max(1);
         self.ensure_offscreen_target(device, width, height);
-        let scene_view = self
+        let offscreen = self
             .offscreen_target
-            .as_ref()
-            .expect("offscreen target is created before postprocess rendering")
-            .view
-            .clone();
+            .take()
+            .expect("offscreen target is created before postprocess rendering");
         self.encode_render_to_view(
             device,
             queue,
             encoder,
-            WgpuLive2DTarget::clear(&scene_view, POST_PROCESS_CLEAR),
+            WgpuLive2DTarget::clear(&offscreen.texture, &offscreen.view, POST_PROCESS_CLEAR),
             render_plan,
             canvas,
             view,
         );
-        postprocess.encode(device, queue, encoder, &scene_view, target, width, height)
+        let result = postprocess.encode(
+            device,
+            queue,
+            encoder,
+            &offscreen.view,
+            target,
+            width,
+            height,
+        );
+        self.offscreen_target = Some(offscreen);
+        result
     }
 
     #[cfg(feature = "probe")]
@@ -1478,7 +1516,7 @@ impl WgpuLive2DRenderer {
         P: ProbeSink,
     {
         self.ensure_uniform_capacity_with_probe(device, uniform_slots(render_plan), probe);
-        let timestamp_frame = GpuTimestampFrame::new(device, !render_plan.masks.is_empty());
+        let timestamp_frame = GpuTimestampFrame::new(device, !render_plan.masks.is_empty(), false);
         if !render_plan.masks.is_empty() {
             let mask_timestamp_writes = timestamp_frame
                 .as_ref()
@@ -1495,39 +1533,31 @@ impl WgpuLive2DRenderer {
             );
         }
         let first_main_uniform_slot = mask_uniform_slots(render_plan);
-        let mask_atlas = self.mask_atlas.as_ref();
         measure(
             probe,
             Stage::WgpuMainPassEncode,
             vec![ProbeAttr::new("draws", render_plan.draws.len())],
             || {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Live2D Render Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target.view,
-                        depth_slice: None,
-                        resolve_target: target.resolve_target,
-                        ops: wgpu::Operations {
-                            load: target.load_op,
-                            store: target.store_op,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: timestamp_frame
-                        .as_ref()
-                        .map(GpuTimestampFrame::main_timestamp_writes),
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                self.encode_render_from_uniform_slot_with_probe(
+                self.encode_main_draws_to_target(
+                    device,
                     queue,
-                    &mut pass,
+                    encoder,
+                    target.texture,
+                    target.view,
+                    target.resolve_target,
+                    target.load_op,
+                    target.store_op,
                     render_plan,
                     canvas,
                     view,
                     first_main_uniform_slot,
-                    mask_atlas,
+                );
+                counter(
                     probe,
+                    Stage::WgpuMainPassEncode,
+                    "draw_calls",
+                    render_plan.draws.len() as u64,
+                    Vec::new(),
                 );
             },
         );
@@ -1573,43 +1603,32 @@ impl WgpuLive2DRenderer {
         let width = view.width.max(1);
         let height = view.height.max(1);
         self.ensure_offscreen_target_with_probe(device, width, height, probe);
-        let scene_view = self
+        let offscreen = self
             .offscreen_target
-            .as_ref()
-            .expect("offscreen target is created before postprocess rendering")
-            .view
-            .clone();
+            .take()
+            .expect("offscreen target is created before postprocess rendering");
         self.encode_render_to_view_with_probe(
             device,
             queue,
             encoder,
-            WgpuLive2DTarget::clear(&scene_view, POST_PROCESS_CLEAR),
+            WgpuLive2DTarget::clear(&offscreen.texture, &offscreen.view, POST_PROCESS_CLEAR),
             render_plan,
             canvas,
             view,
             probe,
         );
-        postprocess.encode_with_probe(
+        let result = postprocess.encode_with_probe(
             device,
             queue,
             encoder,
-            &scene_view,
+            &offscreen.view,
             target,
             width,
             height,
             probe,
-        )
-    }
-
-    pub fn encode_render<'pass>(
-        &self,
-        queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'pass>,
-        render_plan: &RenderPlan,
-        canvas: &CanvasInfo,
-        view: WgpuLive2DView,
-    ) {
-        self.encode_render_from_uniform_slot(queue, pass, render_plan, canvas, view, 0, None);
+        );
+        self.offscreen_target = Some(offscreen);
+        result
     }
 
     pub fn render_to_offscreen(
@@ -1622,20 +1641,19 @@ impl WgpuLive2DRenderer {
         clear_color: wgpu::Color,
     ) -> &wgpu::TextureView {
         self.ensure_offscreen_target(device, view.width, view.height);
-        let offscreen_view = self
+        let offscreen = self
             .offscreen_target
-            .as_ref()
-            .expect("offscreen target is created before rendering")
-            .view
-            .clone();
+            .take()
+            .expect("offscreen target is created before rendering");
         self.render_to_view(
             device,
             queue,
             encoder,
-            WgpuLive2DTarget::clear(&offscreen_view, clear_color),
+            WgpuLive2DTarget::clear(&offscreen.texture, &offscreen.view, clear_color),
             snapshot,
             view,
         );
+        self.offscreen_target = Some(offscreen);
         &self
             .offscreen_target
             .as_ref()
@@ -1658,21 +1676,20 @@ impl WgpuLive2DRenderer {
         P: ProbeSink,
     {
         self.ensure_offscreen_target_with_probe(device, view.width, view.height, probe);
-        let offscreen_view = self
+        let offscreen = self
             .offscreen_target
-            .as_ref()
-            .expect("offscreen target is created before rendering")
-            .view
-            .clone();
+            .take()
+            .expect("offscreen target is created before rendering");
         self.render_to_view_with_probe(
             device,
             queue,
             encoder,
-            WgpuLive2DTarget::clear(&offscreen_view, clear_color),
+            WgpuLive2DTarget::clear(&offscreen.texture, &offscreen.view, clear_color),
             snapshot,
             view,
             probe,
         );
+        self.offscreen_target = Some(offscreen);
         &self
             .offscreen_target
             .as_ref()
@@ -1704,14 +1721,16 @@ impl WgpuLive2DRenderer {
                     timestamp_period,
                 );
             }
-            record_gpu_pass_nanos(
-                probe,
-                Stage::WgpuMainPassEncode,
-                "main",
-                &values,
-                pending.main_indices,
-                timestamp_period,
-            );
+            if let Some((start, end)) = pending.main_indices {
+                record_gpu_pass_nanos(
+                    probe,
+                    Stage::WgpuMainPassEncode,
+                    "main",
+                    &values,
+                    (start, end),
+                    timestamp_period,
+                );
+            }
         }
         Ok(())
     }
@@ -1726,23 +1745,57 @@ impl WgpuLive2DRenderer {
         self.gpu_scenes.get_mut(self.active_scene_key.as_deref()?)
     }
 
-    fn encode_render_from_uniform_slot<'pass>(
-        &self,
+    fn encode_main_draws_to_target(
+        &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'pass>,
+        encoder: &mut wgpu::CommandEncoder,
+        target_texture: &wgpu::Texture,
+        target_view: &wgpu::TextureView,
+        resolve_target: Option<&wgpu::TextureView>,
+        first_load_op: wgpu::LoadOp<wgpu::Color>,
+        store_op: wgpu::StoreOp,
         render_plan: &RenderPlan,
         canvas: &CanvasInfo,
         view: WgpuLive2DView,
         first_uniform_slot: usize,
-        mask_atlas: Option<&MaskAtlas>,
     ) {
+        if render_plan.draws.is_empty() {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Live2D Empty Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: first_load_op,
+                        store: store_op,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            return;
+        }
+
+        if render_plan_has_advanced_blend(render_plan) {
+            self.ensure_blend_copy_target(
+                device,
+                self.pipelines.target_format,
+                view.width,
+                view.height,
+            );
+        }
+
         let Some(gpu_scene) = self.active_gpu_scene() else {
             return;
         };
         let active_mask_atlas = if render_plan.masks.is_empty() {
             None
         } else {
-            mask_atlas
+            self.mask_atlas.as_ref()
         };
         let mask_bind_group = active_mask_atlas
             .map(|atlas| &atlas.bind_group)
@@ -1761,94 +1814,115 @@ impl WgpuLive2DRenderer {
                 &mut uniform_staging,
             );
         }
-        let mut backend = WgpuRenderBackend {
-            pass,
-            pipelines: &self.pipelines,
-            uniform_bind_group: &self.uniform_bind_group,
-            uniform_stride: self.uniform_stride,
-            uniform_index: first_uniform_slot,
-            mask_bind_group,
-            mask_atlas: active_mask_atlas,
-            gpu_scene,
-            last_pipeline_key: None,
-            last_texture_index: None,
-        };
-        render_plan.dispatch(&mut backend);
-    }
 
-    #[cfg(feature = "probe")]
-    fn encode_render_from_uniform_slot_with_probe<'pass, P>(
-        &self,
-        queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'pass>,
-        render_plan: &RenderPlan,
-        canvas: &CanvasInfo,
-        view: WgpuLive2DView,
-        first_uniform_slot: usize,
-        mask_atlas: Option<&MaskAtlas>,
-        probe: &P,
-    ) where
-        P: ProbeSink,
-    {
-        let Some(gpu_scene) = self.active_gpu_scene() else {
-            return;
+        let extent = wgpu::Extent3d {
+            width: view.width.max(1),
+            height: view.height.max(1),
+            depth_or_array_layers: 1,
         };
-        let active_mask_atlas = if render_plan.masks.is_empty() {
-            None
-        } else {
-            mask_atlas
-        };
-        let mask_bind_group = active_mask_atlas
-            .map(|atlas| &atlas.bind_group)
-            .unwrap_or(&self.fallback_mask_bind_group);
-        let uniform_upload = {
-            let mut uniform_staging = self.uniform_staging.borrow_mut();
-            upload_main_uniforms(
-                queue,
-                &self.uniform_buffer,
-                self.uniform_stride,
-                first_uniform_slot,
-                render_plan,
-                canvas,
-                &view,
-                active_mask_atlas,
-                &mut uniform_staging,
-            )
-        };
-        let mut backend = WgpuRenderBackend {
-            pass,
-            pipelines: &self.pipelines,
-            uniform_bind_group: &self.uniform_bind_group,
-            uniform_stride: self.uniform_stride,
-            uniform_index: first_uniform_slot,
-            mask_bind_group,
-            mask_atlas: active_mask_atlas,
-            gpu_scene,
-            last_pipeline_key: None,
-            last_texture_index: None,
-        };
-        counter(
-            probe,
-            Stage::WgpuMainPassEncode,
-            "draw_calls",
-            render_plan.draws.len() as u64,
-            Vec::new(),
-        );
-        counter(
-            probe,
-            Stage::WgpuMainPassEncode,
-            "buffer_writes",
-            uniform_upload.writes,
-            vec![ProbeAttr::new("buffer", "uniform")],
-        );
-        counter(
-            probe,
-            Stage::WgpuMainPassEncode,
-            "bytes",
-            uniform_upload.bytes,
-            vec![ProbeAttr::new("buffer", "uniform")],
-        );
-        render_plan.dispatch_with_probe(&mut backend, probe);
+        let mut load_op = first_load_op;
+        if matches!(render_plan.draws[0].blend_mode, BlendMode::Advanced { .. }) {
+            if let wgpu::LoadOp::Clear(color) = load_op {
+                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Live2D Advanced Blend Clear Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target_view,
+                        depth_slice: None,
+                        resolve_target,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(color),
+                            store: store_op,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                load_op = wgpu::LoadOp::Load;
+            }
+        }
+        let mut start = 0;
+        while start < render_plan.draws.len() {
+            let advanced = matches!(
+                render_plan.draws[start].blend_mode,
+                BlendMode::Advanced { .. }
+            );
+            let end = if advanced {
+                start + 1
+            } else {
+                render_plan.draws[start..]
+                    .iter()
+                    .position(|draw| matches!(draw.blend_mode, BlendMode::Advanced { .. }))
+                    .map(|offset| start + offset)
+                    .unwrap_or(render_plan.draws.len())
+            };
+
+            let blend_bind_group = if advanced {
+                let blend_target = self
+                    .blend_copy_target
+                    .as_ref()
+                    .expect("advanced blend copy target is created before encoding");
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: target_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &blend_target.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    extent,
+                );
+                &blend_target.bind_group
+            } else {
+                &self.fallback_blend_bind_group
+            };
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Live2D Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    depth_slice: None,
+                    resolve_target,
+                    ops: wgpu::Operations {
+                        load: load_op,
+                        store: store_op,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut backend = WgpuRenderBackend {
+                pass: &mut pass,
+                pipelines: &self.pipelines,
+                uniform_bind_group: &self.uniform_bind_group,
+                uniform_stride: self.uniform_stride,
+                uniform_index: first_uniform_slot + start,
+                mask_bind_group,
+                blend_bind_group,
+                mask_atlas: active_mask_atlas,
+                gpu_scene,
+                last_pipeline_key: None,
+                last_texture_index: None,
+            };
+            backend.begin_model(&render_plan.model);
+            backend.begin_main_pass();
+            for draw in &render_plan.draws[start..end] {
+                backend.draw_drawable(draw);
+            }
+            backend.end_model();
+            drop(pass);
+
+            load_op = wgpu::LoadOp::Load;
+            start = end;
+        }
     }
 
     fn prepare_mask_atlas(
@@ -1963,6 +2037,7 @@ impl WgpuLive2DRenderer {
             uniform_stride: self.uniform_stride,
             uniform_index: 0,
             fallback_mask_bind_group: &self.fallback_mask_bind_group,
+            fallback_blend_bind_group: &self.fallback_blend_bind_group,
             gpu_scene,
             layout,
             skip_mask: false,
@@ -2113,6 +2188,34 @@ impl WgpuLive2DRenderer {
             self.offscreen_target = Some(create_offscreen_target(
                 device,
                 self.pipelines.target_format,
+                width,
+                height,
+            ));
+        }
+    }
+
+    fn ensure_blend_copy_target(
+        &mut self,
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) {
+        let width = width.max(1);
+        let height = height.max(1);
+        let rebuild = self
+            .blend_copy_target
+            .as_ref()
+            .map(|target| {
+                target.width != width || target.height != height || target.format != format
+            })
+            .unwrap_or(true);
+        if rebuild {
+            self.blend_copy_target = Some(create_blend_copy_target(
+                device,
+                &self.texture_layout,
+                &self.sampler,
+                format,
                 width,
                 height,
             ));
@@ -2983,6 +3086,7 @@ fn mask_writer_uniform(
         canvas: live2d_canvas_uniform(canvas),
         effect: [1.0, 1.0, 1.0, 1.0],
         mask: [0.0, 0.0, 0.0, 0.0],
+        blend: [0, 0, 0, 0],
     }
 }
 
@@ -3039,6 +3143,29 @@ fn create_empty_mask_bind_group(
     create_mask_bind_group(device, layout, sampler, &view)
 }
 
+fn create_empty_sampled_texture_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Live2D Empty Blend Texture"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    create_sampled_texture_bind_group(device, layout, sampler, &view)
+}
+
 fn create_mask_atlas(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -3093,16 +3220,72 @@ fn create_offscreen_target(
         format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     OffscreenTarget {
         width,
         height,
-        _texture: texture,
+        texture,
         view,
     }
+}
+
+fn create_blend_copy_target(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> BlendCopyTarget {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Live2D Blend Copy Texture"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind_group = create_sampled_texture_bind_group(device, layout, sampler, &view);
+    BlendCopyTarget {
+        width,
+        height,
+        format,
+        texture,
+        bind_group,
+    }
+}
+
+fn create_sampled_texture_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Live2D Sampled Texture Bind Group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 fn create_mask_bind_group(
@@ -3310,6 +3493,53 @@ fn mask_uniform_for_layout(draw: &DrawCommand, layout: Option<MaskAtlasLayout>) 
     ]
 }
 
+fn blend_uniform(blend_mode: BlendMode) -> [u32; 4] {
+    match blend_mode {
+        BlendMode::Advanced { color, alpha } => {
+            [color_blend_code(color), alpha_blend_code(alpha), 0, 0]
+        }
+        BlendMode::Normal | BlendMode::Additive | BlendMode::Multiplicative => [0, 0, 0, 0],
+    }
+}
+
+fn color_blend_code(mode: ColorBlendMode) -> u32 {
+    match mode {
+        ColorBlendMode::Normal => 0,
+        ColorBlendMode::Add => 3,
+        ColorBlendMode::AddGlow => 4,
+        ColorBlendMode::Darken => 5,
+        ColorBlendMode::Multiply => 6,
+        ColorBlendMode::ColorBurn => 7,
+        ColorBlendMode::LinearBurn => 8,
+        ColorBlendMode::Lighten => 9,
+        ColorBlendMode::Screen => 10,
+        ColorBlendMode::ColorDodge => 11,
+        ColorBlendMode::Overlay => 12,
+        ColorBlendMode::SoftLight => 13,
+        ColorBlendMode::HardLight => 14,
+        ColorBlendMode::LinearLight => 15,
+        ColorBlendMode::Hue => 16,
+        ColorBlendMode::Color => 17,
+    }
+}
+
+fn alpha_blend_code(mode: AlphaBlendMode) -> u32 {
+    match mode {
+        AlphaBlendMode::Over => 0,
+        AlphaBlendMode::Atop => 1,
+        AlphaBlendMode::Out => 2,
+        AlphaBlendMode::ConjointOver => 3,
+        AlphaBlendMode::DisjointOver => 4,
+    }
+}
+
+fn render_plan_has_advanced_blend(render_plan: &RenderPlan) -> bool {
+    render_plan
+        .draws
+        .iter()
+        .any(|draw| matches!(draw.blend_mode, BlendMode::Advanced { .. }))
+}
+
 fn upload_main_uniforms(
     queue: &wgpu::Queue,
     uniform_buffer: &wgpu::Buffer,
@@ -3384,6 +3614,7 @@ fn fill_main_uniform_upload_bytes(
             canvas,
             effect,
             mask: mask_uniform(draw, mask_atlas),
+            blend: blend_uniform(draw.blend_mode),
         };
         let offset = index * uniform_stride;
         bytes[offset..offset + uniform_size].copy_from_slice(bytemuck::bytes_of(&uniform));
@@ -3451,6 +3682,7 @@ fn create_live2d_pipeline(
 fn fragment_entry_point(shader_variant: ShaderVariant) -> &'static str {
     match shader_variant {
         ShaderVariant::DefaultMesh => "fs_main",
+        ShaderVariant::AdvancedBlend => "fs_blend",
         ShaderVariant::MaskWriter => "fs_mask",
     }
 }
@@ -3464,13 +3696,21 @@ fn pipeline_label(key: PipelineKey) -> String {
     )
 }
 
-fn live2d_blend_state(blend_mode: BlendMode) -> wgpu::BlendState {
+fn pipeline_blend_mode(blend_mode: BlendMode) -> PipelineBlendMode {
     match blend_mode {
-        BlendMode::Normal => wgpu::BlendState::ALPHA_BLENDING,
-        BlendMode::Additive => wgpu::BlendState {
+        BlendMode::Normal => PipelineBlendMode::Normal,
+        BlendMode::Additive => PipelineBlendMode::Additive,
+        BlendMode::Multiplicative => PipelineBlendMode::Multiplicative,
+        BlendMode::Advanced { .. } => PipelineBlendMode::Advanced,
+    }
+}
+
+fn live2d_blend_state(blend_mode: PipelineBlendMode) -> wgpu::BlendState {
+    match blend_mode {
+        PipelineBlendMode::Normal => wgpu::BlendState {
             color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::SrcAlpha,
-                dst_factor: wgpu::BlendFactor::One,
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                 operation: wgpu::BlendOperation::Add,
             },
             alpha: wgpu::BlendComponent {
@@ -3479,7 +3719,19 @@ fn live2d_blend_state(blend_mode: BlendMode) -> wgpu::BlendState {
                 operation: wgpu::BlendOperation::Add,
             },
         },
-        BlendMode::Multiplicative => wgpu::BlendState {
+        PipelineBlendMode::Additive => wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::Zero,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        },
+        PipelineBlendMode::Multiplicative => wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::Dst,
                 dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
@@ -3491,6 +3743,7 @@ fn live2d_blend_state(blend_mode: BlendMode) -> wgpu::BlendState {
                 operation: wgpu::BlendOperation::Add,
             },
         },
+        PipelineBlendMode::Advanced => wgpu::BlendState::REPLACE,
     }
 }
 
@@ -3671,7 +3924,8 @@ fn padded_index_bytes(indices: &[u16]) -> Vec<u8> {
 mod tests {
     use super::*;
     use live2d_core::{
-        BlendMode, CanvasInfo, ClippingInfo, DrawableId, MaskRef, MaterialKey, TextureAsset, Vertex,
+        AlphaBlendMode, BlendMode, CanvasInfo, ClippingInfo, ColorBlendMode, DrawableId, MaskRef,
+        MaterialKey, TextureAsset, Vertex,
     };
     use live2d_render::RenderPlanner;
 
@@ -3699,6 +3953,67 @@ mod tests {
         let effect = uniform.live2d_effect();
 
         assert_eq!(effect, [0.65, 0.8, 1.1, 0.75]);
+    }
+
+    #[test]
+    fn legacy_blend_states_use_premultiplied_cubism_factors() {
+        let normal = live2d_blend_state(PipelineBlendMode::Normal);
+        assert_blend_component(
+            normal.color,
+            wgpu::BlendFactor::One,
+            wgpu::BlendFactor::OneMinusSrcAlpha,
+        );
+        assert_blend_component(
+            normal.alpha,
+            wgpu::BlendFactor::One,
+            wgpu::BlendFactor::OneMinusSrcAlpha,
+        );
+
+        let additive = live2d_blend_state(PipelineBlendMode::Additive);
+        assert_blend_component(
+            additive.color,
+            wgpu::BlendFactor::One,
+            wgpu::BlendFactor::One,
+        );
+        assert_blend_component(
+            additive.alpha,
+            wgpu::BlendFactor::Zero,
+            wgpu::BlendFactor::One,
+        );
+
+        let multiplicative = live2d_blend_state(PipelineBlendMode::Multiplicative);
+        assert_blend_component(
+            multiplicative.color,
+            wgpu::BlendFactor::Dst,
+            wgpu::BlendFactor::OneMinusSrcAlpha,
+        );
+        assert_blend_component(
+            multiplicative.alpha,
+            wgpu::BlendFactor::Zero,
+            wgpu::BlendFactor::One,
+        );
+    }
+
+    #[test]
+    fn render_plan_reports_advanced_blend_draws() {
+        let mut snapshot = masked_snapshot();
+        snapshot.drawables[1].blend_mode = BlendMode::Advanced {
+            color: ColorBlendMode::Multiply,
+            alpha: AlphaBlendMode::Atop,
+        };
+        let render_plan = RenderPlanner::new().build(&snapshot);
+        let advanced_draw = render_plan
+            .draws
+            .iter()
+            .find(|draw| matches!(draw.blend_mode, BlendMode::Advanced { .. }))
+            .expect("advanced drawable is present");
+
+        assert!(render_plan_has_advanced_blend(&render_plan));
+        assert_eq!(
+            pipeline_blend_mode(advanced_draw.blend_mode),
+            PipelineBlendMode::Advanced
+        );
+        assert_eq!(blend_uniform(advanced_draw.blend_mode), [6, 1, 0, 0]);
     }
 
     #[test]
@@ -4245,5 +4560,15 @@ mod tests {
             inverted_mask: false,
             material: MaterialKey::Default,
         }
+    }
+
+    fn assert_blend_component(
+        component: wgpu::BlendComponent,
+        src_factor: wgpu::BlendFactor,
+        dst_factor: wgpu::BlendFactor,
+    ) {
+        assert_eq!(component.src_factor, src_factor);
+        assert_eq!(component.dst_factor, dst_factor);
+        assert_eq!(component.operation, wgpu::BlendOperation::Add);
     }
 }

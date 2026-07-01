@@ -1,5 +1,6 @@
 use live2d_core::{
-    BlendMode, CanvasInfo, ClippingInfo, Drawable, DrawableId, ModelSnapshot, TextureAsset, Vertex,
+    AlphaBlendMode, BlendMode, CanvasInfo, ClippingInfo, ColorBlendMode, Drawable, DrawableId,
+    ModelSnapshot, TextureAsset, Vertex,
 };
 use live2d_probe::{ProbeRecorder, RunReport};
 use live2d_render::{
@@ -139,7 +140,8 @@ fn pp_apply(fragment: PpFragment) -> vec4<f32> {
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let view_texture = target.create_view(&wgpu::TextureViewDescriptor::default());
@@ -174,6 +176,7 @@ fn pp_apply(fragment: PpFragment) -> vec4<f32> {
                         &queue,
                         &mut encoder,
                         live2d_wgpu::WgpuLive2DTarget::clear(
+                            &target,
                             &view_texture,
                             wgpu::Color::TRANSPARENT,
                         ),
@@ -188,7 +191,11 @@ fn pp_apply(fragment: PpFragment) -> vec4<f32> {
                     &device,
                     &queue,
                     &mut encoder,
-                    live2d_wgpu::WgpuLive2DTarget::clear(&view_texture, wgpu::Color::TRANSPARENT),
+                    live2d_wgpu::WgpuLive2DTarget::clear(
+                        &target,
+                        &view_texture,
+                        wgpu::Color::TRANSPARENT,
+                    ),
                     &snapshot,
                     view,
                     &recorder,
@@ -392,6 +399,10 @@ pub fn synthetic_snapshot(config: &SyntheticConfig, frame: usize) -> ModelSnapsh
                 blend_mode: match index % 11 {
                     0 => BlendMode::Additive,
                     1 => BlendMode::Multiplicative,
+                    2 => BlendMode::Advanced {
+                        color: ColorBlendMode::Multiply,
+                        alpha: AlphaBlendMode::Over,
+                    },
                     _ => BlendMode::Normal,
                 },
                 clipping,

@@ -29,6 +29,94 @@ pub enum BlendMode {
     Normal,
     Additive,
     Multiplicative,
+    Advanced {
+        color: ColorBlendMode,
+        alpha: AlphaBlendMode,
+    },
+}
+
+impl BlendMode {
+    pub fn from_cubism_blend_mode(value: i32) -> Self {
+        let color = value & 0xff;
+        let alpha = (value >> 8) & 0xff;
+        match (color, alpha) {
+            (0, 0) => Self::Normal,
+            (1, _) => Self::Additive,
+            (2, _) => Self::Multiplicative,
+            _ => Self::Advanced {
+                color: ColorBlendMode::from_cubism_color_blend_type(color),
+                alpha: AlphaBlendMode::from_cubism_alpha_blend_type(alpha),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ColorBlendMode {
+    #[default]
+    Normal,
+    Add,
+    AddGlow,
+    Darken,
+    Multiply,
+    ColorBurn,
+    LinearBurn,
+    Lighten,
+    Screen,
+    ColorDodge,
+    Overlay,
+    SoftLight,
+    HardLight,
+    LinearLight,
+    Hue,
+    Color,
+}
+
+impl ColorBlendMode {
+    pub fn from_cubism_color_blend_type(value: i32) -> Self {
+        match value {
+            3 => Self::Add,
+            4 => Self::AddGlow,
+            5 => Self::Darken,
+            6 => Self::Multiply,
+            7 => Self::ColorBurn,
+            8 => Self::LinearBurn,
+            9 => Self::Lighten,
+            10 => Self::Screen,
+            11 => Self::ColorDodge,
+            12 => Self::Overlay,
+            13 => Self::SoftLight,
+            14 => Self::HardLight,
+            15 => Self::LinearLight,
+            16 => Self::Hue,
+            17 => Self::Color,
+            _ => Self::Normal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AlphaBlendMode {
+    #[default]
+    Over,
+    Atop,
+    Out,
+    ConjointOver,
+    DisjointOver,
+}
+
+impl AlphaBlendMode {
+    pub fn from_cubism_alpha_blend_type(value: i32) -> Self {
+        match value {
+            1 => Self::Atop,
+            2 => Self::Out,
+            3 => Self::ConjointOver,
+            4 => Self::DisjointOver,
+            _ => Self::Over,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -112,4 +200,30 @@ pub struct MaskRef(pub usize);
 pub struct DrawableRanges {
     pub vertex_range: Range<u32>,
     pub index_range: Range<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cubism_compatible_blend_modes_map_to_legacy_modes() {
+        assert_eq!(BlendMode::from_cubism_blend_mode(0), BlendMode::Normal);
+        assert_eq!(BlendMode::from_cubism_blend_mode(1), BlendMode::Additive);
+        assert_eq!(
+            BlendMode::from_cubism_blend_mode(2),
+            BlendMode::Multiplicative
+        );
+    }
+
+    #[test]
+    fn cubism_advanced_blend_mode_splits_color_and_alpha() {
+        assert_eq!(
+            BlendMode::from_cubism_blend_mode(6 | (3 << 8)),
+            BlendMode::Advanced {
+                color: ColorBlendMode::Multiply,
+                alpha: AlphaBlendMode::ConjointOver,
+            }
+        );
+    }
 }

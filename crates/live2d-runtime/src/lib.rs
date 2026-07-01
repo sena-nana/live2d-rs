@@ -1092,6 +1092,7 @@ mod runtime {
         let count = live2d_sys::csmGetDrawableCount(model).max(0) as usize;
         let ids = live2d_sys::csmGetDrawableIds(model);
         let constant_flags = live2d_sys::csmGetDrawableConstantFlags(model);
+        let blend_modes = live2d_sys::csmGetDrawableBlendModes(model);
         let texture_indices = live2d_sys::csmGetDrawableTextureIndices(model);
         let mask_counts = live2d_sys::csmGetDrawableMaskCounts(model);
         let masks = live2d_sys::csmGetDrawableMasks(model);
@@ -1167,12 +1168,10 @@ mod runtime {
                     inverted: false,
                 })
             };
-            let blend_mode = if constant & live2d_sys::csmBlendAdditive != 0 {
-                BlendMode::Additive
-            } else if constant & live2d_sys::csmBlendMultiplicative != 0 {
-                BlendMode::Multiplicative
+            let blend_mode = if blend_modes.is_null() {
+                blend_mode_from_constant_flags(constant)
             } else {
-                BlendMode::Normal
+                BlendMode::from_cubism_blend_mode(*blend_modes.add(index))
             };
 
             let vertex_count = *vertex_counts.add(index) as usize;
@@ -1217,6 +1216,16 @@ mod runtime {
             drawable_metas,
             art_meshes,
         ))
+    }
+
+    fn blend_mode_from_constant_flags(flags: live2d_sys::csmFlags) -> BlendMode {
+        if flags & live2d_sys::csmBlendAdditive != 0 {
+            BlendMode::Additive
+        } else if flags & live2d_sys::csmBlendMultiplicative != 0 {
+            BlendMode::Multiplicative
+        } else {
+            BlendMode::Normal
+        }
     }
 
     #[cfg(feature = "probe")]
