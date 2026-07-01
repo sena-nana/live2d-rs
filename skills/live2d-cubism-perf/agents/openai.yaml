@@ -1,0 +1,4 @@
+interface:
+  display_name: "Live2D Cubism Perf"
+  short_description: "Validate Cubism SDK setup and performance."
+  default_prompt: "Use $live2d-cubism-perf to work on Cubism SDK linking, real model loading, live2d-perf scenarios, or performance regression checks."

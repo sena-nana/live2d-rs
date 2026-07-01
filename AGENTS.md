@@ -11,8 +11,16 @@ If this repository has a `.codegraph/` directory, use CodeGraph before grep/find
 - Keep `live2d-sys`, `live2d-core`, `live2d-runtime`, and `live2d-render` free of `wgpu`, `winit`, and Tauri types.
 - Do not create a `live2d-tauri` crate or a `tauri` feature in this phase.
 - Do not vendor the official Cubism SDK or generated SDK downloads. Use `LIVE2D_CUBISM_SDK_DIR` for local linking.
+- Treat `.env` as the local environment-variable file. Use environment variables from it, especially `LIVE2D_CUBISM_SDK_DIR`, when SDK-backed commands need the Cubism SDK; do not hard-code SDK paths.
 - Keep application-specific display protocols outside this workspace; NanaVTS preview code belongs in the NanaVTS/VTSTemplate repository.
 - Prefer functional tests over log/string matching. Add tests only when behavior changes.
+
+## Skills
+
+- Use `live2d-core-runtime` for `live2d-sys`, `live2d-core`, `live2d-runtime`, facade exports, model3 parsing, snapshots, and ArtMesh inspection.
+- Use `live2d-render-plan` for platform-neutral `RenderPlan`, draw ordering, mask plans, material grouping, and backend dispatch contracts.
+- Use `live2d-wgpu-renderer` for `live2d-wgpu`, WGSL, wgpu resources, pipeline/cache work, mask atlas rendering, and built-in preview renderer state.
+- Use `live2d-cubism-perf` for `.env`/`LIVE2D_CUBISM_SDK_DIR`, Cubism SDK linking, real model loading, `live2d-perf`, and before/after performance comparisons.
 
 ## Crate Boundaries
 

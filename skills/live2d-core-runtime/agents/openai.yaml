@@ -1,0 +1,4 @@
+interface:
+  display_name: "Live2D Core Runtime"
+  short_description: "Maintain FFI, core types, and runtime loading."
+  default_prompt: "Use $live2d-core-runtime to work on Live2D FFI, core data types, model loading, snapshots, or facade APIs."

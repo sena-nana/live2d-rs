@@ -1,4 +1,0 @@
-interface:
-  display_name: "Live2D Rust Dev"
-  short_description: "Maintain Live2D Rust runtime and wgpu preview."
-  default_prompt: "Use $live2d-rs-dev to work on the Live2D Rust runtime, render planner, or wgpu previewer."

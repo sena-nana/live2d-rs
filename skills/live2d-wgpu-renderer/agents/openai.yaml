@@ -1,0 +1,4 @@
+interface:
+  display_name: "Live2D wgpu Renderer"
+  short_description: "Maintain wgpu rendering and preview state."
+  default_prompt: "Use $live2d-wgpu-renderer to work on wgpu pipelines, shaders, buffers, textures, preview rendering, or GPU resources."

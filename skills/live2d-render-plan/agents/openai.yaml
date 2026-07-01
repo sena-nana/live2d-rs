@@ -1,0 +1,4 @@
+interface:
+  display_name: "Live2D Render Plan"
+  short_description: "Maintain platform-neutral render planning."
+  default_prompt: "Use $live2d-render-plan to work on RenderPlan, draw ordering, masks, material grouping, or render backend boundaries."
