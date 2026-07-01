@@ -17,8 +17,9 @@ use std::{
 
 mod motion;
 pub use motion::{
-    Live2DMotion, MotionEvaluation, MotionEvent, MotionPlayOptions, MotionPlaybackState,
-    MotionPlayer, MotionPriority, MotionStartResult,
+    Live2DMotion, MotionBlendMode, MotionEvaluation, MotionEvent, MotionLayerId,
+    MotionLayerOptions, MotionMixer, MotionPlayOptions, MotionPlaybackState, MotionPlayer,
+    MotionPriority, MotionStartResult,
 };
 
 #[cfg(not(feature = "live2d-cubism"))]
@@ -154,7 +155,7 @@ impl AssetResolver for FsAssetResolver {
 pub struct Live2DInstance {
     snapshot: ModelSnapshot,
     elapsed_seconds: f32,
-    motion_player: MotionPlayer,
+    motion_mixer: MotionMixer,
     motion_evaluation: MotionEvaluation,
     #[cfg(feature = "live2d-cubism")]
     model: runtime::CubismLive2DModel,
@@ -178,7 +179,7 @@ impl Live2DInstance {
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
         self.elapsed_seconds += dt;
         if self
-            .motion_player
+            .motion_mixer
             .advance_into(dt, &mut self.motion_evaluation)
         {
             self.apply_buffered_motion_frame()?;
@@ -196,9 +197,9 @@ impl Live2DInstance {
     }
 
     pub fn play_motion(&mut self, motion: Live2DMotion, loop_playback: bool) -> Result<(), String> {
-        self.motion_player.play(motion, loop_playback);
+        self.motion_mixer.primary_mut().play(motion, loop_playback);
         if let Err(error) = self.apply_current_motion_frame() {
-            self.motion_player.stop();
+            self.motion_mixer.primary_mut().stop();
             return Err(error);
         }
         Ok(())
@@ -209,9 +210,11 @@ impl Live2DInstance {
         motion: Live2DMotion,
         options: MotionPlayOptions,
     ) -> Result<(), String> {
-        self.motion_player.play_with_options(motion, options);
+        self.motion_mixer
+            .primary_mut()
+            .play_with_options(motion, options);
         if let Err(error) = self.apply_current_motion_frame() {
-            self.motion_player.stop();
+            self.motion_mixer.primary_mut().stop();
             return Err(error);
         }
         Ok(())
@@ -231,10 +234,13 @@ impl Live2DInstance {
         motion: Live2DMotion,
         options: MotionPlayOptions,
     ) -> Result<MotionStartResult, String> {
-        let result = self.motion_player.request_motion(motion, options);
+        let result = self
+            .motion_mixer
+            .primary_mut()
+            .request_motion(motion, options);
         if result == MotionStartResult::Started {
             if let Err(error) = self.apply_current_motion_frame() {
-                self.motion_player.stop();
+                self.motion_mixer.primary_mut().stop();
                 return Err(error);
             }
         }
@@ -251,7 +257,9 @@ impl Live2DInstance {
     }
 
     pub fn queue_motion(&mut self, motion: Live2DMotion, options: MotionPlayOptions) {
-        self.motion_player.queue_motion(motion, options);
+        self.motion_mixer
+            .primary_mut()
+            .queue_motion(motion, options);
     }
 
     pub fn queue_motion_file(
@@ -265,7 +273,9 @@ impl Live2DInstance {
     }
 
     pub fn set_idle_motion(&mut self, motion: Live2DMotion, options: MotionPlayOptions) {
-        self.motion_player.set_idle_motion(motion, options);
+        self.motion_mixer
+            .primary_mut()
+            .set_idle_motion(motion, options);
     }
 
     pub fn set_idle_motion_file(&mut self, motion_file: &ModelMotionFile) -> Result<(), String> {
@@ -275,52 +285,106 @@ impl Live2DInstance {
     }
 
     pub fn clear_idle_motion(&mut self) {
-        self.motion_player.clear_idle_motion();
+        self.motion_mixer.primary_mut().clear_idle_motion();
     }
 
     pub fn queued_motion_count(&self) -> usize {
-        self.motion_player.queued_motion_count()
+        self.motion_mixer.primary().queued_motion_count()
     }
 
     pub fn pause_motion(&mut self) {
-        self.motion_player.pause();
+        self.motion_mixer.primary_mut().pause();
     }
 
     pub fn resume_motion(&mut self) {
-        self.motion_player.resume();
+        self.motion_mixer.primary_mut().resume();
     }
 
     pub fn stop_motion(&mut self) {
-        self.motion_player.stop();
+        self.motion_mixer.primary_mut().stop();
     }
 
     pub fn stop_motion_with_fade(&mut self, fade_out_seconds: f32) {
-        self.motion_player.stop_with_fade(fade_out_seconds);
+        self.motion_mixer
+            .primary_mut()
+            .stop_with_fade(fade_out_seconds);
     }
 
     pub fn seek_motion(&mut self, elapsed_seconds: f32) -> Result<(), String> {
-        self.motion_player.seek(elapsed_seconds);
+        self.motion_mixer.primary_mut().seek(elapsed_seconds);
         self.apply_current_motion_frame()
     }
 
     pub fn set_motion_loop(&mut self, loop_playback: bool) {
-        self.motion_player.set_loop(loop_playback);
+        self.motion_mixer.primary_mut().set_loop(loop_playback);
     }
 
     pub fn set_motion_speed(&mut self, speed: f32) {
-        self.motion_player.set_speed(speed);
+        self.motion_mixer.primary_mut().set_speed(speed);
     }
 
     pub fn motion_state(&self) -> MotionPlaybackState {
-        self.motion_player.state()
+        self.motion_mixer.primary().state()
     }
 
     pub fn motion_elapsed_seconds(&self) -> f32 {
-        self.motion_player.elapsed_seconds()
+        self.motion_mixer.primary().elapsed_seconds()
     }
 
     pub fn motion_player(&self) -> &MotionPlayer {
-        &self.motion_player
+        self.motion_mixer.primary()
+    }
+
+    pub fn motion_mixer(&self) -> &MotionMixer {
+        &self.motion_mixer
+    }
+
+    pub fn set_motion_layer(
+        &mut self,
+        id: impl Into<MotionLayerId>,
+        motion: Live2DMotion,
+        play_options: MotionPlayOptions,
+        layer_options: MotionLayerOptions,
+    ) {
+        self.motion_mixer
+            .set_layer(id, motion, play_options, layer_options);
+    }
+
+    pub fn set_motion_layer_file(
+        &mut self,
+        id: impl Into<MotionLayerId>,
+        motion_file: &ModelMotionFile,
+        loop_playback: bool,
+        layer_options: MotionLayerOptions,
+    ) -> Result<(), String> {
+        let motion = motion_file.load_motion()?;
+        self.set_motion_layer(
+            id,
+            motion,
+            motion_file.play_options(loop_playback),
+            layer_options,
+        );
+        Ok(())
+    }
+
+    pub fn clear_motion_layer(&mut self, id: impl AsRef<str>) -> bool {
+        self.motion_mixer.clear_layer(id)
+    }
+
+    pub fn set_motion_layer_weight(&mut self, id: impl AsRef<str>, weight: f32) -> bool {
+        self.motion_mixer.set_layer_weight(id, weight)
+    }
+
+    pub fn set_breath_motion_file(&mut self, motion_file: &ModelMotionFile) -> Result<(), String> {
+        self.set_motion_layer_file(
+            "breath",
+            motion_file,
+            true,
+            MotionLayerOptions {
+                blend: MotionBlendMode::Additive,
+                ..MotionLayerOptions::default()
+            },
+        )
     }
 
     pub fn motion_events(&self) -> &[MotionEvent] {
@@ -486,10 +550,7 @@ impl Live2DInstance {
     }
 
     fn apply_current_motion_frame(&mut self) -> Result<(), String> {
-        if self
-            .motion_player
-            .evaluate_into(&mut self.motion_evaluation)
-        {
+        if self.motion_mixer.evaluate_into(&mut self.motion_evaluation) {
             self.apply_buffered_motion_frame()?;
         }
         Ok(())
@@ -833,7 +894,7 @@ mod runtime {
         Ok(Live2DInstance {
             snapshot,
             elapsed_seconds: 0.0,
-            motion_player: MotionPlayer::new(),
+            motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
         })
     }
@@ -1403,7 +1464,7 @@ mod runtime {
         Ok(Live2DInstance {
             snapshot,
             elapsed_seconds: 0.0,
-            motion_player: MotionPlayer::new(),
+            motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
             model,
         })
@@ -2160,10 +2221,13 @@ mod tests {
         let mut instance = Live2DInstance {
             snapshot: empty_snapshot(),
             elapsed_seconds: 0.0,
-            motion_player: MotionPlayer::new(),
+            motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
         };
-        instance.motion_player.play(test_motion(), false);
+        instance
+            .motion_mixer
+            .primary_mut()
+            .play(test_motion(), false);
 
         let result = instance.update(0.5);
 
@@ -2356,7 +2420,7 @@ mod tests {
         Live2DInstance {
             snapshot: empty_snapshot(),
             elapsed_seconds: 0.0,
-            motion_player: MotionPlayer::new(),
+            motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
         }
     }

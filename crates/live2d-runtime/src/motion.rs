@@ -49,6 +49,22 @@ pub struct MotionPlayOptions {
     pub priority: MotionPriority,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MotionLayerId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionBlendMode {
+    Override,
+    Additive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionLayerOptions {
+    pub weight: f32,
+    pub enabled: bool,
+    pub blend: MotionBlendMode,
+}
+
 #[derive(Debug, Clone)]
 pub struct MotionPlayer {
     active: Option<MotionTrack>,
@@ -57,6 +73,12 @@ pub struct MotionPlayer {
     idle: Option<QueuedMotion>,
     scratch: MotionEvaluation,
     state: MotionPlaybackState,
+}
+
+#[derive(Debug, Clone)]
+pub struct MotionMixer {
+    primary: MotionPlayer,
+    layers: Vec<MotionLayer>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +93,13 @@ struct MotionTrack {
 struct QueuedMotion {
     motion: Live2DMotion,
     options: MotionPlayOptions,
+}
+
+#[derive(Debug, Clone)]
+struct MotionLayer {
+    id: MotionLayerId,
+    player: MotionPlayer,
+    options: MotionLayerOptions,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -238,6 +267,50 @@ impl MotionEvaluation {
         add_weighted_values(&mut self.parameters, &source.parameters, weight);
         add_weighted_values(&mut self.part_opacities, &source.part_opacities, weight);
     }
+
+    fn apply_layer(&mut self, source: &MotionEvaluation, options: MotionLayerOptions) {
+        if !options.enabled {
+            return;
+        }
+        self.events.extend(source.events.iter().cloned());
+        let weight = finite_non_negative(options.weight);
+        if weight <= 0.0 {
+            return;
+        }
+        match options.blend {
+            MotionBlendMode::Override => self.add_override(source, weight),
+            MotionBlendMode::Additive => self.add_additive(source, weight),
+        }
+    }
+
+    fn add_override(&mut self, source: &MotionEvaluation, weight: f32) {
+        let weight = weight.clamp(0.0, 1.0);
+        if weight <= 0.0 {
+            return;
+        }
+        if let Some(opacity) = source.model_opacity {
+            self.model_opacity = Some(blend_optional_opacity(self.model_opacity, opacity, weight));
+        }
+        add_override_values(&mut self.parameters, &source.parameters, weight);
+        add_override_values(&mut self.part_opacities, &source.part_opacities, weight);
+    }
+
+    fn add_additive(&mut self, source: &MotionEvaluation, weight: f32) {
+        add_weighted_values(&mut self.parameters, &source.parameters, weight);
+        let override_weight = weight.clamp(0.0, 1.0);
+        if let Some(opacity) = source.model_opacity {
+            self.model_opacity = Some(blend_optional_opacity(
+                self.model_opacity,
+                opacity,
+                override_weight,
+            ));
+        }
+        add_override_values(
+            &mut self.part_opacities,
+            &source.part_opacities,
+            override_weight,
+        );
+    }
 }
 
 impl Default for MotionPlayOptions {
@@ -277,6 +350,44 @@ impl MotionPlayOptions {
                 1.0
             },
             priority: self.priority,
+        }
+    }
+}
+
+impl From<String> for MotionLayerId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for MotionLayerId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl AsRef<str> for MotionLayerId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for MotionLayerOptions {
+    fn default() -> Self {
+        Self {
+            weight: 1.0,
+            enabled: true,
+            blend: MotionBlendMode::Override,
+        }
+    }
+}
+
+impl MotionLayerOptions {
+    fn normalized(self) -> Self {
+        Self {
+            weight: finite_non_negative(self.weight),
+            enabled: self.enabled,
+            blend: self.blend,
         }
     }
 }
@@ -603,6 +714,115 @@ impl MotionPlayer {
     }
 }
 
+impl Default for MotionMixer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MotionMixer {
+    pub fn new() -> Self {
+        Self {
+            primary: MotionPlayer::new(),
+            layers: Vec::new(),
+        }
+    }
+
+    pub fn primary(&self) -> &MotionPlayer {
+        &self.primary
+    }
+
+    pub fn primary_mut(&mut self) -> &mut MotionPlayer {
+        &mut self.primary
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn layer_options(&self, id: impl AsRef<str>) -> Option<MotionLayerOptions> {
+        self.layer(id.as_ref()).map(|layer| layer.options)
+    }
+
+    pub fn layer_player(&self, id: impl AsRef<str>) -> Option<&MotionPlayer> {
+        self.layer(id.as_ref()).map(|layer| &layer.player)
+    }
+
+    pub fn set_layer(
+        &mut self,
+        id: impl Into<MotionLayerId>,
+        motion: Live2DMotion,
+        play_options: MotionPlayOptions,
+        layer_options: MotionLayerOptions,
+    ) {
+        let id = id.into();
+        let layer_options = layer_options.normalized();
+        if let Some(layer) = self.layer_mut(id.as_ref()) {
+            layer.options = layer_options;
+            layer.player.play_with_options(motion, play_options);
+            return;
+        }
+        let mut player = MotionPlayer::new();
+        player.play_with_options(motion, play_options);
+        self.layers.push(MotionLayer {
+            id,
+            player,
+            options: layer_options,
+        });
+    }
+
+    pub fn clear_layer(&mut self, id: impl AsRef<str>) -> bool {
+        let Some(index) = self
+            .layers
+            .iter()
+            .position(|layer| layer.id.as_ref() == id.as_ref())
+        else {
+            return false;
+        };
+        self.layers.remove(index);
+        true
+    }
+
+    pub fn set_layer_weight(&mut self, id: impl AsRef<str>, weight: f32) -> bool {
+        let Some(layer) = self.layer_mut(id.as_ref()) else {
+            return false;
+        };
+        layer.options.weight = finite_non_negative(weight);
+        true
+    }
+
+    pub fn evaluate_into(&self, evaluation: &mut MotionEvaluation) -> bool {
+        evaluation.clear();
+        self.primary.evaluate_into(evaluation);
+        let mut scratch = MotionEvaluation::default();
+        for layer in &self.layers {
+            if layer.player.evaluate_into(&mut scratch) {
+                evaluation.apply_layer(&scratch, layer.options);
+            }
+        }
+        evaluation.has_motion_values()
+    }
+
+    pub fn advance_into(&mut self, dt: f32, evaluation: &mut MotionEvaluation) -> bool {
+        evaluation.clear();
+        self.primary.advance_into(dt, evaluation);
+        let mut scratch = MotionEvaluation::default();
+        for layer in &mut self.layers {
+            layer.player.advance_into(dt, &mut scratch);
+            evaluation.apply_layer(&scratch, layer.options);
+        }
+        evaluation.has_motion_values()
+    }
+
+    fn layer(&self, id: &str) -> Option<&MotionLayer> {
+        self.layers.iter().find(|layer| layer.id.as_ref() == id)
+    }
+
+    fn layer_mut(&mut self, id: &str) -> Option<&mut MotionLayer> {
+        self.layers.iter_mut().find(|layer| layer.id.as_ref() == id)
+    }
+}
+
 impl MotionTrack {
     fn advance(&mut self, dt: f32) {
         self.elapsed_seconds = self.clamp_elapsed(self.elapsed_seconds + dt * self.options.speed);
@@ -860,6 +1080,23 @@ fn add_weighted_values(target: &mut Vec<(String, f32)>, source: &[(String, f32)]
     }
 }
 
+fn add_override_values(target: &mut Vec<(String, f32)>, source: &[(String, f32)], weight: f32) {
+    for (id, value) in source {
+        if let Some((_, current)) = target
+            .iter_mut()
+            .find(|(candidate_id, _)| candidate_id == id)
+        {
+            *current = lerp(*current, *value, weight);
+        } else {
+            target.push((id.clone(), value * weight));
+        }
+    }
+}
+
+fn blend_optional_opacity(current: Option<f32>, next: f32, weight: f32) -> f32 {
+    lerp(current.unwrap_or(1.0), next, weight)
+}
+
 fn collect_events_between(
     motion: &Live2DMotion,
     previous_seconds: f32,
@@ -1113,6 +1350,144 @@ mod tests {
         assert!(!player.advance_into(0.6, &mut evaluation));
         assert!(evaluation.events.is_empty());
         assert!(!player.advance_into(0.4, &mut evaluation));
+        assert_eq!(event_values(&evaluation), vec!["blink"]);
+    }
+
+    #[test]
+    fn mixer_combines_primary_idle_and_additive_breath_layer() {
+        let mut mixer = MotionMixer::new();
+        mixer.primary_mut().set_idle_motion(
+            named_motion("ParamAngleX", 10.0, 10.0),
+            MotionPlayOptions::default(),
+        );
+        mixer.set_layer(
+            "breath",
+            named_motion("ParamBreath", 1.0, 1.0),
+            MotionPlayOptions::looped(true),
+            MotionLayerOptions {
+                blend: MotionBlendMode::Additive,
+                ..MotionLayerOptions::default()
+            },
+        );
+
+        let mut evaluation = MotionEvaluation::default();
+        assert!(mixer.advance_into(0.25, &mut evaluation));
+
+        assert_close(value_for(&evaluation, "ParamAngleX"), 10.0);
+        assert_close(value_for(&evaluation, "ParamBreath"), 1.0);
+    }
+
+    #[test]
+    fn mixer_keeps_breath_layer_when_primary_action_returns_to_idle() {
+        let mut mixer = MotionMixer::new();
+        mixer.primary_mut().set_idle_motion(
+            named_motion("ParamAngleX", -10.0, -10.0),
+            MotionPlayOptions::default(),
+        );
+        mixer.set_layer(
+            "breath",
+            named_motion("ParamBreath", 2.0, 2.0),
+            MotionPlayOptions::looped(true),
+            MotionLayerOptions {
+                blend: MotionBlendMode::Additive,
+                ..MotionLayerOptions::default()
+            },
+        );
+        mixer.primary_mut().play_with_options(
+            named_motion("ParamAngleX", 0.0, 10.0),
+            MotionPlayOptions::default(),
+        );
+
+        let mut evaluation = MotionEvaluation::default();
+        assert!(mixer.advance_into(0.5, &mut evaluation));
+        assert_close(value_for(&evaluation, "ParamAngleX"), 5.0);
+        assert_close(value_for(&evaluation, "ParamBreath"), 2.0);
+
+        assert!(mixer.advance_into(0.5, &mut evaluation));
+        assert_close(value_for(&evaluation, "ParamAngleX"), -10.0);
+        assert_close(value_for(&evaluation, "ParamBreath"), 2.0);
+    }
+
+    #[test]
+    fn mixer_additive_layer_uses_weight_for_same_parameter() {
+        let mut mixer = MotionMixer::new();
+        mixer.primary_mut().play_with_options(
+            named_motion("ParamAngleX", 10.0, 10.0),
+            MotionPlayOptions::looped(true),
+        );
+        mixer.set_layer(
+            "breath",
+            named_motion("ParamAngleX", 4.0, 4.0),
+            MotionPlayOptions::looped(true),
+            MotionLayerOptions {
+                weight: 0.5,
+                blend: MotionBlendMode::Additive,
+                ..MotionLayerOptions::default()
+            },
+        );
+
+        let mut evaluation = MotionEvaluation::default();
+        assert!(mixer.advance_into(0.25, &mut evaluation));
+
+        assert_close(value_for(&evaluation, "ParamAngleX"), 12.0);
+    }
+
+    #[test]
+    fn mixer_disabled_and_cleared_layers_do_not_affect_output() {
+        let mut mixer = MotionMixer::new();
+        mixer.primary_mut().play_with_options(
+            named_motion("ParamAngleX", 10.0, 10.0),
+            MotionPlayOptions::looped(true),
+        );
+        mixer.set_layer(
+            "breath",
+            named_motion("ParamAngleX", 5.0, 5.0),
+            MotionPlayOptions::looped(true),
+            MotionLayerOptions {
+                enabled: false,
+                blend: MotionBlendMode::Additive,
+                ..MotionLayerOptions::default()
+            },
+        );
+
+        let mut evaluation = MotionEvaluation::default();
+        assert!(mixer.advance_into(0.25, &mut evaluation));
+        assert_close(value_for(&evaluation, "ParamAngleX"), 10.0);
+
+        mixer.set_layer(
+            "breath",
+            named_motion("ParamAngleX", 5.0, 5.0),
+            MotionPlayOptions::looped(true),
+            MotionLayerOptions {
+                blend: MotionBlendMode::Additive,
+                ..MotionLayerOptions::default()
+            },
+        );
+        assert!(mixer.advance_into(0.25, &mut evaluation));
+        assert_close(value_for(&evaluation, "ParamAngleX"), 15.0);
+
+        assert!(mixer.clear_layer("breath"));
+        assert!(mixer.advance_into(0.25, &mut evaluation));
+        assert_close(value_for(&evaluation, "ParamAngleX"), 10.0);
+    }
+
+    #[test]
+    fn mixer_layer_events_fire_again_after_loop_wrap() {
+        let mut mixer = MotionMixer::new();
+        mixer.set_layer(
+            "blink",
+            event_motion(true),
+            MotionPlayOptions::looped(true),
+            MotionLayerOptions::default(),
+        );
+
+        let mut evaluation = MotionEvaluation::default();
+        assert!(!mixer.advance_into(0.6, &mut evaluation));
+        assert_eq!(event_values(&evaluation), vec!["blink"]);
+
+        assert!(!mixer.advance_into(0.6, &mut evaluation));
+        assert!(evaluation.events.is_empty());
+        assert!(!mixer.advance_into(0.4, &mut evaluation));
         assert_eq!(event_values(&evaluation), vec!["blink"]);
     }
 
