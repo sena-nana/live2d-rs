@@ -7,6 +7,31 @@ pub struct WgpuLive2DView {
     pub target_drawable_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WgpuTextureSampling {
+    Nearest,
+    #[default]
+    Linear,
+    Cubic,
+}
+
+impl WgpuTextureSampling {
+    pub(crate) fn shader_mode(self) -> u32 {
+        match self {
+            Self::Nearest => 0,
+            Self::Linear => 1,
+            Self::Cubic => 2,
+        }
+    }
+
+    pub(crate) fn bind_group_sampling(self) -> Self {
+        match self {
+            Self::Nearest => Self::Nearest,
+            Self::Linear | Self::Cubic => Self::Linear,
+        }
+    }
+}
+
 pub struct WgpuLive2DTarget<'view> {
     pub texture: &'view wgpu::Texture,
     pub view: &'view wgpu::TextureView,

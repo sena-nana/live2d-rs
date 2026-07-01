@@ -1,4 +1,5 @@
 use crate::{
+    api::WgpuTextureSampling,
     renderer::{TextureTopology, WgpuLive2DRenderer},
     upload::GpuPosition,
 };
@@ -7,6 +8,7 @@ use live2d_probe::{counter, measure, ProbeAttr, ProbeSink, Stage};
 
 pub(crate) struct TextureCache {
     pub(crate) topology: TextureTopology,
+    pub(crate) sampling: WgpuTextureSampling,
     pub(crate) bind_groups: Vec<wgpu::BindGroup>,
 }
 
@@ -240,6 +242,16 @@ pub(crate) fn create_sampled_texture_bind_group(
     sampler: &wgpu::Sampler,
     view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
+    create_sampled_texture_bind_group_with_linear_sampler(device, layout, sampler, sampler, view)
+}
+
+pub(crate) fn create_sampled_texture_bind_group_with_linear_sampler(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    linear_sampler: &wgpu::Sampler,
+    view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Live2D Sampled Texture Bind Group"),
         layout,
@@ -251,6 +263,10 @@ pub(crate) fn create_sampled_texture_bind_group(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(linear_sampler),
             },
         ],
     })

@@ -1,9 +1,11 @@
 use crate::{
-    api::WgpuLive2DView,
+    api::{WgpuLive2DView, WgpuTextureSampling},
     mask::{mask_uniform, mask_uniform_slots, position_uploads_touch_masks},
     pipeline::blend_uniform,
     renderer::{SceneTopology, TextureTopology, WgpuLive2DRenderer},
-    resources::{GpuScene, MaskAtlas, TextureCache},
+    resources::{
+        create_sampled_texture_bind_group_with_linear_sampler, GpuScene, MaskAtlas, TextureCache,
+    },
 };
 use bytemuck::{Pod, Zeroable};
 use live2d_core::{CanvasInfo, Drawable, ModelSnapshot, TextureAsset};
@@ -20,6 +22,7 @@ pub(crate) struct Live2dUniform {
     pub(crate) effect: [f32; 4],
     pub(crate) mask: [f32; 4],
     pub(crate) blend: [u32; 4],
+    pub(crate) sampling: [u32; 4],
 }
 
 #[repr(C)]
@@ -125,10 +128,19 @@ pub(crate) fn upload_main_uniforms(
     render_plan: &RenderPlan,
     canvas: &CanvasInfo,
     view: &WgpuLive2DView,
+    texture_sampling: WgpuTextureSampling,
     mask_atlas: Option<&MaskAtlas>,
     bytes: &mut Vec<u8>,
 ) -> UniformUploadStats {
-    fill_main_uniform_upload_bytes(render_plan, canvas, view, mask_atlas, uniform_stride, bytes);
+    fill_main_uniform_upload_bytes(
+        render_plan,
+        canvas,
+        view,
+        texture_sampling,
+        mask_atlas,
+        uniform_stride,
+        bytes,
+    );
     if bytes.is_empty() {
         return UniformUploadStats::default();
     }
@@ -148,6 +160,7 @@ pub(crate) fn fill_main_uniform_upload_bytes(
     render_plan: &RenderPlan,
     canvas: &CanvasInfo,
     view: &WgpuLive2DView,
+    texture_sampling: WgpuTextureSampling,
     mask_atlas: Option<&MaskAtlas>,
     uniform_stride: u64,
     bytes: &mut Vec<u8>,
@@ -192,6 +205,7 @@ pub(crate) fn fill_main_uniform_upload_bytes(
             effect,
             mask: mask_uniform(draw, mask_atlas),
             blend: blend_uniform(draw.blend_mode),
+            sampling: [texture_sampling.shader_mode(), 0, 0, 0],
         };
         let offset = index * uniform_stride;
         bytes[offset..offset + uniform_size].copy_from_slice(bytemuck::bytes_of(&uniform));
@@ -386,11 +400,7 @@ impl WgpuLive2DRenderer {
         let texture_topology = texture_topology(snapshot);
         let active_scene_changed =
             self.active_scene_key.as_deref() != Some(snapshot.model_key.as_str());
-        let texture_dirty = self
-            .texture_caches
-            .get(&snapshot.model_key)
-            .map(|cache| cache.topology != texture_topology)
-            .unwrap_or(true);
+        let texture_dirty = self.texture_cache_dirty(&snapshot.model_key, &texture_topology);
         let textures = self.prepare_textures(device, queue, snapshot);
         if active_scene_changed || texture_dirty {
             self.mask_atlas_dirty = true;
@@ -465,11 +475,7 @@ impl WgpuLive2DRenderer {
         let texture_topology = texture_topology(snapshot);
         let active_scene_changed =
             self.active_scene_key.as_deref() != Some(snapshot.model_key.as_str());
-        let texture_dirty = self
-            .texture_caches
-            .get(&snapshot.model_key)
-            .map(|cache| cache.topology != texture_topology)
-            .unwrap_or(true);
+        let texture_dirty = self.texture_cache_dirty(&snapshot.model_key, &texture_topology);
         let textures = self.prepare_textures_with_probe(device, queue, snapshot, probe);
         if active_scene_changed || texture_dirty {
             self.mask_atlas_dirty = true;
@@ -575,6 +581,14 @@ impl WgpuLive2DRenderer {
         render_plan
     }
 
+    fn texture_cache_dirty(&self, model_key: &str, topology: &TextureTopology) -> bool {
+        let sampling = self.texture_sampling.bind_group_sampling();
+        self.texture_caches
+            .get(model_key)
+            .map(|cache| cache.topology != *topology || cache.sampling != sampling)
+            .unwrap_or(true)
+    }
+
     pub(crate) fn prepare_textures(
         &mut self,
         device: &wgpu::Device,
@@ -582,8 +596,9 @@ impl WgpuLive2DRenderer {
         snapshot: &ModelSnapshot,
     ) -> Vec<wgpu::BindGroup> {
         let topology = texture_topology(snapshot);
+        let sampling = self.texture_sampling.bind_group_sampling();
         if let Some(cache) = self.texture_caches.get(&snapshot.model_key) {
-            if cache.topology == topology {
+            if cache.topology == topology && cache.sampling == sampling {
                 return cache.bind_groups.clone();
             }
         }
@@ -597,6 +612,7 @@ impl WgpuLive2DRenderer {
             snapshot.model_key.clone(),
             TextureCache {
                 topology,
+                sampling,
                 bind_groups: bind_groups.clone(),
             },
         );
@@ -615,8 +631,9 @@ impl WgpuLive2DRenderer {
         P: ProbeSink,
     {
         let topology = texture_topology(snapshot);
+        let sampling = self.texture_sampling.bind_group_sampling();
         if let Some(cache) = self.texture_caches.get(&snapshot.model_key) {
-            if cache.topology == topology {
+            if cache.topology == topology && cache.sampling == sampling {
                 counter(
                     probe,
                     Stage::WgpuTextureCacheHit,
@@ -672,6 +689,7 @@ impl WgpuLive2DRenderer {
             snapshot.model_key.clone(),
             TextureCache {
                 topology,
+                sampling,
                 bind_groups: bind_groups.clone(),
             },
         );
@@ -840,20 +858,17 @@ impl WgpuLive2DRenderer {
             size,
         );
         let view = gpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Live2D Texture Bind Group"),
-            layout: &self.texture_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        })
+        let sampler = match self.texture_sampling.bind_group_sampling() {
+            WgpuTextureSampling::Nearest => &self.nearest_sampler,
+            WgpuTextureSampling::Linear | WgpuTextureSampling::Cubic => &self.sampler,
+        };
+        create_sampled_texture_bind_group_with_linear_sampler(
+            device,
+            &self.texture_layout,
+            sampler,
+            &self.sampler,
+            &view,
+        )
     }
 }
 
@@ -914,7 +929,15 @@ mod tests {
             pixels_per_unit: 1.0,
         };
         let mut bytes = Vec::new();
-        fill_main_uniform_upload_bytes(&render_plan, &canvas, &view, None, stride, &mut bytes);
+        fill_main_uniform_upload_bytes(
+            &render_plan,
+            &canvas,
+            &view,
+            WgpuTextureSampling::Cubic,
+            None,
+            stride,
+            &mut bytes,
+        );
         let first =
             bytemuck::from_bytes::<Live2dUniform>(&bytes[..std::mem::size_of::<Live2dUniform>()]);
         let second_offset = stride as usize;
@@ -927,6 +950,10 @@ mod tests {
         assert_eq!(second.effect, [0.4, 0.5, 0.6, 0.7]);
         assert_eq!(second.viewport, [320.0, 240.0, 2.0, 0.0]);
         assert_eq!(second.view_transform, view.transform);
+        assert_eq!(
+            second.sampling,
+            [WgpuTextureSampling::Cubic.shader_mode(), 0, 0, 0]
+        );
     }
 
     #[test]

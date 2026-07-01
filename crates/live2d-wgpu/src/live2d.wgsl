@@ -5,11 +5,13 @@ struct Live2dUniform {
     effect: vec4<f32>,
     mask: vec4<f32>,
     blend: vec4<u32>,
+    sampling: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Live2dUniform;
 @group(1) @binding(0) var model_texture: texture_2d<f32>;
 @group(1) @binding(1) var model_sampler: sampler;
+@group(1) @binding(2) var model_linear_sampler: sampler;
 @group(2) @binding(0) var mask_texture: texture_2d<f32>;
 @group(2) @binding(1) var mask_sampler: sampler;
 @group(3) @binding(0) var blend_texture: texture_2d<f32>;
@@ -47,16 +49,57 @@ fn vs_main(input: VertexIn) -> VertexOut {
     return out;
 }
 
+fn cubic_weight(x: f32) -> f32 {
+    let ax = abs(x);
+    if (ax <= 1.0) {
+        return ((1.5 * ax - 2.5) * ax) * ax + 1.0;
+    }
+    if (ax < 2.0) {
+        return (((-0.5 * ax + 2.5) * ax - 4.0) * ax) + 2.0;
+    }
+    return 0.0;
+}
+
+fn model_texture_load_clamped(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32> {
+    return textureLoad(model_texture, clamp(coord, vec2<i32>(0), size - vec2<i32>(1)), 0);
+}
+
+fn sample_model_texture_cubic(uv: vec2<f32>) -> vec4<f32> {
+    let size = vec2<i32>(textureDimensions(model_texture));
+    let texture_size = vec2<f32>(f32(size.x), f32(size.y));
+    let texel = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * texture_size - vec2<f32>(0.5);
+    let base = vec2<i32>(i32(floor(texel.x)), i32(floor(texel.y)));
+    let f = texel - vec2<f32>(f32(base.x), f32(base.y));
+    var color = vec4<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var y = -1; y <= 2; y = y + 1) {
+        let wy = cubic_weight(f.y - f32(y));
+        for (var x = -1; x <= 2; x = x + 1) {
+            let weight = cubic_weight(f.x - f32(x)) * wy;
+            color += model_texture_load_clamped(base + vec2<i32>(x, y), size) * weight;
+            weight_sum += weight;
+        }
+    }
+    return clamp(color / max(weight_sum, 0.0001), vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+fn sample_model_texture(uv: vec2<f32>) -> vec4<f32> {
+    if (u.sampling.x == 2u) {
+        return sample_model_texture_cubic(uv);
+    }
+    return textureSample(model_texture, model_sampler, uv);
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-    let color = textureSample(model_texture, model_sampler, input.uv);
+    let color = sample_model_texture(input.uv);
     let alpha = live2d_alpha(color.a, input);
     return vec4<f32>(color.rgb * u.effect.rgb * alpha, alpha);
 }
 
 @fragment
 fn fs_blend(input: VertexOut) -> @location(0) vec4<f32> {
-    let color = textureSample(model_texture, model_sampler, input.uv);
+    let color = sample_model_texture(input.uv);
     let source = vec4<f32>(color.rgb * u.effect.rgb, live2d_alpha(color.a, input));
     let destination = premultiplied_to_straight(textureSample(blend_texture, blend_sampler, input.screen_uv));
     let blended_color = color_blend(u.blend.x, source.rgb, destination.rgb);
@@ -65,7 +108,7 @@ fn fs_blend(input: VertexOut) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
-    let color = textureSample(model_texture, model_sampler, input.uv);
+    let color = textureSample(model_texture, model_linear_sampler, input.uv);
     return vec4<f32>(1.0, 1.0, 1.0, color.a * u.effect.a);
 }
 

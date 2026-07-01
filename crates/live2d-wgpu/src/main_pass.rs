@@ -170,6 +170,7 @@ impl WgpuLive2DRenderer {
                 render_plan,
                 canvas,
                 &view,
+                self.texture_sampling,
                 active_mask_atlas,
                 &mut uniform_staging,
             );

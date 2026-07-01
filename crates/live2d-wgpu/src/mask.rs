@@ -1,5 +1,6 @@
 use crate::{
     api::WgpuLive2DView,
+    api::WgpuTextureSampling,
     pipeline::PipelineCache,
     renderer::WgpuLive2DRenderer,
     resources::{GpuScene, MaskAtlas, MaskAtlasUpdate},
@@ -445,6 +446,7 @@ pub(crate) fn mask_writer_uniform(
         effect: [1.0, 1.0, 1.0, 1.0],
         mask: [0.0, 0.0, 0.0, 0.0],
         blend: [0, 0, 0, 0],
+        sampling: [WgpuTextureSampling::Linear.shader_mode(), 0, 0, 0],
     }
 }
 
@@ -551,6 +553,10 @@ pub(crate) fn create_mask_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
             },
         ],

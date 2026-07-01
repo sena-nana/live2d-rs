@@ -1,7 +1,7 @@
 #[cfg(feature = "probe")]
 use crate::probe::{read_timestamp_values, record_gpu_pass_nanos, GpuTimestampFrame};
 use crate::{
-    api::{WgpuLive2DTarget, WgpuLive2DView},
+    api::{WgpuLive2DTarget, WgpuLive2DView, WgpuTextureSampling},
     mask::{create_empty_mask_bind_group, mask_uniform_slots},
     pipeline::PipelineCache,
     post_process::{WgpuPostProcessChain, WgpuPostProcessError},
@@ -25,6 +25,8 @@ pub struct WgpuLive2DRenderer {
     pub(crate) uniform_layout: wgpu::BindGroupLayout,
     pub(crate) texture_layout: wgpu::BindGroupLayout,
     pub(crate) sampler: wgpu::Sampler,
+    pub(crate) nearest_sampler: wgpu::Sampler,
+    pub(crate) texture_sampling: WgpuTextureSampling,
     pub(crate) fallback_mask_bind_group: wgpu::BindGroup,
     pub(crate) fallback_blend_bind_group: wgpu::BindGroup,
     pub(crate) uniform_buffer: wgpu::Buffer,
@@ -100,6 +102,12 @@ impl WgpuLive2DRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -108,6 +116,14 @@ impl WgpuLive2DRenderer {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Live2D Nearest Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -131,6 +147,8 @@ impl WgpuLive2DRenderer {
             uniform_layout: bind_group_layout,
             texture_layout,
             sampler,
+            nearest_sampler,
+            texture_sampling: WgpuTextureSampling::default(),
             fallback_mask_bind_group,
             fallback_blend_bind_group,
             uniform_buffer,
@@ -150,6 +168,14 @@ impl WgpuLive2DRenderer {
             #[cfg(feature = "probe")]
             pending_gpu_timestamps: Vec::new(),
         }
+    }
+
+    pub fn texture_sampling(&self) -> WgpuTextureSampling {
+        self.texture_sampling
+    }
+
+    pub fn set_texture_sampling(&mut self, sampling: WgpuTextureSampling) {
+        self.texture_sampling = sampling;
     }
 
     #[cfg(feature = "probe")]
