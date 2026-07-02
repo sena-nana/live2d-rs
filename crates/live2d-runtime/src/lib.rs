@@ -22,6 +22,8 @@ pub use motion::{
     MotionLayerOptions, MotionMixer, MotionPlayOptions, MotionPlaybackState, MotionPlayer,
     MotionPriority, MotionStartResult,
 };
+mod physics;
+pub use physics::{Live2DPhysics, PhysicsEvaluationStats, PhysicsStats};
 
 #[cfg(not(feature = "live2d-cubism"))]
 const RUNTIME_UNAVAILABLE: &str = "live2d_runtime_unavailable";
@@ -91,6 +93,7 @@ pub struct ModelFiles {
     pub moc_path: PathBuf,
     pub texture_paths: Vec<PathBuf>,
     pub motion_groups: Vec<ModelMotionGroup>,
+    pub physics_file: Option<ModelPhysicsFile>,
     pub missing_files: Vec<String>,
 }
 
@@ -106,6 +109,18 @@ pub struct ModelMotionFile {
     pub relative_path: String,
     pub fade_in_seconds: Option<f32>,
     pub fade_out_seconds: Option<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelPhysicsFile {
+    pub path: PathBuf,
+    pub relative_path: String,
+}
+
+impl ModelPhysicsFile {
+    pub fn load_physics(&self) -> Result<Live2DPhysics, String> {
+        Live2DPhysics::load_file(&self.path)
+    }
 }
 
 impl ModelMotionFile {
@@ -205,6 +220,8 @@ pub struct Live2DInstance {
     elapsed_seconds: f32,
     motion_mixer: MotionMixer,
     motion_evaluation: MotionEvaluation,
+    physics_file: Option<ModelPhysicsFile>,
+    physics: Option<Live2DPhysics>,
     #[cfg(feature = "live2d-cubism")]
     base_parameters: Vec<(String, f32)>,
     #[cfg(feature = "live2d-cubism")]
@@ -223,8 +240,68 @@ impl Live2DInstance {
     }
 
     pub fn update(&mut self, dt: f32) -> Result<(), String> {
-        let _ = self.update_motion(dt)?;
-        Ok(())
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        self.elapsed_seconds += dt;
+        #[cfg(feature = "live2d-cubism")]
+        {
+            let motion_changed = self
+                .motion_mixer
+                .advance_into(dt, &mut self.motion_evaluation);
+            if motion_changed || self.physics.is_some() {
+                let evaluation = self.motion_evaluation.clone();
+                self.apply_pose_layers_for_frame(
+                    &evaluation,
+                    evaluation.model_opacity.unwrap_or(1.0),
+                    dt,
+                )?;
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "live2d-cubism"))]
+        {
+            let _ = self
+                .motion_mixer
+                .advance_into(dt, &mut self.motion_evaluation);
+            Err(RUNTIME_UNAVAILABLE.into())
+        }
+    }
+
+    pub fn has_physics(&self) -> bool {
+        self.physics.is_some()
+    }
+
+    pub fn physics_file(&self) -> Option<&ModelPhysicsFile> {
+        self.physics_file.as_ref()
+    }
+
+    pub fn physics_stats(&self) -> Option<PhysicsStats> {
+        self.physics.as_ref().map(Live2DPhysics::stats)
+    }
+
+    pub fn reset_physics(&mut self) {
+        if let Some(physics) = &mut self.physics {
+            physics.reset();
+        }
+    }
+
+    pub fn update_physics(&mut self, dt: f32) -> Result<Option<PhysicsEvaluationStats>, String> {
+        let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
+        #[cfg(feature = "live2d-cubism")]
+        {
+            let stats = self.apply_physics_frame(dt)?;
+            if stats.is_some() {
+                self.model.update_snapshot(
+                    &mut self.snapshot,
+                    self.motion_evaluation.model_opacity.unwrap_or(1.0),
+                )?;
+            }
+            return Ok(stats);
+        }
+        #[cfg(not(feature = "live2d-cubism"))]
+        {
+            let _ = dt;
+            Err(RUNTIME_UNAVAILABLE.into())
+        }
     }
 
     pub fn update_motion(&mut self, dt: f32) -> Result<bool, String> {
@@ -689,6 +766,20 @@ impl Live2DInstance {
         Ok(())
     }
 
+    #[cfg(feature = "live2d-cubism")]
+    fn apply_pose_layers_for_frame(
+        &mut self,
+        evaluation: &MotionEvaluation,
+        model_opacity: f32,
+        dt: f32,
+    ) -> Result<(), String> {
+        self.write_pose_layers(evaluation)?;
+        self.apply_physics_frame(dt)?;
+        self.model
+            .update_snapshot(&mut self.snapshot, model_opacity)?;
+        Ok(())
+    }
+
     #[cfg(all(feature = "probe", feature = "live2d-cubism"))]
     fn apply_pose_layers_with_probe<P>(
         &mut self,
@@ -715,6 +806,17 @@ impl Live2DInstance {
         self.model
             .write_part_opacities(&evaluation.part_opacities)?;
         Ok(())
+    }
+
+    #[cfg(feature = "live2d-cubism")]
+    fn apply_physics_frame(&mut self, dt: f32) -> Result<Option<PhysicsEvaluationStats>, String> {
+        let Some(physics) = &mut self.physics else {
+            return Ok(None);
+        };
+        let parameters = self.model.parameters()?;
+        let (writes, stats) = physics.evaluate_to_writes(&parameters, dt);
+        self.model.write_parameters(&writes)?;
+        Ok(Some(stats))
     }
 }
 
@@ -816,6 +918,13 @@ where
                 .iter()
                 .map(|group| group.motions.len() as u64)
                 .sum(),
+            Vec::new(),
+        );
+        counter(
+            probe,
+            Stage::RuntimeAssetResolve,
+            "physics_refs",
+            u64::from(files.physics_file.is_some()),
             Vec::new(),
         );
 
@@ -922,6 +1031,7 @@ fn parse_model_files(model_json_path: &Path, json: &Value) -> Result<ModelFiles,
 
     let texture_paths = parse_texture_paths(file_refs, &model_root, &mut missing_files);
     let motion_groups = parse_motion_groups(file_refs, &model_root, &mut missing_files);
+    let physics_file = parse_physics_file(file_refs, &model_root, &mut missing_files);
     missing_files.sort();
     missing_files.dedup();
 
@@ -931,6 +1041,7 @@ fn parse_model_files(model_json_path: &Path, json: &Value) -> Result<ModelFiles,
         moc_path,
         texture_paths,
         motion_groups,
+        physics_file,
         missing_files,
     })
 }
@@ -1005,6 +1116,27 @@ fn parse_motion_file(
     })
 }
 
+fn parse_physics_file(
+    file_refs: &Value,
+    model_root: &Path,
+    missing_files: &mut Vec<String>,
+) -> Option<ModelPhysicsFile> {
+    let file = file_refs
+        .get("Physics")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    let path = model_root.join(file);
+    let relative_path = normalize_relative_path(file);
+    if !path.exists() {
+        missing_files.push(relative_path.clone());
+    }
+    Some(ModelPhysicsFile {
+        path,
+        relative_path,
+    })
+}
+
 fn read_f32(value: Option<&Value>) -> Option<f32> {
     value.and_then(Value::as_f64).map(|value| value as f32)
 }
@@ -1044,6 +1176,8 @@ mod runtime {
             elapsed_seconds: 0.0,
             motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
+            physics_file: None,
+            physics: None,
             #[cfg(feature = "live2d-cubism")]
             base_parameters: Vec::new(),
             #[cfg(feature = "live2d-cubism")]
@@ -1666,6 +1800,11 @@ mod runtime {
             return Err("live2d_model_assets_missing".into());
         }
         let textures = load_textures(&files.texture_paths)?;
+        let physics_file = files.physics_file.clone();
+        let physics = physics_file
+            .as_ref()
+            .map(ModelPhysicsFile::load_physics)
+            .transpose()?;
         let mut model = CubismLive2DModel::load(&files)?;
         let snapshot = model.snapshot(
             files.model_json_path.to_string_lossy().into_owned(),
@@ -1677,6 +1816,8 @@ mod runtime {
             elapsed_seconds: 0.0,
             motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
+            physics_file,
+            physics,
             #[cfg(feature = "live2d-cubism")]
             base_parameters: Vec::new(),
             #[cfg(feature = "live2d-cubism")]
@@ -2372,12 +2513,14 @@ mod tests {
         fs::create_dir_all(root.join("motions")).unwrap();
         fs::write(root.join("texture_ok.png"), "").unwrap();
         fs::write(root.join("motions/idle.motion3.json"), test_motion_json()).unwrap();
+        fs::write(root.join("sample.physics3.json"), minimal_physics_json()).unwrap();
         let model = root.join("sample.model3.json");
         fs::write(
             &model,
             r#"{
                 "FileReferences": {
                     "Moc": "sample.moc3",
+                    "Physics": "sample.physics3.json",
                     "Textures": ["texture_ok.png", "textures/missing.png"],
                     "Motions": {
                         "TapBody": [
@@ -2397,6 +2540,14 @@ mod tests {
         assert_eq!(files.moc_path, root.join("sample.moc3"));
         assert_eq!(files.texture_paths.len(), 2);
         assert_eq!(files.motion_groups.len(), 2);
+        assert_eq!(
+            files.physics_file.as_ref().unwrap().path,
+            root.join("sample.physics3.json")
+        );
+        assert_eq!(
+            files.physics_file.as_ref().unwrap().relative_path,
+            "sample.physics3.json"
+        );
         let idle = files
             .motion_groups
             .iter()
@@ -2479,6 +2630,8 @@ mod tests {
             elapsed_seconds: 0.0,
             motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
+            physics_file: None,
+            physics: None,
             #[cfg(feature = "live2d-cubism")]
             base_parameters: Vec::new(),
             #[cfg(feature = "live2d-cubism")]
@@ -2489,26 +2642,26 @@ mod tests {
             .primary_mut()
             .play(test_motion(), false);
 
-        let result = instance.update(0.5);
+        let result = instance.update_motion(0.5);
 
         assert_eq!(result.unwrap_err(), RUNTIME_UNAVAILABLE);
         assert_eq!(instance.motion_state(), MotionPlaybackState::Playing);
         assert!((instance.motion_elapsed_seconds() - 0.5).abs() < 0.001);
 
         instance.pause_motion();
-        instance.update(0.5).unwrap();
+        instance.update_motion(0.5).unwrap();
         assert_eq!(instance.motion_state(), MotionPlaybackState::Paused);
         assert!((instance.motion_elapsed_seconds() - 0.5).abs() < 0.001);
 
         instance.resume_motion();
-        let result = instance.update(2.0);
+        let result = instance.update_motion(2.0);
         assert_eq!(result.unwrap_err(), RUNTIME_UNAVAILABLE);
         assert_eq!(instance.motion_state(), MotionPlaybackState::Finished);
         assert!((instance.motion_elapsed_seconds() - 2.0).abs() < 0.001);
 
         instance.stop_motion();
         assert_eq!(instance.motion_state(), MotionPlaybackState::Stopped);
-        instance.update(1.0).unwrap();
+        instance.update_motion(1.0).unwrap();
         assert_eq!(instance.motion_state(), MotionPlaybackState::Stopped);
     }
 
@@ -2685,6 +2838,8 @@ mod tests {
             elapsed_seconds: 0.0,
             motion_mixer: MotionMixer::new(),
             motion_evaluation: MotionEvaluation::default(),
+            physics_file: None,
+            physics: None,
             #[cfg(feature = "live2d-cubism")]
             base_parameters: Vec::new(),
             #[cfg(feature = "live2d-cubism")]
@@ -2718,5 +2873,41 @@ mod tests {
                     { "Target": "Parameter", "Id": "ParamAngleX", "Segments": [0, 0, 0, 2, 10] }
                 ]
             }"#
+    }
+
+    fn minimal_physics_json() -> &'static str {
+        r#"{
+            "Meta": {
+                "EffectiveForces": {
+                    "Gravity": { "X": 0, "Y": -1 },
+                    "Wind": { "X": 0, "Y": 0 }
+                },
+                "Fps": 30
+            },
+            "PhysicsSettings": [{
+                "Normalization": {
+                    "Position": { "Minimum": -10, "Maximum": 10, "Default": 0 },
+                    "Angle": { "Minimum": -30, "Maximum": 30, "Default": 0 }
+                },
+                "Input": [{
+                    "Source": { "Id": "ParamAngleX" },
+                    "Weight": 100,
+                    "Type": "X",
+                    "Reflect": false
+                }],
+                "Output": [{
+                    "Destination": { "Id": "ParamHair" },
+                    "VertexIndex": 1,
+                    "Scale": 30,
+                    "Weight": 100,
+                    "Type": "Angle",
+                    "Reflect": false
+                }],
+                "Vertices": [
+                    { "Position": { "X": 0, "Y": 0 }, "Mobility": 1, "Delay": 1, "Acceleration": 1, "Radius": 0 },
+                    { "Position": { "X": 0, "Y": 1 }, "Mobility": 1, "Delay": 1, "Acceleration": 1, "Radius": 1 }
+                ]
+            }]
+        }"#
     }
 }

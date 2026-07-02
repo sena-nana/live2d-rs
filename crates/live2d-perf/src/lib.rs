@@ -9,8 +9,9 @@ use live2d_render::{
 #[cfg(all(feature = "exp3", feature = "live2d-cubism"))]
 use live2d_runtime::Live2DExpression;
 use live2d_runtime::{
-    Live2DMotion, MotionBlendMode, MotionEvaluation, MotionLayerOptions, MotionMixer,
-    MotionPlayOptions, MotionPlayer, MotionPriority, MotionStartResult,
+    Live2DMotion, Live2DPhysics, MotionBlendMode, MotionEvaluation, MotionLayerOptions,
+    MotionMixer, MotionPlayOptions, MotionPlayer, MotionPriority, MotionStartResult, ParameterId,
+    ParameterInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
@@ -497,6 +498,15 @@ impl SyntheticConfig {
         }
     }
 
+    pub fn physics_heavy() -> Self {
+        Self {
+            drawables: 256,
+            vertices_per_drawable: 24,
+            frames: 300,
+            ..Self::medium()
+        }
+    }
+
     pub fn from_profile(profile: &str) -> Self {
         match profile {
             "small" => Self::small(),
@@ -505,6 +515,7 @@ impl SyntheticConfig {
             "static-mask-heavy" => Self::static_mask_heavy(),
             "texture-heavy" => Self::texture_heavy(),
             "target-filter" => Self::target_filter(),
+            "physics-heavy" => Self::physics_heavy(),
             _ => Self::medium(),
         }
     }
@@ -989,6 +1000,87 @@ pub fn run_layered_motion(config: &SyntheticConfig) -> RunReport {
     recorder.report("layered-motion", report_config, Vec::new())
 }
 
+pub fn run_physics_update(config: &SyntheticConfig) -> RunReport {
+    let recorder = ProbeRecorder::new();
+    let instance_count = config.drawables.max(1);
+    let settings_per_instance = (config.vertices_per_drawable / 8).max(1);
+    let particles_per_setting = config.mask_members.max(2);
+    let frames = config.frames.max(1);
+    let physics_json = synthetic_physics_json(settings_per_instance, particles_per_setting);
+    let mut physics = (0..instance_count)
+        .map(|_| Live2DPhysics::from_json_str(&physics_json).expect("synthetic physics is valid"))
+        .collect::<Vec<_>>();
+    let mut parameters = (0..instance_count)
+        .map(|_| synthetic_physics_parameters(settings_per_instance))
+        .collect::<Vec<_>>();
+    let mut total_output_writes = 0usize;
+    let mut changed_frames = 0usize;
+
+    for frame in 0..frames {
+        let changed = measure(
+            &recorder,
+            Stage::RuntimePhysicsUpdate,
+            vec![ProbeAttr::new("frame", frame as u64)],
+            || {
+                let mut frame_writes = 0usize;
+                for (instance_index, (physics, parameters)) in
+                    physics.iter_mut().zip(parameters.iter_mut()).enumerate()
+                {
+                    let phase = ((frame + instance_index) as f32 / 30.0).sin();
+                    for setting_index in 0..settings_per_instance {
+                        parameters[setting_index * 2].value = phase;
+                    }
+                    let stats = physics.evaluate(parameters, 1.0 / 60.0);
+                    frame_writes += stats.output_writes;
+                    total_output_writes += stats.output_writes;
+                }
+                frame_writes
+            },
+        );
+        if changed > 0 {
+            changed_frames += 1;
+        }
+        counter(
+            &recorder,
+            Stage::RuntimePhysicsUpdate,
+            "physics_output_writes",
+            changed as u64,
+            Vec::new(),
+        );
+    }
+
+    counter(
+        &recorder,
+        Stage::RuntimePhysicsUpdate,
+        "physics_instances",
+        instance_count as u64,
+        Vec::new(),
+    );
+    counter(
+        &recorder,
+        Stage::RuntimePhysicsUpdate,
+        "physics_changed_frames",
+        changed_frames as u64,
+        Vec::new(),
+    );
+
+    let mut report_config = config.as_report_config();
+    report_config.insert("physics_instances".into(), instance_count.to_string());
+    report_config.insert(
+        "physics_settings_per_instance".into(),
+        settings_per_instance.to_string(),
+    );
+    report_config.insert(
+        "physics_particles_per_setting".into(),
+        particles_per_setting.to_string(),
+    );
+    report_config.insert(
+        "physics_total_output_writes".into(),
+        total_output_writes.to_string(),
+    );
+    recorder.report("physics-update", report_config, Vec::new())
+}
+
 fn motion_for(parameter_id: &str, start: f32, end: f32, looped: bool) -> Live2DMotion {
     Live2DMotion::from_json_str(&format!(
         r#"{{
@@ -1005,6 +1097,78 @@ fn motion_for(parameter_id: &str, start: f32, end: f32, looped: bool) -> Live2DM
     .expect("synthetic motion is valid")
 }
 
+fn synthetic_physics_parameters(settings: usize) -> Vec<ParameterInfo> {
+    let mut parameters = Vec::with_capacity(settings * 2);
+    for index in 0..settings {
+        parameters.push(ParameterInfo {
+            id: ParameterId::from(format!("ParamPhysicsInput{index}")),
+            minimum: -1.0,
+            maximum: 1.0,
+            default: 0.0,
+            value: 0.0,
+        });
+        parameters.push(ParameterInfo {
+            id: ParameterId::from(format!("ParamPhysicsOutput{index}")),
+            minimum: -30.0,
+            maximum: 30.0,
+            default: 0.0,
+            value: 0.0,
+        });
+    }
+    parameters
+}
+
+fn synthetic_physics_json(settings: usize, particles: usize) -> String {
+    let mut physics_settings = Vec::with_capacity(settings);
+    for setting_index in 0..settings {
+        let vertices = (0..particles)
+            .map(|index| {
+                let radius = if index == 0 { 0.0 } else { 1.0 };
+                format!(
+                    r#"{{ "Position": {{ "X": 0, "Y": {index} }}, "Mobility": 0.8, "Delay": 0.7, "Acceleration": 1.0, "Radius": {radius} }}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        physics_settings.push(format!(
+            r#"{{
+                "Normalization": {{
+                    "Position": {{ "Minimum": -10, "Maximum": 10, "Default": 0 }},
+                    "Angle": {{ "Minimum": -30, "Maximum": 30, "Default": 0 }}
+                }},
+                "Input": [{{
+                    "Source": {{ "Id": "ParamPhysicsInput{setting_index}" }},
+                    "Weight": 100,
+                    "Type": "X",
+                    "Reflect": false
+                }}],
+                "Output": [{{
+                    "Destination": {{ "Id": "ParamPhysicsOutput{setting_index}" }},
+                    "VertexIndex": 1,
+                    "Scale": 30,
+                    "Weight": 100,
+                    "Type": "Angle",
+                    "Reflect": false
+                }}],
+                "Vertices": [{vertices}]
+            }}"#
+        ));
+    }
+    format!(
+        r#"{{
+            "Meta": {{
+                "EffectiveForces": {{
+                    "Gravity": {{ "X": 0, "Y": -1 }},
+                    "Wind": {{ "X": 0.15, "Y": 0 }}
+                }},
+                "Fps": 30
+            }},
+            "PhysicsSettings": [{}]
+        }}"#,
+        physics_settings.join(",")
+    )
+}
+
 pub fn run_real_model_load(model_path: &Path) -> RunReport {
     let recorder = ProbeRecorder::new();
     let warnings = match live2d_runtime::load_snapshot_with_probe(model_path, &recorder) {
@@ -1015,6 +1179,30 @@ pub fn run_real_model_load(model_path: &Path) -> RunReport {
         "real-model-load",
         BTreeMap::from([("model".into(), model_path.display().to_string())]),
         warnings,
+    )
+}
+
+#[cfg(feature = "live2d-cubism")]
+pub fn run_real_model_physics(model_path: &Path, frames: usize) -> RunReport {
+    let recorder = ProbeRecorder::new();
+    let mut config = BTreeMap::from([
+        ("model".into(), model_path.display().to_string()),
+        ("frames".into(), frames.max(1).to_string()),
+    ]);
+    let warnings = run_real_model_physics_inner(model_path, frames.max(1), &recorder, &mut config)
+        .unwrap_or_else(|err| vec![format!("real model physics failed: {err}")]);
+    recorder.report("real-model-physics", config, warnings)
+}
+
+#[cfg(not(feature = "live2d-cubism"))]
+pub fn run_real_model_physics(model_path: &Path, frames: usize) -> RunReport {
+    ProbeRecorder::new().report(
+        "real-model-physics",
+        BTreeMap::from([
+            ("model".into(), model_path.display().to_string()),
+            ("frames".into(), frames.max(1).to_string()),
+        ]),
+        vec!["real-model-physics requires `--features live2d-cubism`".to_owned()],
     )
 }
 
@@ -1283,6 +1471,7 @@ async fn run_real_model_render_inner(
 
     for _ in 0..config.warmup_frames {
         instance.update_motion(1.0 / 60.0)?;
+        instance.update_physics(1.0 / 60.0)?;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Live2D Real Model Perf Warmup Encoder"),
         });
@@ -1309,6 +1498,20 @@ async fn run_real_model_render_inner(
         )?;
         if changed {
             changed_frames += 1;
+        }
+        if let Some(stats) = measure(
+            recorder,
+            Stage::RuntimePhysicsUpdate,
+            vec![ProbeAttr::new("frame", frame as u64)],
+            || instance.update_physics(1.0 / 60.0),
+        )? {
+            counter(
+                recorder,
+                Stage::RuntimePhysicsUpdate,
+                "physics_output_writes",
+                stats.output_writes as u64,
+                Vec::new(),
+            );
         }
         motion_events += instance.motion_events().len();
 
@@ -1377,6 +1580,100 @@ fn real_model_render_view(config: &RealModelRenderConfig) -> live2d_wgpu::WgpuLi
 }
 
 #[cfg(feature = "live2d-cubism")]
+fn run_real_model_physics_inner(
+    model_path: &Path,
+    frames: usize,
+    recorder: &ProbeRecorder,
+    config: &mut BTreeMap<String, String>,
+) -> Result<Vec<String>, String> {
+    let files = live2d_runtime::resolve_model_files(model_path)?;
+    if !files.missing_files.is_empty() {
+        return Err(format!(
+            "model assets missing: {}",
+            files.missing_files.join(", ")
+        ));
+    }
+    let physics_file = files
+        .physics_file
+        .as_ref()
+        .ok_or_else(|| "model has no physics file".to_owned())?;
+    config.insert("physics".into(), physics_file.relative_path.clone());
+    let mut physics = measure(
+        recorder,
+        Stage::RuntimePhysicsParse,
+        vec![ProbeAttr::new(
+            "physics",
+            physics_file.relative_path.clone(),
+        )],
+        || physics_file.load_physics(),
+    )?;
+    let stats = physics.stats();
+    config.insert("physics_settings".into(), stats.settings.to_string());
+    config.insert("physics_inputs".into(), stats.inputs.to_string());
+    config.insert("physics_outputs".into(), stats.outputs.to_string());
+    config.insert("physics_particles".into(), stats.particles.to_string());
+
+    let instance = live2d_runtime::Live2DInstance::load_file(model_path)?;
+    let mut parameters = instance.parameters()?;
+    let mut output_writes = 0usize;
+    for frame in 0..frames {
+        for parameter in &mut parameters {
+            if parameter.id.as_ref().contains("Angle") {
+                parameter.value = (((frame as f32) / 30.0).sin() * parameter.maximum)
+                    .clamp(parameter.minimum, parameter.maximum);
+            }
+        }
+        let frame_stats = measure(
+            recorder,
+            Stage::RuntimePhysicsUpdate,
+            vec![ProbeAttr::new("frame", frame as u64)],
+            || physics.evaluate(&mut parameters, 1.0 / 60.0),
+        );
+        output_writes += frame_stats.output_writes;
+        counter(
+            recorder,
+            Stage::RuntimePhysicsUpdate,
+            "physics_output_writes",
+            frame_stats.output_writes as u64,
+            Vec::new(),
+        );
+    }
+    counter(
+        recorder,
+        Stage::RuntimePhysicsUpdate,
+        "physics_settings",
+        stats.settings as u64,
+        Vec::new(),
+    );
+    counter(
+        recorder,
+        Stage::RuntimePhysicsUpdate,
+        "physics_inputs",
+        stats.inputs as u64,
+        Vec::new(),
+    );
+    counter(
+        recorder,
+        Stage::RuntimePhysicsUpdate,
+        "physics_outputs",
+        stats.outputs as u64,
+        Vec::new(),
+    );
+    counter(
+        recorder,
+        Stage::RuntimePhysicsUpdate,
+        "physics_particles",
+        stats.particles as u64,
+        Vec::new(),
+    );
+    config.insert(
+        "physics_total_output_writes".into(),
+        output_writes.to_string(),
+    );
+    Ok(Vec::new())
+}
+
+#[cfg(feature = "live2d-cubism")]
 fn run_real_model_motion_inner(
     model_path: &Path,
     frames: usize,
@@ -1423,6 +1720,23 @@ fn run_real_model_motion_inner(
             ],
             || instance.update_motion(1.0 / 60.0),
         )?;
+        if let Some(stats) = measure(
+            recorder,
+            Stage::RuntimePhysicsUpdate,
+            vec![
+                ProbeAttr::new("phase", "update"),
+                ProbeAttr::new("frame", frame as u64),
+            ],
+            || instance.update_physics(1.0 / 60.0),
+        )? {
+            counter(
+                recorder,
+                Stage::RuntimePhysicsUpdate,
+                "physics_output_writes",
+                stats.output_writes as u64,
+                Vec::new(),
+            );
+        }
         if changed {
             changed_frames += 1;
         }

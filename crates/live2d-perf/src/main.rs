@@ -1,8 +1,8 @@
 use live2d_perf::{
     compare_reports, run_dispatch_null_backend, run_layered_motion, run_motion_update,
-    run_real_model_load, run_real_model_motion, run_real_model_motion_diff, run_real_model_render,
-    run_render_plan, run_render_world_switch, CompareSummary, RealModelRenderConfig,
-    SyntheticBlendProfile, SyntheticConfig,
+    run_physics_update, run_real_model_load, run_real_model_motion, run_real_model_motion_diff,
+    run_real_model_physics, run_real_model_render, run_render_plan, run_render_world_switch,
+    CompareSummary, RealModelRenderConfig, SyntheticBlendProfile, SyntheticConfig,
 };
 use live2d_probe::{RunReport, Stage, StageStats};
 use serde::Serialize;
@@ -67,10 +67,16 @@ fn run() -> Result<(), String> {
         }
         "motion-update" => run_motion_update(&config),
         "layered-motion" => run_layered_motion(&config),
+        "physics-update" => run_physics_update(&config),
         "real-model-load" => {
             let model = value_arg(&args, "--model")
                 .ok_or_else(|| "real-model-load requires --model <path>".to_owned())?;
             run_real_model_load(Path::new(&model))
+        }
+        "real-model-physics" => {
+            let model = value_arg(&args, "--model")
+                .ok_or_else(|| "real-model-physics requires --model <path>".to_owned())?;
+            run_real_model_physics(Path::new(&model), config.frames)
         }
         "real-model-motion" => {
             let model = value_arg(&args, "--model")
@@ -119,7 +125,7 @@ fn run() -> Result<(), String> {
         }
         _ => {
             return Err(format!(
-                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, real-model-load, real-model-motion, real-model-motion-diff, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, or wgpu-postprocess"
+                "unknown scenario `{scenario}`; expected synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, physics-update, real-model-load, real-model-physics, real-model-motion, real-model-motion-diff, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, or wgpu-postprocess"
             ));
         }
     };
@@ -136,8 +142,8 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!("usage: live2d-perf <scenario> [--profile <name>] [--frames <n>] [--blend-profile <name>] [--model <path>] [--motion-group <name>] [--motion <path>] [--expression <path>] [--frame <n>] [--dt <seconds>] [--warmup-frames <n>] [--width <px>] [--height <px>]");
-    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, real-model-load, real-model-motion, real-model-motion-diff, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, wgpu-postprocess, compare-revs");
-    println!("profiles: small, medium, large, mask-heavy, static-mask-heavy, texture-heavy, target-filter");
+    println!("scenarios: synthetic-render-plan, render-world-switch, dispatch-null-backend, motion-update, layered-motion, physics-update, real-model-load, real-model-physics, real-model-motion, real-model-motion-diff, real-model-render, wgpu-cold, wgpu-warm, wgpu-mask, wgpu-resize, wgpu-model-switch, wgpu-postprocess, compare-revs");
+    println!("profiles: small, medium, large, mask-heavy, static-mask-heavy, texture-heavy, target-filter, physics-heavy");
     println!(
         "blend profiles: classic-mix, advanced-colors, advanced-alphas, advanced-matrix, all-modes"
     );
@@ -152,6 +158,7 @@ fn uses_synthetic_config(scenario: &str) -> bool {
             | "dispatch-null-backend"
             | "motion-update"
             | "layered-motion"
+            | "physics-update"
             | "wgpu-cold"
             | "wgpu-warm"
             | "wgpu-mask"
@@ -702,9 +709,19 @@ fn compare_scenarios(include_real_model_motion: bool) -> Vec<CompareScenario> {
             stages: &[Stage::RuntimeMotionUpdate],
             kind: CompareScenarioKind::Synthetic,
         },
+        CompareScenario {
+            name: "physics-update",
+            stages: &[Stage::RuntimePhysicsUpdate],
+            kind: CompareScenarioKind::Synthetic,
+        },
     ];
     append_wgpu_compare_scenarios(&mut scenarios);
     if include_real_model_motion {
+        scenarios.push(CompareScenario {
+            name: "real-model-physics",
+            stages: &[Stage::RuntimePhysicsParse, Stage::RuntimePhysicsUpdate],
+            kind: CompareScenarioKind::RealModel,
+        });
         scenarios.push(CompareScenario {
             name: "real-model-motion",
             stages: &[Stage::RuntimeMotionUpdate],
